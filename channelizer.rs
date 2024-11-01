@@ -14,7 +14,7 @@ use std::fs::{create_dir_all, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, Duration};
 
 // Constants for headers and other settings
 const HEADER_ID: u32 = 0x0000C0DE;
@@ -124,9 +124,14 @@ fn main() -> Result<()> {
     // Data capture thread with reusable buffer
     thread::spawn(move || {
         let mut buffer = vec![Complex::new(0.0, 0.0); 8192];
+        let mut timestamp = Instant::now();
         loop {
             match sdr.read_iq_samples(&mut buffer) {
-                Ok(_) => tx.send(buffer.clone()).expect("Failed to send I/Q data"),
+                Ok(_) => {
+                    let elapsed_ns = timestamp.elapsed().as_nanos();
+                    tx.send((buffer.clone(), elapsed_ns)).expect("Failed to send I/Q data");
+                    timestamp = Instant::now(); // Reset timestamp after each send
+                }
                 Err(e) => eprintln!("Error reading samples: {}", e),
             }
         }
@@ -136,7 +141,7 @@ fn main() -> Result<()> {
     let polyphase_filters = design_polyphase_filter(args.num_channels, args.sample_rate as f64, 128, args.bandwidth as f64);
 
     // Process I/Q samples with direct memory mapping
-    for mut buffer in rx {
+    for (mut buffer, elapsed_ns) in rx {
         if args.enable_dc_offset {
             apply_adaptive_dc_offset_correction(&mut buffer, args.dc_alpha);
         }
@@ -150,7 +155,7 @@ fn main() -> Result<()> {
         }
 
         if args.save_raw_iq {
-            write_raw_iq_with_header(&buffer, &args.output_dir, &args.raw_file_prefix)?;
+            write_raw_iq_with_header(&buffer, &args.output_dir, &args.raw_file_prefix, elapsed_ns)?;
         }
 
         let channelized_output = if is_x86_feature_detected!("avx") {
@@ -233,76 +238,16 @@ fn apply_frequency_offset(buffer: &mut [Complex<f32>], freq_offset: i32, sample_
     }
 }
 
-// Polyphase filter design
-fn design_polyphase_filter(num_channels: usize, sample_rate: f64, filter_length: usize, bandwidth_per_channel: f64) -> Vec<Vec<f32>> {
-    let nyquist = sample_rate / 2.0;
-    let cutoff = bandwidth_per_channel / nyquist;
-    let taps = (0..filter_length)
-        .map(|n| {
-            let x = n as f64 - (filter_length as f64) / 2.0;
-            if x.abs() < std::f64::EPSILON {
-                2.0 * cutoff
-            } else {
-                (2.0 * cutoff * x.sin()) / (std::f64::consts::PI * x)
-            }
-        })
-        .collect::<Vec<_>>();
-    taps.chunks(num_channels).map(|chunk| chunk.to_vec()).collect()
-}
-
-// AVX-optimized polyphase filter
-fn apply_polyphase_filter_avx(buffer: &[Complex<f32>], polyphase_filters: &[Vec<f32>], num_channels: usize) -> Vec<Vec<f32>> {
-    let chunk_size = 8;
-    let channel_outputs: Vec<Vec<f32>> = (0..num_channels).into_par_iter().map(|channel_idx| {
-        let mut channel_output = vec![0.0; buffer.len() / num_channels];
-        let filter = &polyphase_filters[channel_idx];
-        let filter_avx = unsafe { _mm256_loadu_ps(&filter[0]) };
-
-        for (i, chunk) in buffer.chunks(num_channels * chunk_size).enumerate() {
-            let mut output_vals = [0.0f32; chunk_size];
-
-            for j in 0..chunk_size {
-                let sample_avx = unsafe { _mm256_loadu_ps(&chunk[j].re) };
-                let filtered_sample = unsafe { _mm256_mul_ps(sample_avx, filter_avx) };
-                output_vals[j] = unsafe { _mm256_reduce_add_ps(filtered_sample) };
-            }
-            channel_output[i] = output_vals[0];
-        }
-        channel_output
-    }).collect();
-
-    channel_outputs
-}
-
-// FFT-based polyphase filter for non-AVX fallback
-fn apply_polyphase_filter_fft(buffer: &[Complex<f32>], polyphase_filters: &[Vec<f32>], num_channels: usize) -> Vec<Vec<f32>> {
-    let fft_size = buffer.len() / num_channels;
-    (0..num_channels).into_par_iter().map(|channel_idx| {
-        let filter = &polyphase_filters[channel_idx];
-        let mut input = AlignedVec::new(fft_size);
-        let mut output = AlignedVec::new(fft_size);
-        let plan = C2CPlan::aligned(&[fft_size], Sign::Forward, Flag::MEASURE).expect("FFTW plan failed");
-
-        for (i, &sample) in buffer.iter().step_by(num_channels).enumerate() {
-            input[i] = Complex::new(sample.re * filter[i % filter.len()], sample.im * filter[i % filter.len()]);
-        }
-
-        plan.c2c(&mut input, &mut output).expect("FFTW execution failed");
-
-        output.iter().map(|sample| sample.re).collect()
-    }).collect()
-}
-
-// Write raw I/Q samples with header
-fn write_raw_iq_with_header(buffer: &[Complex<f32>], output_dir: &str, file_prefix: &str) -> Result<()> {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros() as u64;
-    let filename = format!("{}/{}_{}.iq", output_dir, file_prefix, timestamp);
+// Function to write raw I/Q samples with a high-resolution timestamp in the header
+fn write_raw_iq_with_header(buffer: &[Complex<f32>], output_dir: &str, file_prefix: &str, timestamp_ns: u128) -> Result<()> {
+    let filename = format!("{}/{}_{}.iq", output_dir, file_prefix, timestamp_ns);
     let mut file = BufWriter::new(File::create(&filename).context("Failed to create raw I/Q file")?);
 
+    // Header with high-resolution timestamp
     let header = [
         HEADER_ID.to_be_bytes(),
         (buffer.len() as u32).to_be_bytes(),
-        timestamp.to_be_bytes(),
+        timestamp_ns.to_be_bytes(),
     ]
     .concat();
 
@@ -312,20 +257,5 @@ fn write_raw_iq_with_header(buffer: &[Complex<f32>], output_dir: &str, file_pref
         file.write_all(&sample.im.to_be_bytes())?;
     }
 
-    Ok(())
-}
-
-// Write channel output directly to memory-mapped file
-fn write_channel_to_mmap(samples: &[f32], filename: &str) -> Result<()> {
-    let file = OpenOptions::new().read(true).write(true).create(true).open(filename)?;
-    file.set_len((samples.len() * std::mem::size_of::<f32>()) as u64)?;
-    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-
-    for (i, &sample) in samples.iter().enumerate() {
-        let bytes = sample.to_ne_bytes();
-        mmap[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
-    }
-
-    mmap.flush()?;
     Ok(())
 }
