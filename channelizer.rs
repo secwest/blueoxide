@@ -9,6 +9,7 @@ use memmap2::MmapMut;
 use num_complex::Complex;
 use rayon::prelude::*;
 use std::arch::x86_64::*;
+use std::f32::consts::PI;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::mpsc;
@@ -17,6 +18,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // Constants for headers and other settings
 const HEADER_ID: u32 = 0x0000C0DE;
+
+// Enum for SDR modes
+#[derive(ValueEnum, Clone, Debug)]
+enum Mode {
+    Bluetooth,
+    BLE,
+}
 
 // Enum for supported SDR devices
 #[derive(ValueEnum, Clone, Debug)]
@@ -32,6 +40,9 @@ enum DeviceType {
 #[command(author, version, about)]
 struct Args {
     #[arg(value_enum)]
+    mode: Mode,
+
+    #[arg(value_enum)]
     device: DeviceType,
 
     #[arg(short, long, default_value_t = 2402000000)]
@@ -39,6 +50,9 @@ struct Args {
 
     #[arg(short, long, default_value_t = 10000000)]
     sample_rate: u32,
+
+    #[arg(long, default_value_t = 0)]
+    frequency_offset: i32, // Frequency offset for tuning in Hz
 
     #[arg(short, long, default_value_t = 20)]
     num_channels: usize,
@@ -55,23 +69,14 @@ struct Args {
     #[arg(long)]
     save_raw_iq: bool,
 
-    #[arg(long, default_value_t = 0)]
-    bandwidth: u32,
+    #[arg(long, default_value_t = 2000000)]
+    bandwidth: u32, // Default bandwidth for Bluetooth and BLE is 2 MHz
 
     #[arg(long, default_value_t = 30.0)]
     gain: f64,
 
-    #[arg(long, default_value_t = 5)]
-    channel_range_start: usize,
-
-    #[arg(long, default_value_t = 10)]
-    channel_range_end: usize,
-
-    #[arg(long)]
-    enable_dc_offset: bool,
-
-    #[arg(long)]
-    enable_iq_imbalance: bool,
+    #[arg(long, default_value_t = 0.01)]
+    dc_alpha: f32, // Alpha parameter for adaptive DC offset correction
 
     #[arg(long, default_value_t = 0.01)]
     iq_phase_error: f32,
@@ -79,23 +84,26 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     iq_gain_error: f32,
 
-    #[arg(long, default_value_t = 0.01)]
-    dc_alpha: f32, // Alpha parameter for adaptive DC offset correction
+    #[arg(long, default_value = "full")]
+    channel_selection: String, // Either "full" for full-band or "range" for selective channels
+
+    #[arg(long, default_value_t = 37)]
+    channel_range_start: usize,
+
+    #[arg(long, default_value_t = 39)]
+    channel_range_end: usize,
 }
 
-// SDRDevice trait and device modules
-mod xtrx;
-mod hackrf;
-mod bladerf;
-mod lime;
-
-use xtrx::XTRXSdr;
-use hackrf::HackRFSdr;
-use bladerf::BladeRFSDR;
-use lime::LimeSDR;
-
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    // Adjust defaults for BLE advertising channels if in BLE mode
+    if args.mode == Mode::BLE {
+        args.center_frequency = 2426000000; // Center across channels 37, 38, 39
+        args.sample_rate = 10000000;
+        args.bandwidth = 2000000;
+    }
+
     let (tx, rx) = mpsc::sync_channel(10);
     create_dir_all(&args.output_dir)?;
 
@@ -109,7 +117,7 @@ fn main() -> Result<()> {
 
     // Configure SDR
     sdr.set_sample_rate(args.sample_rate)?;
-    sdr.set_frequency(args.center_frequency)?;
+    sdr.set_frequency((args.center_frequency as i64 + args.frequency_offset as i64) as u64)?;
     sdr.set_rx_bandwidth(args.bandwidth as f64)?;
     sdr.set_gain(args.gain)?;
 
@@ -136,6 +144,11 @@ fn main() -> Result<()> {
             apply_iq_imbalance_correction(&mut buffer, args.iq_gain_error, args.iq_phase_error);
         }
 
+        // Apply frequency offset compensation if specified
+        if args.frequency_offset != 0 {
+            apply_frequency_offset(&mut buffer, args.frequency_offset, args.sample_rate);
+        }
+
         if args.save_raw_iq {
             write_raw_iq_with_header(&buffer, &args.output_dir, &args.raw_file_prefix)?;
         }
@@ -146,8 +159,15 @@ fn main() -> Result<()> {
             apply_polyphase_filter_fft(&buffer, &polyphase_filters, args.num_channels)
         };
 
+        // Select channels for output based on selection type
+        let channels = match args.channel_selection.as_str() {
+            "full" => 0..args.num_channels,
+            "range" => args.channel_range_start..=args.channel_range_end,
+            _ => panic!("Invalid channel_selection option. Use 'full' or 'range'"),
+        };
+
         // Write channelized output directly to memory-mapped files
-        for i in args.channel_range_start..=args.channel_range_end {
+        for i in channels {
             let filename = format!("{}/{}_channel_{}.iq", &args.output_dir, &args.channel_file_prefix, i);
             write_channel_to_mmap(&channelized_output[i], &filename)?;
         }
@@ -161,10 +181,7 @@ fn apply_adaptive_dc_offset_correction(buffer: &mut [Complex<f32>], alpha: f32) 
     let mut dc_estimate = Complex::new(0.0, 0.0);
 
     for sample in buffer.iter_mut() {
-        // Estimate DC component using exponential moving average
         dc_estimate = dc_estimate * (1.0 - alpha) + *sample * alpha;
-
-        // Subtract estimated DC component from the current sample
         *sample -= dc_estimate;
     }
 }
@@ -198,6 +215,21 @@ fn apply_iq_imbalance_correction(buffer: &mut [Complex<f32>], gain_error: f32, p
             sample.re = i;
             sample.im = q;
         }
+    }
+}
+
+// Function to apply a frequency offset
+fn apply_frequency_offset(buffer: &mut [Complex<f32>], freq_offset: i32, sample_rate: u32) {
+    let freq_rad = 2.0 * PI * (freq_offset as f32) / (sample_rate as f32);
+    for (i, sample) in buffer.iter_mut().enumerate() {
+        let angle = freq_rad * i as f32;
+        let cos_offset = angle.cos();
+        let sin_offset = angle.sin();
+        let adjusted = Complex::new(
+            sample.re * cos_offset - sample.im * sin_offset,
+            sample.im * cos_offset + sample.re * sin_offset,
+        );
+        *sample = adjusted;
     }
 }
 
