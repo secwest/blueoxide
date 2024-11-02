@@ -1500,8 +1500,7 @@ This section covers functions that help manage logging and error reporting withi
      * `...`: Additional arguments as required by the format string.  
    * **Usage**: Allows developers to integrate their own log messages into the LimeSuite logging framework, ensuring consistent logging behavior.  
    * **Example**:  
-     c  
-     Copy code  
+  
      `LMS_Log(LMS_LOG_INFO, "Custom message: Device initialized successfully.");`  
    *   
 7. **`LMS_ErrorToString(int error_code)`**  
@@ -1772,18 +1771,17 @@ Functions for ensuring consistency between software and hardware states.
    * **Returns**: `int` \- Returns `0` on success, or `-1` on error.  
    * **Usage**: This function is essential for maintaining consistency between the software and hardware states of the device, especially when multiple software components might be interacting with the device or when direct register access has been used. It ensures that any changes made in the software cache are reflected in the hardware registers, and vice versa.  
    * **Example**:  
-     c  
-     Copy code  
+   
      `// Synchronize software cache to hardware`  
-   * `if (LMS_Synchronize(device, true) != 0) {`  
-   *     `printf("Error synchronizing to hardware: %s\n", LMS_GetLastErrorMessage());`  
-   * `}`  
-   *   
-   * `// Synchronize hardware to software cache`  
-   * `if (LMS_Synchronize(device, false) != 0) {`  
-   *     `printf("Error synchronizing from hardware: %s\n", LMS_GetLastErrorMessage());`  
-   * `}`  
-   *   
+     `if (LMS_Synchronize(device, true) != 0) {`  
+         `printf("Error synchronizing to hardware: %s\n", LMS_GetLastErrorMessage());`  
+     `}`  
+       
+     `// Synchronize hardware to software cache`  
+     `if (LMS_Synchronize(device, false) != 0) {`  
+         `printf("Error synchronizing from hardware: %s\n", LMS_GetLastErrorMessage());`  
+     `}`  
+       
      ---
 
      ### **Additional Functions**
