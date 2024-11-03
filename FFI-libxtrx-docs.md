@@ -1,3 +1,92 @@
+## **Introduction to XTRX Hardware and Software**
+
+### **Overview of XTRX Hardware Capabilities**
+
+The XTRX is a high-performance software-defined radio (SDR) built for compact integration, leveraging a PCIe form factor optimized for applications requiring high data throughput, low latency, and versatile RF performance. The device is designed for real-time signal processing, supporting complex configurations such as multiple-input, multiple-output (MIMO) setups, time-synchronized phased arrays, and custom RF applications.
+
+Key hardware capabilities of the XTRX include:
+
+* **Frequency Range**: Coverage from 10 MHz up to 3.8 GHz, suitable for various communication protocols, testing, and experimental RF applications.  
+* **Bandwidth**: Supports up to 120 MHz bandwidth per channel, providing high-resolution capture and transmission over a broad spectrum.  
+* **Data Processing**: Dual RX/TX channels allow full-duplex operation, enabling MIMO or SISO configurations.  
+* **Timing and Synchronization**: External clock and Pulse-Per-Second (PPS) input for precise timing, synchronization across devices, and alignment in multi-device arrays.  
+* **Compact PCIe Interface**: The XTRX device can be embedded into existing systems, offering direct PCIe data transfer with low latency for real-time applications.
+
+### **Software Stack and `libxtrx` Library**
+
+The `libxtrx` library is the primary interface for controlling and utilizing XTRX devices. This library exposes comprehensive API functions for configuring RF parameters, managing streams, setting up clock sources, controlling GPIO pins, and performing low-level operations such as calibration and diagnostics.
+
+The software stack includes:
+
+* **libxtrx**: Main control library, offering API access to all XTRX hardware capabilities.  
+* **libxtrxll**: A lower-level library interfacing directly with the RFIC, used for advanced users who require direct register manipulation.  
+* **XTRX Utilities**: Command-line tools and example scripts for device configuration, testing, and diagnostics.
+
+### **Supported Hardware Models and Specifications**
+
+| Model | Frequency Range | Bandwidth | Channels | Interface | Clock Sources | Features |
+| ----- | ----- | ----- | ----- | ----- | ----- | ----- |
+| **XTRX Pro** | 10 MHz \- 3.8 GHz | 120 MHz | 2 RX / 2 TX | PCIe | Internal, External, PPS | High stability, MIMO capable |
+| **XTRX Standard** | 10 MHz \- 3.8 GHz | 60 MHz | 2 RX / 2 TX | PCIe | Internal, External | Standard performance, suitable for SISO |
+| **XTRX Mini** | 10 MHz \- 3.8 GHz | 30 MHz | 1 RX / 1 TX | USB | Internal | Compact, portable, lower bandwidth |
+
+### **Compiling and Setting Up `libxtrx`**
+
+1. **Prerequisites**:  
+   * **Dependencies**: Ensure your development environment has CMake, GCC, and libraries for PCIe support.  
+   * **Supported Platforms**: Primarily Linux (Ubuntu recommended); macOS and Windows are also supported but may require additional dependencies.  
+2. **Installation Instructions**:
+
+Clone the `libxtrx` repository:
+
+`git clone https://github.com/xtrx-sdr/libxtrx.git`
+
+`cd libxtrx`
+
+**Configure Build with CMake**:
+
+`mkdir build && cd build`
+
+`cmake ..`
+
+* You can specify options such as `-DENABLE_DEBUG=ON` for debugging or `-DBUILD_SHARED_LIBS=ON` for shared library builds.
+
+**Compile**:
+
+`make`
+
+**Install**:
+
+`sudo make install`
+
+`sudo ldconfig`
+
+3. **Verifying Installation**:
+
+Use `xtrx_test` utility to confirm the device is recognized:
+
+`xtrx_test -l`
+
+* This should list connected XTRX devices and provide initial diagnostics on connection status and PCIe communication.  
+4. **Setting Up Development Environment**:
+
+Include `libxtrx` headers in your C/C++ project:
+
+`#include <libxtrx/xtrx.h>`
+
+Link the compiled library in your project’s build file. For example, using GCC:
+
+`gcc -o my_xtrx_app my_xtrx_app.c -lxtrx`
+
+### **Usage Notes and Coding with `libxtrx`**
+
+* **Device Initialization**: Always initialize the device with `xtrx_open`, passing the device path (e.g., `/dev/xtrx0`). Configure basic settings like clock source and reference frequency with `xtrx_set_ref_clk` and confirm device readiness with test functions if needed.  
+* **Data Streaming**: Use `xtrx_run_ex` for detailed streaming configurations, such as setting wire and host formats. Manage buffers according to the required data resolution and channel configuration.  
+* **Multi-Device Synchronization**: For MIMO or array setups, use `xtrx_open_multi` and configure each device’s PPS input with `xtrx_gpio_configure` to synchronize signals precisely across channels.  
+* **Error Handling and Debugging**: The library provides various error codes. For extensive debugging, use `xtrx_debug_init` to initialize a debug context and configure logging levels with `xtrx_log_setlevel` for more verbose output.  
+* **Advanced Tuning and Calibration**: The `xtrx_val_set` and `xtrx_calibrate` functions allow for fine-tuning and device calibration, which can be essential in adjusting for factors like temperature drift or optimizing for signal clarity in specific environments.
+
+
 Here's an interface summary based on the key `libxtrx` functions available for use in your Rust code through FFI.
 
 1. **Device Management**  
