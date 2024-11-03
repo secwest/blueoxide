@@ -828,145 +828,145 @@ This section covers functions related to setting frequencies, gains, performing 
 
 ### **Configuration and Utility API**
 
-**This section covers functions related to saving and loading device configurations, performing device resets, synchronizing settings, and other utility functions that help manage the LimeSDR device's settings and states.**
+This section covers functions related to saving and loading device configurations, performing device resets, synchronizing settings, and other utility functions that help manage the LimeSDR device's settings and states.
 
 ---
 
 1. **`LMS_SaveConfig(lms_device_t *device, const char *filename)`**  
-   * **Description: Saves the current configuration of the LMS7002M chip to a file, allowing the configuration to be restored later.**  
+   * **Description**: Saves the current configuration of the LMS7002M chip to a file, allowing the configuration to be restored later.**  
    * **Arguments:**  
-     * **`lms_device_t *device`: Device handle obtained from `LMS_Open`.**  
-     * **`const char *filename`: Path to the file where the configuration will be saved.**  
-   * **Returns: `int` \- `0` on success, `-1` if an error occurs.**  
-   * **Usage: Useful for saving custom configurations that may need to be reloaded across sessions. For instance, a user might save specific tuning, calibration, or filter settings and reload them as needed.**  
+     * **`lms_device_t *device`**: Device handle obtained from `LMS_Open`. 
+     * **`const char *filename`**: Path to the file where the configuration will be saved.**  
+   * **Returns**: `int` \- `0` on success, `-1` if an error occurs.**  
+   * **Usage**: Useful for saving custom configurations that may need to be reloaded across sessions. For instance, a user might save specific tuning, calibration, or filter settings and reload them as needed.**  
 2. **`LMS_LoadConfig(lms_device_t *device, const char *filename)`**  
-   * **Description: Loads a previously saved LMS7002M chip configuration from a file.**  
+   * **Description**: Loads a previously saved LMS7002M chip configuration from a file.  
    * **Arguments:**  
-     * **`lms_device_t *device`: Device handle.**  
-     * **`const char *filename`: Path to the file containing the saved configuration.**  
-   * **Returns: `int` \- `0` if successful, `-1` if the configuration load fails.**  
-   * **Usage: Used to restore the device state to a known configuration, which can be helpful for quick setup in scenarios where multiple devices need to be consistently configured.**  
+     * **`lms_device_t *device`**: Device handle.  
+     * **`const char *filename`**: Path to the file containing the saved configuration. 
+   * **Returns**: `int` \- `0` if successful, `-1` if the configuration load fails.  
+   * **Usage**: Used to restore the device state to a known configuration, which can be helpful for quick setup in scenarios where multiple devices need to be consistently configured.  
 3. **`LMS_Reset(lms_device_t *device)`**  
-   * **Description: Resets the entire LimeSDR device, returning it to its default state.**  
+   * **Description**: Resets the entire LimeSDR device, returning it to its default state. 
    * **Arguments:**  
-     * **`lms_device_t *device`: The handle of the device to reset.**  
-   * **Returns: `int` \- `0` on success, `-1` if an error occurs.**  
-   * **Usage: A complete hardware reset is useful when a device needs to be cleared of all configurations, as it reinitializes the LimeSDR to its default setup. This function is typically used to recover from errors or prepare the device for a new configuration.**  
+     * **`lms_device_t *device`**: The handle of the device to reset.  
+   * **Returns**: `int` \- `0` on success, `-1` if an error occurs.  
+   * **Usage**: A complete hardware reset is useful when a device needs to be cleared of all configurations, as it reinitializes the LimeSDR to its default setup. This function is typically used to recover from errors or prepare the device for a new configuration. 
 4. **`LMS_Synchronize(lms_device_t *device, bool toChip)`**  
-   * **Description: Synchronizes the register values between the software cache and the hardware registers of the LimeSDR device.**  
+   * **Description**: Synchronizes the register values between the software cache and the hardware registers of the LimeSDR device.
    * **Arguments:**  
-     * **`lms_device_t *device`: Device handle.**  
-     * **`bool toChip`: If `true`, copies the values from the software cache to the hardware registers; if `false`, updates the cache with the values from the hardware.**  
-   * **Returns: `int` \- `0` on success, `-1` if an error occurs.**  
-   * **Usage: Important for ensuring configuration consistency, particularly in scenarios where external changes may affect register values or when multiple software components may interact with the device.**  
+     * **`lms_device_t *device`**: Device handle.
+     * **`bool toChip`**: If `true`, copies the values from the software cache to the hardware registers; if `false`, updates the cache with the values from the hardware.
+   * **Returns**: `int` \- `0` on success, `-1` if an error occurs.
+   * **Usage**: Important for ensuring configuration consistency, particularly in scenarios where external changes may affect register values or when multiple software components may interact with the device.
 5. **`LMS_EnableCache(lms_device_t *device, bool enable)`**  
-   * **Description: Enables or disables caching of LMS7002M and FPGA register values for the specified device.**  
+   * **Description**: Enables or disables caching of LMS7002M and FPGA register values for the specified device. 
    * **Arguments:**  
-     * **`lms_device_t *device`: Device handle.**  
-     * **`bool enable`: Set to `true` to enable caching, `false` to disable.**  
-   * **Returns: `int` \- `0` if successful, `-1` on failure.**  
-   * **Usage: Helps improve performance by reducing redundant register reads, beneficial in applications requiring frequent access to register values. Caching should be disabled when real-time register updates are critical.**  
+     * **`lms_device_t *device`**: Device handle.
+     * **`bool enable`**: Set to `true` to enable caching, `false` to disable.
+   * **Returns**: `int` \- `0` if successful, `-1` on failure.
+   * **Usage**: Helps improve performance by reducing redundant register reads, beneficial in applications requiring frequent access to register values. Caching should be disabled when real-time register updates are critical.
 6. **`LMS7002M::SoftReset()`**  
-   * **Description: Performs a software reset of the LMS7002M chip, reinitializing its state without fully powering down or disconnecting the device.**  
-   * **Arguments: None.**  
-   * **Returns: `int` \- `0` on success, `-1` if the reset fails.**  
-   * **Usage: Useful for resetting the chip to a known state without a complete hardware reset. This function is often used to clear any temporary settings or errors that may have occurred during testing or streaming.**  
+   * **Description**: Performs a software reset of the LMS7002M chip, reinitializing its state without fully powering down or disconnecting the device.
+   * **Arguments**: None.
+   * **Returns**: `int` \- `0` on success, `-1` if the reset fails.
+   * **Usage**: Useful for resetting the chip to a known state without a complete hardware reset. This function is often used to clear any temporary settings or errors that may have occurred during testing or streaming.
 7. **`LMS_GetDeviceInfo(lms_device_t *device, lms_dev_info_t **info)`**  
-   * **Description: Retrieves detailed information about the connected LimeSDR device, including platform-specific details such as PCIe configurations.**  
+   * **Description**: Retrieves detailed information about the connected LimeSDR device, including platform-specific details such as PCIe configurations.
    * **Arguments:**  
-     * **`lms_device_t *device`: Device handle.**  
-     * **`lms_dev_info_t **info`: Pointer to a pointer where the device information structure will be stored.**  
-   * **Returns: `int` \- `0` on success, `-1` on error.**  
-   * **Usage: Important when managing multiple devices or platforms, especially with PCIe-based LimeSDR configurations.**  
+     * **`lms_device_t *device`**: Device handle.
+     * **`lms_dev_info_t **info`**: Pointer to a pointer where the device information structure will be stored.
+   * **Returns**: `int` \- `0` on success, `-1` on error.
+   * **Usage**: Important when managing multiple devices or platforms, especially with PCIe-based LimeSDR configurations.
 8. **`LMS_GetLibraryVersion(void)`**  
-   * **Description: Returns the version of the LimeSuite API library currently in use.**  
-   * **Returns: `const char*` \- A string indicating the version.**  
-   * **Usage: Important for compatibility checks, especially when developing software that requires specific library versions.**  
+   * **Description**: Returns the version of the LimeSuite API library currently in use.
+   * **Returns**: `const char*` \- A string indicating the version.
+   * **Usage**: Important for compatibility checks, especially when developing software that requires specific library versions.
 9. **`LMS_GetLastErrorMessage(void)`**  
-   * **Description: Retrieves the last error message generated by the LimeSuite API, providing details on why the most recent API function call failed.**  
-   * **Returns: `const char*` \- String containing the last error message.**  
-   * **Usage: Useful in debugging, particularly in cases where more context is required to understand and address errors.**  
+   * **Description**: Retrieves the last error message generated by the LimeSuite API, providing details on why the most recent API function call failed.
+   * **Returns**: `const char*` \- String containing the last error message.
+   * **Usage**: Useful in debugging, particularly in cases where more context is required to understand and address errors.
 10. **`LMS_RegisterLogHandler(LMS_LogHandler handler)`**  
-    * **Description: Registers a custom log handler, redirecting API log messages (errors, warnings, info) to a user-defined function.**  
+    * **Description**: Registers a custom log handler, redirecting API log messages (errors, warnings, info) to a user-defined function.
     * **Arguments:**  
-      * **`LMS_LogHandler handler`: Pointer to a logging function that will handle messages based on log level.**  
-    * **Usage: Useful for integrating LimeSDR logging with external logging systems, enabling custom message handling and filtering.**  
+      * **`LMS_LogHandler handler`**: Pointer to a logging function that will handle messages based on log level.
+    * **Usage**: Useful for integrating LimeSDR logging with external logging systems, enabling custom message handling and filtering.
 11. **`LMS_GetDeviceList(lms_info_str_t *dev_list)`**  
-    * **Description: Retrieves a list of connected LimeSDR devices.**  
+    * **Description**: Retrieves a list of connected LimeSDR devices.
     * **Arguments:**  
-      * **`lms_info_str_t *dev_list`: Array to store device information.**  
-    * **Returns: `int` \- Number of devices found, or `-1` on error.**  
-    * **Usage: Scan for available devices and select one for use. Useful in applications that may need to handle multiple devices.**  
+      * **`lms_info_str_t *dev_list`**: Array to store device information.
+    * **Returns**: `int` \- Number of devices found, or `-1` on error. 
+    * **Usage**: Scan for available devices and select one for use. Useful in applications that may need to handle multiple devices. 
 12. **`LMS_Init(lms_device_t *device)`**  
-    * **Description: Initializes the device with settings to prepare it for operation.**  
+    * **Description**: Initializes the device with settings to prepare it for operation.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-    * **Returns: `int` \- `0` on success, `-1` on error.**  
-    * **Usage: This function is fundamental for initializing the LimeSDR to its default operational state, a prerequisite for reliable data transmission and reception.**  
+      * **`lms_device_t *device`**: Device handle.
+    * **Returns**: `int` \- `0` on success, `-1` on error.
+    * **Usage**: This function is fundamental for initializing the LimeSDR to its default operational state, a prerequisite for reliable data transmission and reception.
 13. **`LMS_ReadCustomBoardParam(lms_device_t *device, uint8_t param_id, float_type *val, lms_name_t units)`**  
-    * **Description: Reads a custom board parameter by its identifier.**  
+    * **Description**: Reads a custom board parameter by its identifier.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`uint8_t param_id`: ID of the parameter to read.**  
-      * **`float_type *val`: Pointer to store the value read.**  
-      * **`lms_name_t units`: Buffer to store units associated with the parameter.**  
-    * **Returns: `int` \- `0` on success, `-1` on failure.**  
-    * **Usage: Allows reading unique board parameters that may be specific to custom configurations or experimental setups.**  
+      * **`lms_device_t *device`**: Device handle  
+      * **`uint8_t param_id`**: ID of the parameter to read. 
+      * **`float_type *val`**: Pointer to store the value read.
+      * **`lms_name_t units`**: Buffer to store units associated with the parameter. 
+    * **Returns**: `int` \- `0` on success, `-1` on failure.**  
+    * **Usage**: Allows reading unique board parameters that may be specific to custom configurations or experimental setups.
 14. **`LMS_WriteCustomBoardParam(lms_device_t *device, uint8_t param_id, float_type val, const lms_name_t units)`**  
-    * **Description: Writes a value to a specified custom board parameter.**  
+    * **Description**: Writes a value to a specified custom board parameter.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`uint8_t param_id`: ID of the parameter to set.**  
-      * **`float_type val`: Value to write.**  
-      * **`const lms_name_t units`: Units associated with the parameter.**  
-    * **Returns: `int` \- `0` on success, `-1` if an error occurs.**  
-    * **Usage: Useful in custom applications needing control over experimental or board-specific parameters for configuration beyond standard API limits.**  
+      * **`lms_device_t *device`**: Device handle.
+      * **`uint8_t param_id`**: ID of the parameter to set.
+      * **`float_type val`**: Value to write.
+      * **`const lms_name_t units`**: Units associated with the parameter.
+    * **Returns**: `int` \- `0` on success, `-1` if an error occurs.
+    * **Usage**: Useful in custom applications needing control over experimental or board-specific parameters for configuration beyond standard API limits.
 15. **`LMS_EnableCache(lms_device_t *device, bool enable)`**  
-    * **Description: Enables or disables register caching for a specific device.**  
+    * **Description**: Enables or disables register caching for a specific device. 
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`bool enable`: Set to `true` to enable caching, `false` to disable.**  
-    * **Returns: `int` \- `0` if successful, `-1` on failure.**  
-    * **Usage: Caching improves performance by reducing the need for redundant register reads. It should be enabled in scenarios where register values do not need to be immediately updated, and disabled when real-time data is critical.**  
+      * **`lms_device_t *device`**: Device handle.**  
+      * **`bool enable`**: Set to `true` to enable caching, `false` to disable.
+    * **Returns**: `int` \- `0` if successful, `-1` on failure.
+    * **Usage**: Caching improves performance by reducing the need for redundant register reads. It should be enabled in scenarios where register values do not need to be immediately updated, and disabled when real-time data is critical.
 16. **`LMS_GetClockLockedStatus(lms_device_t *device, size_t chan)`**  
-    * **Description: Checks if the LO (Local Oscillator) or CGEN (Clock Generator) clock is locked for the specified channel, confirming that the frequency settings are stable.**  
+    * **Description**: Checks if the LO (Local Oscillator) or CGEN (Clock Generator) clock is locked for the specified channel, confirming that the frequency settings are stable.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`size_t chan`: Channel index (e.g., 0 or 1).**  
-    * **Returns: `bool` \- `true` if the clock is locked; `false` if not.**  
-    * **Usage: Clock locking is critical in applications requiring high-frequency stability. This function helps verify that the LO or CGEN is properly tuned and stable before streaming or testing.**  
+      * **`lms_device_t *device`**: Device handle.
+      * **`size_t chan`**: Channel index (e.g., 0 or 1).
+    * **Returns**: `bool` \- `true` if the clock is locked; `false` if not.  
+    * **Usage**: Clock locking is critical in applications requiring high-frequency stability. This function helps verify that the LO or CGEN is properly tuned and stable before streaming or testing.
 17. **`LMS_GetNumChannels(lms_device_t *device, bool dir_tx)`**  
-    * **Description: Retrieves the number of available channels for either RX or TX.**  
+    * **Description**: Retrieves the number of available channels for either RX or TX.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`bool dir_tx`: `true` for TX channels, `false` for RX channels.**  
-    * **Returns: `int` \- Number of channels on success, `-1` on failure.**  
-    * **Usage: Used to check the available channel count, which is essential in multi-channel applications to dynamically adjust the configuration.**  
+      * **`lms_device_t *device`**: Device handle.
+      * **`bool dir_tx`**: `true` for TX channels, `false` for RX channels.
+    * **Returns**: `int` \- Number of channels on success, `-1` on failure.
+    * **Usage***: Used to check the available channel count, which is essential in multi-channel applications to dynamically adjust the configuration.
 18. **`LMS_GetSampleRateRange(lms_device_t *device, bool dir_tx, lms_range_t *range)`**  
-    * **Description: Provides the supported range of sample rates for a specified RX or TX path.**  
+    * **Description**: Provides the supported range of sample rates for a specified RX or TX path.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`bool dir_tx`: `true` for TX, `false` for RX.**  
-      * **`lms_range_t *range`: Pointer to a structure that stores the minimum, maximum, and step values of the sample rate.**  
-    * **Returns: `int` \- `0` on success, `-1` if an error occurs.**  
-    * **Usage: Useful for determining valid sample rates prior to configuration, ensuring that settings fall within the device’s operational limits.**  
+      * **`lms_device_t *device`**: Device handle.
+      * **`bool dir_tx`**: `true` for TX, `false` for RX.
+      * **`lms_range_t *range`**: Pointer to a structure that stores the minimum, maximum, and step values of the sample rate.**  
+    * **Returns**: `int` \- `0` on success, `-1` if an error occurs.
+    * **Usage**: Useful for determining valid sample rates prior to configuration, ensuring that settings fall within the device’s operational limits.
 19. **`LMS_GetLOFrequencyRange(lms_device_t *device, bool dir_tx, lms_range_t *range)`**  
-    * **Description: Retrieves the permissible range of LO frequencies for a specified RX or TX channel.**  
+    * **Description**: Retrieves the permissible range of LO frequencies for a specified RX or TX channel. 
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`bool dir_tx`: `true` for TX, `false` for RX.**  
-      * **`lms_range_t *range`: Structure to store the minimum, maximum, and step values for the LO frequency.**  
-    * **Returns: `int` \- `0` on success, `-1` on error.**  
-    * **Usage: This function is crucial for applications requiring dynamic tuning within the hardware's frequency capabilities.**  
+      * **`lms_device_t *device`**: Device handle.  
+      * **`bool dir_tx`**: `true` for TX, `false` for RX. 
+      * **`lms_range_t *range`**: Structure to store the minimum, maximum, and step values for the LO frequency.  
+    * **Returns**: `int` \- `0` on success, `-1` on error.
+    * **Usage**: This function is crucial for applications requiring dynamic tuning within the hardware's frequency capabilities.
 20. **`LMS_GetLPFBWRange(lms_device_t *device, bool dir_tx, lms_range_t *range)`**  
-    * **Description: Retrieves the allowed range of low-pass filter (LPF) bandwidths for a specified RX or TX path.**  
+    * **Description**: Retrieves the allowed range of low-pass filter (LPF) bandwidths for a specified RX or TX path.
     * **Arguments:**  
-      * **`lms_device_t *device`: Device handle.**  
-      * **`bool dir_tx`: `true` for TX, `false` for RX.**  
-      * **`lms_range_t *range`: Pointer to an `lms_range_t` structure to store the min, max, and step values.**  
-    * **Returns: `int` \- `0` on success, `-1` on error.**  
-    * **Usage: This function is critical for applications needing to adjust the LPF within the supported bandwidth range, ensuring optimal filtering for specific frequency ranges.**  
-    * 
+      * **`lms_device_t *device`**: Device handle.  
+      * **`bool dir_tx`**: `true` for TX, `false` for RX.
+      * **`lms_range_t *range`**: Pointer to an `lms_range_t` structure to store the min, max, and step values.
+    * **Returns**: `int` \- `0` on success, `-1` on error.
+    * **Usage**: This function is critical for applications needing to adjust the LPF within the supported bandwidth range, ensuring optimal filtering for specific frequency ranges. 
+    
 
 ---
 
