@@ -108,13 +108,10 @@ int main() {
 
 ### Best Practices and Tips
 
-### Error Handling: Use `bladerf_strerror` and `bladerf_get_last_error` to retrieve detailed error messages, especially during configuration and streaming operations.
-
-### Data Streaming: For applications requiring high-throughput data handling, tune buffer sizes and the number of buffers in `bladerf_init_stream` to optimize performance.
-
-### Version Compatibility: Use `bladerf_check_fw_compat` to ensure firmware compatibility with your version of `libbladeRF`.
-
-### Loopback Testing: For initial development and testing, use loopback modes to confirm data integrity without the need for external RF signals.
+Error Handling: Use `bladerf_strerror` and `bladerf_get_last_error` to retrieve detailed error messages, especially during configuration and streaming operations.
+Data Streaming: For applications requiring high-throughput data handling, tune buffer sizes and the number of buffers in `bladerf_init_stream` to optimize performance.
+Version Compatibility: Use `bladerf_check_fw_compat` to ensure firmware compatibility with your version of `libbladeRF`.
+Loopback Testing: For initial development and testing, use loopback modes to confirm data integrity without the need for external RF signals.
 
 ### This document serves as a reference for developing SDR applications with bladeRF hardware and `libbladeRF`. By following the setup steps and utilizing the outlined API functions, you can fully leverage the capabilities of the bladeRF platform in RF experimentation, signal processing, and beyond.
 
