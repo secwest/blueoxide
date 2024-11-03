@@ -1,5 +1,9 @@
 ## Introduction to `libbladeRF` Documentation
 
+Compiled by Dragos Ruiu, Nov 3 2024
+v1.0
+
+
 ### Overview of Hardware Capabilities
 
 The bladeRF software-defined radio (SDR) platform, developed by Nuand, provides a versatile RF transceiver with high performance and extensive configurability. The bladeRF hardware is available in multiple models, including the bladeRF x40, bladeRF x115, and bladeRF 2.0 micro.
