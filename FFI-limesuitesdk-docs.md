@@ -1,6 +1,6 @@
 ## **Introduction to LimeSDR SDK Documentation**
 
-Compiled by Dragos Ruiu November 03 2024 v1.0
+Compiled by Dragos Ruiu - November 03 2024 - v1.0
 
 ### **Hardware Capabilities of LimeSDR**
 
