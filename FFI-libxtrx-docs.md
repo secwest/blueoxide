@@ -1,5 +1,7 @@
 ## **Introduction to XTRX Hardware and Software**
 
+Compiled by Dragos Ruiu - November 03, 2024 - v1.0
+
 ### **Overview of XTRX Hardware Capabilities**
 
 The XTRX is a high-performance software-defined radio (SDR) built for compact integration, leveraging a PCIe form factor optimized for applications requiring high data throughput, low latency, and versatile RF performance. The device is designed for real-time signal processing, supporting complex configurations such as multiple-input, multiple-output (MIMO) setups, time-synchronized phased arrays, and custom RF applications.
