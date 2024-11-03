@@ -1,5 +1,7 @@
 ## **Introduction to LimeSDR SDK Documentation**
 
+Compiled by Dragos Ruiu November 03 2024 v1.0
+
 ### **Hardware Capabilities of LimeSDR**
 
 The LimeSDR family of devices, including LimeSDR, LimeSDR-Mini, and LimeSDR-PCIe, are highly flexible Software Defined Radios (SDRs) designed for a wide range of RF applications. LimeSDR devices are based on the LMS7002M transceiver, which supports:
