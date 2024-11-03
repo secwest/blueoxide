@@ -1,3 +1,216 @@
+## **Introduction to LimeSDR SDK Documentation**
+
+### **Hardware Capabilities of LimeSDR**
+
+The LimeSDR family of devices, including LimeSDR, LimeSDR-Mini, and LimeSDR-PCIe, are highly flexible Software Defined Radios (SDRs) designed for a wide range of RF applications. LimeSDR devices are based on the LMS7002M transceiver, which supports:
+
+1. **Frequency Range**: Covers from 100 kHz up to 3.8 GHz, enabling applications across HF, VHF, UHF, and up into the GHz range, which supports cellular, Wi-Fi, and various satellite frequencies.  
+2. **Channels**: Configurable as full-duplex, supporting simultaneous transmit (TX) and receive (RX) operations.  
+3. **Bandwidth**: Supports up to 61.44 MHz bandwidth per channel.  
+4. **Multiple Interfaces**: USB 3.0 for LimeSDR and LimeSDR-Mini, and PCIe for LimeSDR-PCIe models, providing high throughput and low-latency connections for demanding applications.  
+5. **LMS7002M Chip**: The transceiver chip in LimeSDR provides flexible signal routing and filtering, as well as tunable low-pass, band-pass, and digital filters.
+
+These capabilities make LimeSDR suitable for applications in cellular networks (GSM, LTE), IoT, radar, digital communications, and satellite ground stations, among others.
+
+| Feature | LimeSDR-USB | LimeSDR-Mini | LimeSDR-PCIe |
+| ----- | ----- | ----- | ----- |
+| **Frequency Range** | 100 kHz – 3.8 GHz | 10 MHz – 3.5 GHz | 100 kHz – 3.8 GHz |
+| **Bandwidth** | Up to 61.44 MHz | Up to 30.72 MHz | Up to 61.44 MHz |
+| **Channels** | 2×2 MIMO (2 RX, 2 TX) | 1×1 (1 RX, 1 TX) | 2×2 MIMO (2 RX, 2 TX) |
+| **ADC/DAC Resolution** | 12-bit | 12-bit | 12-bit |
+| **Interface** | USB 3.0 | USB 3.0 | PCIe |
+| **FPGA** | Altera Cyclone IV EP4CE40F23 | Intel MAX 10 | Altera Cyclone IV EP4CE40F23 |
+| **Power Supply** | USB-powered (external optional) | USB-powered | PCIe slot-powered |
+| **Form Factor** | 100 mm × 60 mm | 69 mm × 31 mm | Standard PCIe card size |
+| **Price Range** | Approximately $299 | Approximately $139 | Approximately $499 |
+
+**Key Differences and Considerations:**
+
+1. **Frequency Range**:  
+   * The LimeSDR-USB and LimeSDR-PCIe models offer a broader frequency range (100 kHz to 3.8 GHz), making them suitable for applications requiring coverage of HF bands.  
+   * The LimeSDR-Mini starts at 10 MHz, which may limit its use in lower-frequency applications.  
+2. **Bandwidth**:  
+   * LimeSDR-USB and LimeSDR-PCIe support up to 61.44 MHz bandwidth, accommodating wideband applications.  
+   * LimeSDR-Mini supports up to 30.72 MHz, which is sufficient for many standard applications but may be restrictive for ultra-wideband requirements.  
+3. **Channels**:  
+   * LimeSDR-USB and LimeSDR-PCIe feature 2×2 MIMO, enabling simultaneous dual-channel RX and TX, beneficial for applications like MIMO communications and diversity reception.  
+   * LimeSDR-Mini has a single RX and TX channel, suitable for simpler applications.  
+4. **Interface and Power**:  
+   * LimeSDR-USB and LimeSDR-Mini connect via USB 3.0, offering portability and ease of use with laptops and desktops.  
+   * LimeSDR-PCIe connects via a PCIe slot, providing higher data throughput and lower latency, advantageous for high-performance applications.  
+5. **FPGA Resources**:  
+   * The FPGA in LimeSDR-USB and LimeSDR-PCIe (Altera Cyclone IV EP4CE40F23) offers more logic elements compared to the Intel MAX 10 in LimeSDR-Mini, allowing for more complex on-board processing.
+
+**Coding and Application Considerations:**
+
+* **Driver and API Compatibility**:  
+  * All models are supported by the LimeSuite software, ensuring a consistent API across devices.  
+  * However, certain features like dual-channel operations are only applicable to LimeSDR-USB and LimeSDR-PCIe.  
+* **Performance Optimization**:  
+  * For applications requiring high data rates and low latency, LimeSDR-PCIe is preferable due to its PCIe interface.  
+  * LimeSDR-Mini's smaller form factor and USB power make it ideal for portable or space-constrained applications.  
+* **Power Consumption**:  
+  * LimeSDR-USB may require an external power supply for full performance, especially when using both channels at high power.  
+  * LimeSDR-Mini is designed to operate solely on USB power, simplifying deployment.  
+* **Development Environment**:  
+  * The choice of model may influence the development environment, especially concerning FPGA programming and resource availability.  
+  * Developers should consider the FPGA's capacity when planning on-board signal processing tasks.
+
+---
+
+### **Software Stack Overview**
+
+The LimeSDR SDK (LimeSuite) provides a comprehensive software stack that includes:
+
+* **Driver Libraries**: Core libraries that interface directly with the LimeSDR hardware, handling low-level control of the LMS7002M transceiver and various registers.  
+* **SoapySDR Compatibility**: LimeSDR is compatible with SoapySDR, a popular SDR abstraction layer, allowing interoperability with multiple SDR applications and frameworks.  
+* **LimeSuiteGUI**: A graphical interface for manual configuration, monitoring, and testing of the LimeSDR hardware.  
+* **LimeRFE Support**: Integration with LimeRFE modules, which extend LimeSDR functionality by adding configurable front-end components (filters, amplifiers, switches).
+
+---
+
+### **Instructions for Compiling and Setting Up LimeSDR SDK**
+
+To compile and set up the LimeSDR SDK, follow these steps:
+
+#### **1\. Prerequisites**
+
+Ensure you have the following dependencies installed on your system:
+
+* **CMake** (minimum version 3.2)  
+* **GNU Make**  
+* **GCC** or **Clang**  
+* **libusb** (for USB-based LimeSDR devices)  
+* **SoapySDR** (for SoapySDR integration)
+
+For Ubuntu-based systems, install dependencies with:
+
+`sudo apt-get update`
+
+`sudo apt-get install cmake g++ libusb-1.0-0-dev`
+
+#### **2\. Cloning the Repository**
+
+Clone the LimeSuite repository from GitHub:
+
+`git clone https://github.com/myriadrf/LimeSuite.git`
+
+`cd LimeSuite`
+
+#### **3\. Building the Library**
+
+To build LimeSuite, use CMake and Make:
+
+`mkdir build`
+
+`cd build`
+
+`cmake ..`
+
+`make`
+
+`sudo make install`
+
+`sudo ldconfig`
+
+* **CMake Options**:  
+  * `-DENABLE_GUI=ON`: Enables LimeSuiteGUI.  
+  * `-DENABLE_REMOTE=ON`: Enables remote access for LimeSDR devices.  
+  * `-DENABLE_SOAPY=ON`: Builds with SoapySDR integration for compatibility with Soapy-based SDR applications.
+
+#### **4\. Installing LimeSuiteGUI (Optional)**
+
+To install the LimeSuiteGUI application for device testing and configuration:
+
+`cmake .. -DENABLE_GUI=ON`
+
+`make`
+
+`sudo make install`
+
+Once installed, LimeSuiteGUI can be used to visually configure and test the LimeSDR hardware, access RF settings, control the LMS7002M registers, and monitor RF signal quality.
+
+#### **5\. Testing the Installation**
+
+To verify the installation and detect connected LimeSDR devices:
+
+`LimeUtil --find`
+
+This command should list any connected LimeSDR devices, confirming that the driver is installed and the device is recognized.
+
+---
+
+### **Programming with the LimeSDR SDK**
+
+When developing applications with LimeSDR, consider the following steps:
+
+#### **1\. Initializing the Device**
+
+Begin by opening and initializing the device:
+
+`lms_device_t *device = nullptr;`
+
+`if (LMS_Open(&device, nullptr, nullptr) != 0) {`
+
+    `printf("Failed to open LimeSDR\n");`
+
+`}`
+
+Use `LMS_GetDeviceList` to select a specific device if more than one is connected.
+
+#### **2\. Setting Up RX/TX Streams**
+
+Define the sample rate, frequency, gain, and antenna:
+
+`LMS_SetSampleRate(device, 10e6, 2); // 10 MHz with oversampling factor of 2`
+
+`LMS_SetLOFrequency(device, LMS_CH_RX, 0, 1e9); // RX at 1 GHz`
+
+`LMS_SetGaindB(device, LMS_CH_RX, 0, 30); // RX gain of 30 dB`
+
+`LMS_SetAntenna(device, LMS_CH_RX, 0, LMS_ANTENNA_AUTO); // Automatic antenna`
+
+Configure the data stream, then activate it with `LMS_StartStream`.
+
+#### **3\. Reading and Writing Data**
+
+For receiving data:
+
+`LMS_RecvStream(&stream, buffer, sample_count, &meta, timeout);`
+
+For transmitting data:
+
+`LMS_SendStream(&stream, buffer, sample_count, &meta, timeout);`
+
+Stop the stream after use:
+
+`LMS_StopStream(&stream);`
+
+`LMS_DestroyStream(device, &stream);`
+
+#### **4\. Device Calibration**
+
+Use calibration functions, like `LMS_Calibrate`, to optimize the device’s RF performance. This step is particularly useful in multi-band and high-gain applications to ensure signal quality.
+
+#### **5\. Closing the Device**
+
+After completing operations, always close the device:
+
+`LMS_Close(device);`
+
+---
+
+### **Development and Debugging Tips**
+
+* **Logging**: Use `LMS_RegisterLogHandler` to capture log messages for debugging.  
+* **Error Tracking**: Retrieve error messages with `LMS_GetLastErrorMessage` to understand the cause of any issues.  
+* **LimeSuiteGUI**: Use for visual inspection and experimentation with device settings, which can later be replicated in code.
+
+---
+
+
+
+
 # **LimeSuite SDK API Documentation**
 
 ## **Introduction**
