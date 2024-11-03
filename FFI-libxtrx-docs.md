@@ -86,7 +86,7 @@ Link the compiled library in your project’s build file. For example, using GCC
 * **Error Handling and Debugging**: The library provides various error codes. For extensive debugging, use `xtrx_debug_init` to initialize a debug context and configure logging levels with `xtrx_log_setlevel` for more verbose output.  
 * **Advanced Tuning and Calibration**: The `xtrx_val_set` and `xtrx_calibrate` functions allow for fine-tuning and device calibration, which can be essential in adjusting for factors like temperature drift or optimizing for signal clarity in specific environments.
 
-
+# Overview of `libxtrx`
 Here's an interface summary based on the key `libxtrx` functions available for use in your Rust code through FFI.
 
 1. **Device Management**  
