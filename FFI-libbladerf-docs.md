@@ -104,6 +104,7 @@ int main() {
     bladerf_close(dev);
     return 0;
 }
+```
 
 ### **Best Practices and Tips**
 
