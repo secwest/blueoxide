@@ -60,6 +60,15 @@ impl AdvertisingPdu {
     pub fn rx_add_random(&self) -> bool {
         self.header[0] & 0x80 != 0
     }
+
+    pub fn link_layer_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(4 + 2 + self.payload.len() + 3);
+        bytes.extend_from_slice(&LE_ADV_ACCESS_ADDRESS.to_le_bytes());
+        bytes.extend_from_slice(&self.header);
+        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(&self.crc);
+        bytes
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -239,13 +248,7 @@ pub fn decode_primary_advertising(
                 payload: body[2..pdu_length].to_vec(),
                 crc: received_crc,
             };
-            if !packets.iter().any(|existing: &AdvertisingPdu| {
-                existing.header == packet.header
-                    && existing.payload == packet.payload
-                    && existing.crc == packet.crc
-            }) {
-                packets.push(packet);
-            }
+            packets.push(packet);
         }
     }
     Ok(packets)
@@ -305,6 +308,57 @@ mod tests {
             crc24_bytes(&[0x00, 0x00], LE_ADV_CRC_INIT),
             [0x1d, 0xb5, 0x38]
         );
+        assert_eq!(
+            crc24_bytes(&[0x00, 0x06, 1, 2, 3, 4, 5, 6], LE_ADV_CRC_INIT),
+            [0x42, 0xf5, 0xf2]
+        );
+        assert_eq!(
+            crc24_bytes(
+                &[
+                    0x05, 0x00, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff
+                ],
+                LE_ADV_CRC_INIT
+            ),
+            [0x0c, 0xc8, 0x32]
+        );
+    }
+
+    #[test]
+    fn whitening_matches_independent_phy_vectors() {
+        let input = [
+            0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x1d, 0xb5, 0x38,
+        ];
+        for (channel, expected) in [
+            (
+                0,
+                [
+                    0x40, 0xb4, 0xbd, 0xc1, 0x1c, 0x33, 0x4f, 0x59, 0x98, 0x43, 0xa4,
+                ],
+            ),
+            (
+                37,
+                [
+                    0x8d, 0xd4, 0x56, 0xa3, 0x3e, 0xa3, 0x63, 0xb6, 0x68, 0x84, 0x29,
+                ],
+            ),
+            (
+                38,
+                [
+                    0xd6, 0xc3, 0x45, 0x22, 0x5a, 0xda, 0xe4, 0x89, 0x06, 0x10, 0x97,
+                ],
+            ),
+            (
+                39,
+                [
+                    0x1f, 0x31, 0x4b, 0x5d, 0x86, 0xf2, 0x99, 0x9c, 0xdc, 0x63, 0xfd,
+                ],
+            ),
+        ] {
+            let mut bits = bytes_to_bits_lsb(&input);
+            whiten_bits(&mut bits, BleChannel::new(channel).unwrap());
+            assert_eq!(bits_to_bytes_lsb(&bits), expected, "channel {channel}");
+        }
     }
 
     #[test]

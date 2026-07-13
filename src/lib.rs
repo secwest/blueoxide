@@ -4,11 +4,13 @@
 //! SDR drivers will be isolated behind backend modules so the protocol and DSP
 //! core remains testable without attached hardware.
 
+pub mod advertising;
 pub mod ble;
 pub mod complex;
 pub mod demod;
 pub mod error;
 pub mod iq;
+pub mod pcapng;
 pub mod sdr;
 
 pub use error::{Error, Result};
