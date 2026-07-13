@@ -1,0 +1,20 @@
+[package]
+name = "blueoxide"
+version = "0.1.0"
+edition = "2024"
+description = "Dependency-light Bluetooth and Bluetooth Low Energy SDR receive and capture tools"
+repository = "https://github.com/secwest/blueoxide"
+
+[lib]
+name = "blueoxide"
+path = "src/lib.rs"
+
+[[bin]]
+name = "blueoxide"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
