@@ -81,6 +81,11 @@ pub trait IqSource {
     fn kind(&self) -> SdrKind;
     fn capabilities(&self) -> SdrCapabilities;
     fn configure(&mut self, config: &SdrConfig) -> Result<()>;
+    /// Returns the hardware-applied sample rate after configuration when the
+    /// backend can query or receives that value from the native API.
+    fn applied_sample_rate_hz(&self) -> Option<u32> {
+        None
+    }
     fn start(&mut self) -> Result<()>;
     fn read(
         &mut self,

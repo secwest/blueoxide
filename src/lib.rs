@@ -5,11 +5,14 @@
 //! core remains testable without attached hardware.
 
 pub mod advertising;
+pub mod backends;
 pub mod ble;
+pub mod capture;
 pub mod complex;
 pub mod demod;
 pub mod error;
 pub mod iq;
+pub mod native;
 pub mod pcapng;
 pub mod sdr;
 

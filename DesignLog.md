@@ -79,7 +79,7 @@ into packet metadata and capture files.
 ### Backend requirements
 
 - LimeSuite, libbladeRF, and libxtrx adapters must use direct, reviewed FFI
-  behind Cargo features.
+  isolated behind runtime backend modules.
 - Native status and error codes must be preserved in Blueoxide errors.
 - Device open, configure, start, read, stop, and close operations must be
   idempotent where practical and unwind resources on partial initialization.
@@ -123,10 +123,8 @@ The result is also immediately useful for receiver bring-up and RF validation.
   recovery loop.
 - Carrier offset is absorbed by the slicing threshold only while the two GFSK
   levels remain separable.
-- Duplicate suppression currently uses packet bytes, so identical repeated
-  advertisements in one input buffer collapse into one result.
-- The decoder does not yet preserve absolute sample offsets through every timing
-  phase, RSSI, noise estimate, or wall-clock/hardware timestamps.
+- The decoder does not yet report calibrated RSSI, noise estimates, or a
+  hardware-correlated wall-clock timestamp.
 - LE 2M, LE Coded PHY, secondary advertising, and data-channel PDUs are not yet
   decoded.
 
@@ -317,3 +315,85 @@ resulting fixed vectors belong in the Blueoxide test suite.
   interval, and hop increment.
 
 Detailed commands and results are recorded in `Verification.md`.
+
+## 2026-07-13: Load vendor libraries dynamically
+
+### Decision
+
+Use a small in-tree dynamic loader for the native SDR transport boundary rather
+than link-time dependencies or Rust wrapper crates. Windows uses
+`LoadLibraryW`/`GetProcAddress`/`FreeLibrary`; Unix platforms use
+`dlopen`/`dlsym`/`dlclose`.
+
+### Rationale
+
+Protocol, DSP, file decoding, tests, and documentation must remain buildable on
+machines without every vendor SDK. Dynamic loading makes backend availability a
+runtime capability while retaining exact control over the reviewed ABI.
+
+### Safety boundary
+
+- Every loaded function type is transcribed from a pinned official header.
+- A backend struct owns the library handle for at least as long as all copied
+  function pointers.
+- Symbol lookup is the only generic unsafe conversion from data pointer bits to
+  a typed function pointer.
+- Native device handles never enter protocol or DSP modules.
+- Native buffers are sized with checked arithmetic before an FFI call.
+- Mock-native tests exercise lifecycle and error paths without loading a vendor
+  library.
+
+### Consequences
+
+The loader itself has no third-party dependency, but live operation still
+requires the vendor library and device firmware. ABI changes require updating
+the pinned source revision, reviewing every signature and layout, and rerunning
+backend tests.
+
+## 2026-07-13: First live backend uses bladeRF metadata RX
+
+### Decision
+
+Implement bladeRF reception through libbladeRF's synchronous
+`BLADERF_FORMAT_SC16_Q11_META` API. Set `BLADERF_META_FLAG_RX_NOW` for every
+continuous read, convert interleaved Q11 I/Q to `Complex32`, and propagate the
+metadata timestamp, contiguous sample count, overrun flag, and inferred sample
+gaps into `ReadMetadata`.
+
+### Rationale
+
+The metadata format exposes the free-running FPGA sample counter needed to
+detect discontinuities. The non-metadata format could receive samples but could
+not meet the capture provenance contract.
+
+### Error policy
+
+- Native timeout is a recoverable empty read.
+- Other nonzero native status values become `Error::NativeCall` with operation,
+  code, and the vendor error string.
+- A success result with a null device, excessive returned sample count, or
+  timestamp overflow is rejected as a native contract violation.
+- Capture always calls `stop` after read, decode, or packet-output failure.
+- `Drop` retries RX disable when necessary and always closes the device.
+
+### Channel-layout decision
+
+The backend exposes one receive channel because `BLADERF_RX_X1` maps to RX0.
+Although bladeRF 2 hardware has two receivers, selecting RX1 correctly requires
+an X2 stream and explicit deinterleaving. Reporting two usable channels before
+that implementation would allow a configuration that enables RX1 while reading
+RX0 data.
+
+### Applied-rate decision
+
+libbladeRF reports its applied sample rate and bandwidth. Blueoxide records
+both and refuses to start the LE demodulator when the applied sample rate does
+not exactly match the requested demodulator rate. This favors explicit failure
+over silently decoding with an invalid symbol clock.
+
+### Verification limitation
+
+The native ABI and state machine are verified against the pinned official
+libbladeRF source and mock-native tests. No bladeRF library or physical radio
+was available in the development environment, so over-the-air behavior remains
+an explicit pending hardware verification item.

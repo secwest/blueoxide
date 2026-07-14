@@ -36,8 +36,20 @@
 - `blueoxide channels` and `blueoxide decode` commands.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
+- An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.
+- A runtime-loaded libbladeRF receive backend with SC16 Q11 metadata streaming,
+  immediate continuous receive, FPGA timestamps, timeout recovery, overrun and
+  dropped-sample reporting, applied-rate reporting, deterministic library
+  overrides, and validated lifecycle cleanup.
+- A finite live-capture loop with sample and duration limits, cross-block
+  decoding, capture-relative packet timestamps, and unconditional source stop
+  after stream-time failures.
+- `blueoxide backends` and `blueoxide capture --device bladerf` commands.
+- Live CLI validation for duration overflow, zero-sized reads, zero timeouts,
+  unsupported devices, and missing native libraries.
 - Unit tests for channel mapping, whitening, CRC, PDU validation, GFSK
-  demodulation, malformed I/Q input, and SDR configuration failures.
+  demodulation, malformed I/Q input, SDR configuration failures, native backend
+  lifecycle, timeout recovery, timestamp gaps/overflow, cleanup, and ABI layout.
 - Cross-implementation CRC/whitening fixtures and external Scapy PCAPNG
   interoperability checks.
 - Linux and Windows GitHub Actions gates for formatting, tests, Clippy, and
@@ -53,11 +65,11 @@
 
 ### Known limitations
 
-- No hardware backend is connected to the new `IqSource` API yet.
-- The executable currently receives LE 1M primary-advertising IQ from files;
-  live hardware backends are not connected yet.
+- LimeSDR and XTRX backends are not connected to `IqSource` yet.
+- The bladeRF backend has not yet been exercised with an installed libbladeRF
+  library or physical radio in the development environment.
+- bladeRF live capture currently supports the RX0/X1 stream layout only.
 - The demodulator requires an integer multiple of 1 MHz sample rate.
-- Hardware timestamps, calibrated RSSI/SNR, connection following, extended
-  advertising, higher protocol layers, Bluetooth Classic, LE 2M, and LE Coded
-  PHY remain to be implemented.
-
+- Hardware-correlated wall-clock time, calibrated RSSI/SNR, connection
+  following, extended advertising, higher protocol layers, Bluetooth Classic,
+  LE 2M, and LE Coded PHY remain to be implemented.

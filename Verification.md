@@ -12,6 +12,11 @@ dependency.
 - NumPy: 2.4.6
 - Scapy: 2.7.0
 
+No libbladeRF, LimeSuite, libxtrx installation, or attached SDR was present in
+the development environment. Native-backend verification in this increment is
+therefore source/ABI review plus mock-native execution, not an over-the-air
+hardware claim.
+
 ## Independent BLE PHY vectors
 
 Reference:
@@ -135,6 +140,50 @@ The checked-in test suite covers:
 - Invalid CONNECT_IND timing and channel constraints.
 - Arbitrary bounded advertising PDU payloads without panics.
 - PCAPNG block lengths, link type, flags, byte order, and timestamp conversion.
+- Dynamic symbol loading on the host operating system.
+- bladeRF open/configure/start/read/stop/close ordering and drop cleanup.
+- Q11 edge-value conversion, short native reads, receive timeouts, native
+  overruns, forward timestamp gaps, backward timestamps, and timestamp overflow.
+- Decoder validation and applied-sample-rate checks before hardware streaming.
+- Live CLI failure handling without an installed vendor library.
+
+## libbladeRF ABI and behavior verification
+
+Reference:
+
+- Project: Nuand bladeRF / libbladeRF
+- Commit: `41b7fc705651404e2a180c477309cb2d29f4d69b`
+- Header: `host/libraries/libbladeRF/include/libbladeRF.h`
+- Sync implementation:
+  `host/libraries/libbladeRF/src/streaming/sync.c`
+- Official metadata example:
+  `host/libraries/libbladeRF/doc/examples/sync_rx_meta.c`
+
+The reviewed source confirms:
+
+| Blueoxide assumption | Official definition/behavior |
+| --- | --- |
+| RX channel mapping | `BLADERF_CHANNEL_RX(ch) = ch << 1` |
+| X1 stream layout | `BLADERF_RX_X1 = 0` |
+| Metadata format | `BLADERF_FORMAT_SC16_Q11_META = 2` at the pinned revision |
+| Sample representation | Interleaved signed I then Q, Q11 range `[-2048, 2048)` |
+| Immediate receive flag | `BLADERF_META_FLAG_RX_NOW = 1 << 31` |
+| Overrun status | `BLADERF_META_STATUS_OVERRUN = 1 << 0` |
+| Timeout status | `BLADERF_ERR_TIMEOUT = -6` |
+| Timestamp type | Unsigned 64-bit free-running FPGA sample counter |
+| Metadata ABI on 64-bit targets | Size 56 bytes, alignment 8 bytes |
+
+The pinned `sync.c` implementation shows that a metadata read without RX_NOW is
+timestamp-directed and can return `BLADERF_ERR_TIME_PAST`; with RX_NOW it writes
+the timestamp of the first returned sample. It also sets `actual_count` to the
+number of contiguous samples returned. Blueoxide has fixed regression tests
+that require RX_NOW on every native read and reject an `actual_count` larger
+than the supplied buffer.
+
+The official metadata example and libbladeRF timestamp tests also initialize
+continuous receive with RX_NOW. Blueoxide's mock ABI verifies the same input
+flag, output timestamp/status/count handling, and Q11 conversion independently
+of a loaded vendor library.
 
 Commands:
 
@@ -149,6 +198,8 @@ cargo doc --no-deps
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
+- Live bladeRF smoke tests with libbladeRF and both bladeRF 1 and bladeRF 2.
+- bladeRF 2 X2 receive/deinterleaving validation before exposing RX1.
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.

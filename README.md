@@ -24,6 +24,12 @@ The repository now contains a dependency-free, buildable receive core with:
   pseudo-header.
 - A hardware-neutral receive trait that requires backends to report overruns and
   dropped samples.
+- A dependency-free dynamic-library loader for Windows, Linux, and macOS.
+- A live libbladeRF receive backend using SC16 Q11 metadata samples, native
+  hardware timestamps, timeout recovery, overrun detection, and timestamp-gap
+  accounting.
+- A finite live-capture pipeline that always stops the source after decode,
+  callback, or read failures.
 
 The older root-level SDR and channelizer files are historical prototypes. They
 are not part of the Cargo build because they depend on unverified crates, use
@@ -42,6 +48,12 @@ List the BLE channel map:
 
 ```text
 cargo run -- channels
+```
+
+Probe runtime hardware-library availability:
+
+```text
+cargo run -- backends
 ```
 
 Decode a baseband recording centered on BLE advertising channel 37:
@@ -70,6 +82,35 @@ recover maximum-length primary advertisements split between reads. Repeated
 identical advertisements are preserved when they occur at different sample
 positions.
 
+Capture live BLE advertising traffic from bladeRF RX0:
+
+```text
+cargo run --release -- capture \
+  --device bladerf \
+  --channel 37 \
+  --sample-rate 4000000 \
+  --bandwidth 2000000 \
+  --gain 30 \
+  --seconds 30 \
+  --output-pcap capture.pcapng
+```
+
+The bladeRF backend loads the vendor library at runtime, so the project still
+builds and its DSP/protocol tests run without an installed SDR SDK. The default
+library names are `bladeRF.dll`/`libbladeRF.dll` on Windows,
+`libbladeRF.so.2`/`libbladeRF.so` on Linux, and `libbladeRF.dylib` on macOS.
+Set `BLUEOXIDE_BLADERF_LIBRARY` to an exact library path or name when the
+library is installed elsewhere. When set, this override is exclusive so a
+misconfigured path cannot silently select a different installation.
+
+Live capture currently uses libbladeRF's `BLADERF_RX_X1` layout, which maps to
+hardware RX0. RX1 is rejected until an X2 stream and explicit channel
+deinterleaving are implemented. The hardware-applied sample rate must exactly
+match the LE demodulator rate; a quantized mismatch is reported instead of
+silently corrupting symbol timing. Native receive timeouts are treated as empty
+reads, while other native failures stop capture and are returned with their
+libbladeRF status code and error string.
+
 ## Standalone implementation policy
 
 Blueoxide implements protocol framing, CRC, whitening, demodulation, buffering,
@@ -85,15 +126,13 @@ firmware compatibility, and hardware tests make that practical.
 
 ## Development direction
 
-The next backend work is to implement direct, feature-gated FFI for LimeSuite,
-libbladeRF, and libxtrx, with vendor libraries as runtime/build prerequisites
-but no wrapper-crate dependency. Those backends will feed the same `IqSource`
-contract and will be exercised with recorded fixtures when hardware is absent.
-Next receive work is direct LimeSuite, libbladeRF, and libxtrx integration,
-followed by wideband channelization and BLE connection following. Full packet
-decode is a project requirement: extended advertising, LL control, L2CAP,
-ATT/GATT, SMP, LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be
-added incrementally while retaining undecoded packet bytes losslessly.
+The next hardware work is equivalent direct runtime integration for LimeSuite
+and libxtrx, followed by recorded fixtures from all three supported SDR
+families. The next receive stages are wideband channelization and BLE
+connection following. Full packet decode is a project requirement: extended
+advertising, LL control, L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and Bluetooth
+Classic BR/EDR layers will be added incrementally while retaining undecoded
+packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

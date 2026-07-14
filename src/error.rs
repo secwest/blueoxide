@@ -5,6 +5,17 @@ pub enum Error {
     InvalidChannel(u8),
     InvalidConfiguration(String),
     InvalidInput(String),
+    InvalidState(String),
+    NativeCall {
+        backend: &'static str,
+        operation: &'static str,
+        code: i32,
+        message: String,
+    },
+    NativeLibrary {
+        library: String,
+        message: String,
+    },
     Io(std::io::Error),
 }
 
@@ -19,6 +30,22 @@ impl Display for Error {
             }
             Self::InvalidConfiguration(message) => formatter.write_str(message),
             Self::InvalidInput(message) => formatter.write_str(message),
+            Self::InvalidState(message) => formatter.write_str(message),
+            Self::NativeCall {
+                backend,
+                operation,
+                code,
+                message,
+            } => write!(
+                formatter,
+                "{backend} {operation} failed with native code {code}: {message}"
+            ),
+            Self::NativeLibrary { library, message } => {
+                write!(
+                    formatter,
+                    "failed to load native library {library}: {message}"
+                )
+            }
             Self::Io(error) => Display::fmt(error, formatter),
         }
     }
