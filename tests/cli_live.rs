@@ -13,13 +13,14 @@ fn backends_reports_missing_override_without_failing_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
         .arg("backends")
         .env("BLUEOXIDE_BLADERF_LIBRARY", &missing)
+        .env("BLUEOXIDE_LIMESUITE_LIBRARY", &missing)
         .output()
         .expect("run blueoxide");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("bladerf  unavailable:"));
     assert!(stdout.contains(&missing.to_string_lossy().to_string()));
-    assert!(stdout.contains("limesdr  backend not implemented"));
+    assert!(stdout.contains("limesdr  unavailable:"));
     assert!(stdout.contains("xtrx     backend not implemented"));
 }
 
@@ -84,6 +85,28 @@ fn capture_missing_library_is_reported_as_an_error() {
             "0.001",
         ])
         .env("BLUEOXIDE_BLADERF_LIBRARY", &missing)
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to load native library"));
+    assert!(stderr.contains(&missing.to_string_lossy().to_string()));
+}
+
+#[test]
+fn limesdr_capture_missing_library_is_reported_as_an_error() {
+    let missing = std::env::temp_dir().join("blueoxide-limesuite-that-does-not-exist.dll");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "capture",
+            "--device",
+            "limesdr",
+            "--channel",
+            "37",
+            "--seconds",
+            "0.001",
+        ])
+        .env("BLUEOXIDE_LIMESUITE_LIBRARY", &missing)
         .output()
         .expect("run blueoxide");
     assert_eq!(output.status.code(), Some(2));

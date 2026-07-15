@@ -1,11 +1,14 @@
 use blueoxide::advertising::decode_advertising_pdu;
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
+use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
 use blueoxide::ble::BleChannel;
-use blueoxide::capture::{CaptureLimits, CapturedAdvertisingPdu, capture_primary_advertising};
+use blueoxide::capture::{
+    CaptureLimits, CaptureStats, CapturedAdvertisingPdu, capture_primary_advertising,
+};
 use blueoxide::demod::{Le1mDemodConfig, Le1mStreamDecoder, ReceivedAdvertisingPdu};
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
-use blueoxide::sdr::SdrConfig;
+use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::{Error, Result};
 use std::env;
 use std::fs::File;
@@ -53,7 +56,7 @@ USAGE:
   blueoxide channels
   blueoxide backends
   blueoxide decode --input FILE --channel 37|38|39 --sample-rate HZ [OPTIONS]
-  blueoxide capture --device bladerf --channel 37|38|39 [OPTIONS]
+  blueoxide capture --device bladerf|limesdr --channel 37|38|39 [OPTIONS]
 
 DECODE OPTIONS:
   --format f32le|s16le    Interleaved little-endian I/Q (default: f32le)
@@ -65,7 +68,7 @@ DECODE OPTIONS:
   -h, --help              Show this help
 
 CAPTURE OPTIONS:
-  --identifier STRING     Native bladeRF device identifier
+  --identifier STRING     Native backend device identifier
   --sample-rate HZ        Complex sample rate (default: 4000000)
   --bandwidth HZ          RX bandwidth (default: 2000000)
   --gain DB               RX gain in dB (default: 30)
@@ -262,14 +265,14 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
         index += 1;
     }
 
-    if block_samples == 0 || block_samples > u32::MAX as usize {
+    if block_samples == 0 || block_samples > c_int_max_as_usize() {
         return Err(Error::InvalidConfiguration(
-            "--block-samples must be in 1..=4294967295 for bladeRF".to_owned(),
+            "--block-samples must be in 1..=2147483647 for current live backends".to_owned(),
         ));
     }
     if read_timeout_ms == 0 || read_timeout_ms > u32::MAX as u64 {
         return Err(Error::InvalidConfiguration(
-            "--read-timeout-ms must be in 1..=4294967295 for bladeRF".to_owned(),
+            "--read-timeout-ms must be in 1..=4294967295 for current live backends".to_owned(),
         ));
     }
     if !gain_db.is_finite() {
@@ -279,7 +282,7 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
     }
     Ok(CaptureArgs {
         device: device.ok_or_else(|| {
-            Error::InvalidConfiguration("capture requires --device bladerf".to_owned())
+            Error::InvalidConfiguration("capture requires --device bladerf|limesdr".to_owned())
         })?,
         identifier,
         channel: channel.ok_or_else(|| {
@@ -296,6 +299,10 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
         output_pcap,
         capture_start_ns,
     })
+}
+
+const fn c_int_max_as_usize() -> usize {
+    i32::MAX as usize
 }
 
 fn print_hex(bytes: &[u8]) -> String {
@@ -398,9 +405,10 @@ fn current_unix_time_ns() -> Result<u64> {
 }
 
 fn capture(args: CaptureArgs) -> Result<()> {
-    if !args.device.eq_ignore_ascii_case("bladerf") {
+    let device = args.device.to_ascii_lowercase();
+    if !matches!(device.as_str(), "bladerf" | "limesdr" | "lime") {
         return Err(Error::InvalidConfiguration(format!(
-            "capture device {:?} is not implemented; currently available: bladerf",
+            "capture device {:?} is not implemented; currently available: bladerf, limesdr",
             args.device
         )));
     }
@@ -422,7 +430,51 @@ fn capture(args: CaptureArgs) -> Result<()> {
         gain_db: args.gain_db,
         channel: args.rx_channel,
     };
-    let mut source = BladeRfSource::open(args.identifier.as_deref(), BladeRfOptions::default())?;
+
+    let stats = match device.as_str() {
+        "bladerf" => {
+            let mut source =
+                BladeRfSource::open(args.identifier.as_deref(), BladeRfOptions::default())?;
+            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            if let Some(applied) = source.applied_config() {
+                eprintln!(
+                    "bladeRF applied sample_rate={} bandwidth={}",
+                    applied.sample_rate_hz, applied.bandwidth_hz
+                );
+            }
+            stats
+        }
+        "limesdr" | "lime" => {
+            let mut source =
+                LimeSdrSource::open(args.identifier.as_deref(), LimeSdrOptions::default())?;
+            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            if let Some(applied) = source.applied_config() {
+                eprintln!(
+                    "LimeSDR applied sample_rate={} bandwidth={}",
+                    applied.sample_rate_hz, applied.bandwidth_hz
+                );
+            }
+            stats
+        }
+        _ => unreachable!(),
+    };
+    eprintln!(
+        "capture complete: samples={} packets={} overruns={} dropped={} discontinuities={}",
+        stats.samples_received,
+        stats.packets_decoded,
+        stats.overruns,
+        stats.dropped_samples,
+        stats.discontinuities
+    );
+    Ok(())
+}
+
+fn capture_from_source<S: IqSource>(
+    source: &mut S,
+    args: &CaptureArgs,
+    radio_config: &SdrConfig,
+    demod_config: Le1mDemodConfig,
+) -> Result<CaptureStats> {
     let capture_start_ns = args
         .capture_start_ns
         .map(Ok)
@@ -433,8 +485,8 @@ fn capture(args: CaptureArgs) -> Result<()> {
     };
 
     let stats = capture_primary_advertising(
-        &mut source,
-        &radio_config,
+        source,
+        radio_config,
         args.channel,
         demod_config,
         CaptureLimits {
@@ -459,21 +511,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
     if let Some(writer) = pcap {
         writer.into_inner().flush()?;
     }
-    if let Some(applied) = source.applied_config() {
-        eprintln!(
-            "bladeRF applied sample_rate={} bandwidth={}",
-            applied.sample_rate_hz, applied.bandwidth_hz
-        );
-    }
-    eprintln!(
-        "capture complete: samples={} packets={} overruns={} dropped={} discontinuities={}",
-        stats.samples_received,
-        stats.packets_decoded,
-        stats.overruns,
-        stats.dropped_samples,
-        stats.discontinuities
-    );
-    Ok(())
+    Ok(stats)
 }
 
 fn backends() {
@@ -481,7 +519,10 @@ fn backends() {
         Ok(library) => println!("bladerf  library available: {library}"),
         Err(error) => println!("bladerf  unavailable: {error}"),
     }
-    println!("limesdr  backend not implemented");
+    match LimeSdrSource::probe_library() {
+        Ok(library) => println!("limesdr  library available: {library}"),
+        Err(error) => println!("limesdr  unavailable: {error}"),
+    }
     println!("xtrx     backend not implemented");
 }
 

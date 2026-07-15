@@ -41,10 +41,19 @@
   immediate continuous receive, FPGA timestamps, timeout recovery, overrun and
   dropped-sample reporting, applied-rate reporting, deterministic library
   overrides, and validated lifecycle cleanup.
+- A runtime-loaded LimeSuite receive backend with:
+  - Device-specific RX channel, LO, sample-rate, and LPF capability queries.
+  - Interleaved finite `f32` I/Q reception and hardware sample timestamps.
+  - Automatic RX calibration after radio configuration, with the established
+    2.5 MHz minimum calibration bandwidth.
+  - FIFO overrun and dropped-packet status plus exact timestamp-gap accounting.
+  - Applied sample-rate/bandwidth reporting, reconfiguration teardown, and
+    cleanup after partial initialization or stream failures.
+  - Deterministic `BLUEOXIDE_LIMESUITE_LIBRARY` override support.
 - A finite live-capture loop with sample and duration limits, cross-block
   decoding, capture-relative packet timestamps, and unconditional source stop
   after stream-time failures.
-- `blueoxide backends` and `blueoxide capture --device bladerf` commands.
+- `blueoxide backends` and live capture through `--device bladerf|limesdr`.
 - Live CLI validation for duration overflow, zero-sized reads, zero timeouts,
   unsupported devices, and missing native libraries.
 - Unit tests for channel mapping, whitening, CRC, PDU validation, GFSK
@@ -62,12 +71,14 @@
   injection remains planned but will use a separate transmit subsystem.
 - Excluded the original standalone SDR/channelizer sketches from the Cargo build
   until their behavior is migrated to validated backends.
+- Updated the CI checkout action after GitHub reported the previous action's
+  Node.js runtime as deprecated.
 
 ### Known limitations
 
-- LimeSDR and XTRX backends are not connected to `IqSource` yet.
-- The bladeRF backend has not yet been exercised with an installed libbladeRF
-  library or physical radio in the development environment.
+- XTRX is not connected to `IqSource` yet.
+- The bladeRF and LimeSDR backends have not yet been exercised with installed
+  vendor libraries or physical radios in the development environment.
 - bladeRF live capture currently supports the RX0/X1 stream layout only.
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, connection

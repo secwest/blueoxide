@@ -397,3 +397,56 @@ The native ABI and state machine are verified against the pinned official
 libbladeRF source and mock-native tests. No bladeRF library or physical radio
 was available in the development environment, so over-the-air behavior remains
 an explicit pending hardware verification item.
+
+## 2026-07-13: LimeSDR uses device-reported ranges and calibrated F32 RX
+
+### Decision
+
+Implement LimeSDR reception through the runtime-loaded LimeSuite C API using a
+single `LMS_FMT_F32` stream per selected RX channel. Query the opened device for
+its channel count, LO range, host sample-rate range, and analog LPF range rather
+than publishing one static capability set for every LimeSDR model.
+
+### Configuration order
+
+1. Initialize the device.
+2. Enable the selected RX channel.
+3. Set and read back the host sample rate.
+4. Set the LO frequency.
+5. Set and read back the analog LPF bandwidth.
+6. Set gain.
+7. Run RX calibration using at least 2.5 MHz calibration bandwidth.
+8. Create the F32 stream and start it only after all previous steps succeed.
+
+The 2.5 MHz calibration floor follows SoapyLMS7's activation path. It does not
+change the requested 2 MHz BLE receive LPF.
+
+### Timestamp and status policy
+
+`LMS_RecvStream` metadata reports the hardware counter value for the first
+returned sample. Blueoxide compares that value with the expected next counter
+to derive exact missing-sample counts and detect backward movement. After each
+nonempty read it calls `LMS_GetStreamStatus`; native FIFO overruns and dropped
+packet counts mark the read discontinuous even when the exact sample gap cannot
+be inferred. Empty timeout reads do not query status because LimeSuite resets
+those counters when status is read.
+
+### Error and cleanup policy
+
+- A zero-sample receive is a timeout/empty read; a negative return is a native
+  error.
+- Non-finite native F32 values, excessive returned counts, invalid range
+  metadata, zero stream handles, and timestamp overflow are contract errors.
+- Failed configuration disables the channel. Residual teardown state is
+  retained and retried before a later configuration instead of being
+  overwritten.
+- Reconfiguration destroys the previous stream and disables its channel before
+  enabling another.
+- Drop stops, destroys, disables, and closes in that order.
+
+### Verification limitation
+
+The ABI and behavior are checked against LimeSuite commit
+`699d05b7212aa612a9802c219dd6621be88c77db`, its SoapyLMS7 integration, and
+gr-limesdr commit `244c6bf4f1cb52a8b4d27240d7a4c88c9542cbbb`. No LimeSDR hardware or installed
+LimeSuite library was available for an over-the-air test.

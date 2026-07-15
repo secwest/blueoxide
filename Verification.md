@@ -146,6 +146,10 @@ The checked-in test suite covers:
   overruns, forward timestamp gaps, backward timestamps, and timestamp overflow.
 - Decoder validation and applied-sample-rate checks before hardware streaming.
 - Live CLI failure handling without an installed vendor library.
+- LimeSDR initialization/configuration/start/read/stop/destroy/disable/close
+  ordering, reconfiguration teardown, and partial-failure cleanup.
+- LimeSDR F32 I/Q validation, timeout behavior, stream-status counter handling,
+  forward/backward timestamp discontinuities, and timestamp overflow.
 
 ## libbladeRF ABI and behavior verification
 
@@ -185,6 +189,58 @@ continuous receive with RX_NOW. Blueoxide's mock ABI verifies the same input
 flag, output timestamp/status/count handling, and Q11 conversion independently
 of a loaded vendor library.
 
+## LimeSuite ABI and behavior verification
+
+Primary reference:
+
+- Project: MyriadRF LimeSuite
+- Commit: `699d05b7212aa612a9802c219dd6621be88c77db`
+- Header: `src/lime/LimeSuite.h`
+- C API implementation: `src/API/lms7_api.cpp`
+- FIFO/stream implementation: `src/protocols/Streamer.cpp` and
+  `src/protocols/fifo.h`
+
+Cross-implementation reference:
+
+- Project: MyriadRF gr-limesdr
+- Commit: `244c6bf4f1cb52a8b4d27240d7a4c88c9542cbbb`
+- Receive implementation: `lib/source_impl.cc`
+- Device configuration: `lib/common/device_handler.cc`
+- SoapyLMS7 at the pinned LimeSuite commit: `SoapyLMS7/Streaming.cpp`
+
+The reviewed sources confirm:
+
+| Blueoxide assumption | Reference behavior |
+| --- | --- |
+| Host floating type | LimeSuite `float_type` is C `double` |
+| Stream sample format | `LMS_FMT_F32 = 0`, interleaved I then Q `float` scalars |
+| Metadata timestamp | Hardware sample counter for the first returned RX sample |
+| Timeout | `LMS_RecvStream` returns zero when no samples are popped |
+| Error | `LMS_RecvStream` returns a negative value on failure |
+| Status counters | FIFO overrun/underrun and dropped-packet counters reset when queried |
+| Stream lifecycle | Setup, start, receive, stop, destroy |
+| Calibration | Run after RF configuration; SoapyLMS7 uses at least 2.5 MHz |
+
+gr-limesdr independently uses `LMS_FMT_F32`, passes receive metadata, calls
+`LMS_GetStreamStatus` after reads, treats `droppedPackets` as reset-on-read, and
+converts the metadata timestamp from sample ticks. SoapyLMS7 independently maps
+CF32 to LimeSuite float32 with an int16 link format, treats zero reads as
+timeouts, checks non-monotonic timestamps, and calibrates configured channels
+when activating streams.
+
+Blueoxide fixes the pinned 64-bit ABI layouts in tests:
+
+| Structure | Size | Alignment |
+| --- | ---: | ---: |
+| `lms_stream_meta_t` | 16 | 8 |
+| `lms_stream_t` | 32 | 8 |
+| `lms_stream_status_t` | 48 | 8 |
+
+Mock-native tests additionally verify field values passed to stream setup,
+automatic calibration order, exact timestamp-gap arithmetic, status querying
+only after nonempty reads, non-finite sample rejection, and cleanup after
+initialization/configuration failures.
+
 Commands:
 
 ```text
@@ -200,6 +256,7 @@ cargo doc --no-deps
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
 - Live bladeRF smoke tests with libbladeRF and both bladeRF 1 and bladeRF 2.
 - bladeRF 2 X2 receive/deinterleaving validation before exposing RX1.
+- Live LimeSDR smoke tests across LimeSDR USB, Mini, and PCIe variants.
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.

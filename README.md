@@ -28,6 +28,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - A live libbladeRF receive backend using SC16 Q11 metadata samples, native
   hardware timestamps, timeout recovery, overrun detection, and timestamp-gap
   accounting.
+- A live LimeSuite receive backend using interleaved `f32` I/Q, device-reported
+  capability ranges, automatic RX calibration, hardware timestamps, FIFO
+  overrun/dropped-packet status, and timestamp-gap accounting.
 - A finite live-capture pipeline that always stops the source after decode,
   callback, or read failures.
 
@@ -95,6 +98,19 @@ cargo run --release -- capture \
   --output-pcap capture.pcapng
 ```
 
+Use `--device limesdr` for LimeSDR:
+
+```text
+cargo run --release -- capture \
+  --device limesdr \
+  --channel 37 \
+  --sample-rate 4000000 \
+  --bandwidth 2000000 \
+  --gain 30 \
+  --seconds 30 \
+  --output-pcap capture.pcapng
+```
+
 The bladeRF backend loads the vendor library at runtime, so the project still
 builds and its DSP/protocol tests run without an installed SDR SDK. The default
 library names are `bladeRF.dll`/`libbladeRF.dll` on Windows,
@@ -111,6 +127,16 @@ silently corrupting symbol timing. Native receive timeouts are treated as empty
 reads, while other native failures stop capture and are returned with their
 libbladeRF status code and error string.
 
+The LimeSDR backend loads `LimeSuite.dll`/`libLimeSuite.dll` on Windows,
+`libLimeSuite.so` on Linux, or `libLimeSuite.dylib` on macOS. Set
+`BLUEOXIDE_LIMESUITE_LIBRARY` to an exact path or name to override discovery.
+At open time Blueoxide queries the device's RX channel count, LO range, sample
+rate range, and LPF range. It uses LimeSuite's `LMS_FMT_F32` stream format,
+checks every returned scalar for finiteness, and calibrates RX after frequency,
+rate, bandwidth, and gain configuration. Calibration uses at least 2.5 MHz,
+matching SoapyLMS7 behavior, while the receive LPF remains at the requested
+bandwidth.
+
 ## Standalone implementation policy
 
 Blueoxide implements protocol framing, CRC, whitening, demodulation, buffering,
@@ -126,13 +152,12 @@ firmware compatibility, and hardware tests make that practical.
 
 ## Development direction
 
-The next hardware work is equivalent direct runtime integration for LimeSuite
-and libxtrx, followed by recorded fixtures from all three supported SDR
-families. The next receive stages are wideband channelization and BLE
-connection following. Full packet decode is a project requirement: extended
-advertising, LL control, L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and Bluetooth
-Classic BR/EDR layers will be added incrementally while retaining undecoded
-packet bytes losslessly.
+The next hardware work is equivalent direct runtime integration for libxtrx,
+followed by recorded fixtures from all three supported SDR families. The next
+receive stages are wideband channelization and BLE connection following. Full
+packet decode is a project requirement: extended advertising, LL control,
+L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will
+be added incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;
