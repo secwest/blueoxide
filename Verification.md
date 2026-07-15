@@ -150,6 +150,10 @@ The checked-in test suite covers:
   ordering, reconfiguration teardown, and partial-failure cleanup.
 - LimeSDR F32 I/Q validation, timeout behavior, stream-status counter handling,
   forward/backward timestamp discontinuities, and timestamp overflow.
+- XTRX open/configure/run/read/stop/close ordering, channel A/B SISO selection,
+  applied-rate reporting, and configuration/run failure recovery.
+- XTRX Q11 conversion, finite timeout handling, overflow interval accounting,
+  forward/backward timestamp discontinuities, and ABI layouts.
 
 ## libbladeRF ABI and behavior verification
 
@@ -241,6 +245,77 @@ automatic calibration order, exact timestamp-gap arithmetic, status querying
 only after nonempty reads, non-finite sample rejection, and cleanup after
 initialization/configuration failures.
 
+## libxtrx ABI and behavior verification
+
+Primary reference:
+
+- Project: xtrx-sdr libxtrx
+- Commit: `d9599fbf5be2714e6933c5a15acb3d8c57669859`
+- Header: `xtrx_api.h`
+- High-level implementation: `xtrx.c`
+- Official exercise program: `test_xtrx.c`
+- Bundled Soapy implementation: `soapy/SoapyXTRX.cpp`
+
+Independent cross-implementation reference:
+
+- Project: Osmocom gr-osmosdr
+- Commit: `aa95a6b568e04d3d15a3b4b055562ffa611c217f`
+- Receive implementation: `lib/xtrx/xtrx_source_c.cc`
+- Shared device configuration: `lib/xtrx/xtrx_obj.cc`
+
+The reviewed sources confirm:
+
+| Blueoxide assumption | Reference behavior |
+| --- | --- |
+| Receive direction | `XTRX_RX = 1` |
+| Channel masks | `XTRX_CH_A = 1`, `XTRX_CH_B = 2`, `XTRX_CH_AB = 3` |
+| Single-channel stream | `XTRX_RSP_SISO_MODE`; channel B additionally uses `XTRX_RSP_SWAP_AB` |
+| Stream formats | `XTRX_WF_16 = 3`, `XTRX_IQ_INT16 = 2` |
+| Host layout | One INT16 complex sample is interleaved I then Q and occupies four bytes |
+| Native float scale | libxtrx converts 16-bit wire samples with `1 / 2048` |
+| Receive result | Zero is success; negative errno values are failures |
+| Timeout request | `RCVEX_TIMOUT` enables finite native timeout reporting |
+| Gap policy | `RCVEX_DONT_INSER_ZEROS` skips missing packets; `RCVEX_DROP_OLD_ON_OVERFLOW` resumes at current data |
+| Receive metadata | `out_samples`, `out_first_sample`, overflow event, overrun timestamp, and resume timestamp |
+| Stream lifecycle | Initialize run parameters, `xtrx_run_ex`, repeated `xtrx_recv_sync_ex`, `xtrx_stop` |
+
+The bundled SoapyXTRX independently uses SISO plus SWAP_AB for channel B,
+16-bit wire and host formats for CS16, a 32,768-sample untimed RX start, and
+hardware sample timestamps. It publishes 30 MHz through 3.8 GHz RF coverage,
+RX sample-rate ranges of 0.2 through 56.25 MHz and 61.4375 through 80 MHz,
+1 through 60 MHz receive bandwidth, and a 0 through 30 dB LNA range.
+
+gr-osmosdr independently starts RX through `xtrx_run_ex`, receives through
+`xtrx_recv_sync_ex`, requests no inserted zeros plus old-packet dropping, uses
+`out_first_sample` for time tags, and returns `out_samples` to its scheduler.
+The official `test_xtrx.c` additionally computes dropped samples from
+`out_resumed_at - out_overrun_at` when the overflow event is present.
+
+Blueoxide fixes the pinned 64-bit ABI layouts in tests:
+
+| Structure | Size | Alignment |
+| --- | ---: | ---: |
+| `xtrx_run_stream_params_t` | 48 | 4 |
+| `xtrx_run_params_t` | 160 | 8 |
+| `xtrx_recv_ex_info_t` | 56 | 8 |
+
+Mock-native tests verify exact run flags and formats, channel-B swap selection,
+Q11 edge values, timeout errno recovery, native and timestamp-derived gap
+arithmetic, invalid overflow metadata rejection, and stop-before-close cleanup.
+
+An additional Windows FFI smoke test compiled a temporary DLL directly against
+the pinned `xtrx_api.h`. Blueoxide loaded that DLL through
+`BLUEOXIDE_XTRX_LIBRARY`, validated its run parameters, consumed interleaved
+INT16 samples through the real dynamic-call boundary, accepted a fractional
+hardware-reported LO, and reported a scripted eight-sample overflow as:
+
+```text
+capture complete: samples=3136 packets=0 overruns=1 dropped=8 discontinuities=1
+```
+
+This verifies symbol loading and the actual C ABI on the development host, but
+does not substitute for a physical-radio test.
+
 Commands:
 
 ```text
@@ -257,6 +332,7 @@ cargo doc --no-deps
 - Live bladeRF smoke tests with libbladeRF and both bladeRF 1 and bladeRF 2.
 - bladeRF 2 X2 receive/deinterleaving validation before exposing RX1.
 - Live LimeSDR smoke tests across LimeSDR USB, Mini, and PCIe variants.
+- Live XTRX smoke tests for channels A and B with induced DMA overruns.
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.

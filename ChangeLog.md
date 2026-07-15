@@ -50,10 +50,20 @@
   - Applied sample-rate/bandwidth reporting, reconfiguration teardown, and
     cleanup after partial initialization or stream failures.
   - Deterministic `BLUEOXIDE_LIMESUITE_LIBRARY` override support.
+- A runtime-loaded libxtrx receive backend with:
+  - Receive-only SISO operation for hardware channels A and B.
+  - `XTRX_WF_16`/`XTRX_IQ_INT16` streaming and in-tree Q11 conversion.
+  - Applied sample-rate/bandwidth reporting and validation of XTRX's
+    discontinuous supported sample-rate ranges.
+  - Finite native timeouts, hardware sample timestamps, overflow intervals,
+    exact timestamp-gap accounting, and no synthetic gap filling.
+  - Automatic RX antenna selection and explicit 0 through 30 dB LNA gain.
+  - Deterministic `BLUEOXIDE_XTRX_LIBRARY` override support.
 - A finite live-capture loop with sample and duration limits, cross-block
   decoding, capture-relative packet timestamps, and unconditional source stop
   after stream-time failures.
-- `blueoxide backends` and live capture through `--device bladerf|limesdr`.
+- `blueoxide backends` and live capture through
+  `--device bladerf|limesdr|xtrx`.
 - Live CLI validation for duration overflow, zero-sized reads, zero timeouts,
   unsupported devices, and missing native libraries.
 - Unit tests for channel mapping, whitening, CRC, PDU validation, GFSK
@@ -76,9 +86,9 @@
 
 ### Known limitations
 
-- XTRX is not connected to `IqSource` yet.
-- The bladeRF and LimeSDR backends have not yet been exercised with installed
-  vendor libraries or physical radios in the development environment.
+- The bladeRF, LimeSDR, and XTRX backends have not yet been exercised with
+  installed vendor libraries or physical radios in the development
+  environment.
 - bladeRF live capture currently supports the RX0/X1 stream layout only.
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, connection

@@ -450,3 +450,59 @@ The ABI and behavior are checked against LimeSuite commit
 `699d05b7212aa612a9802c219dd6621be88c77db`, its SoapyLMS7 integration, and
 gr-limesdr commit `244c6bf4f1cb52a8b4d27240d7a4c88c9542cbbb`. No LimeSDR hardware or installed
 LimeSuite library was available for an over-the-air test.
+
+## 2026-07-13: XTRX receive uses SISO INT16 with visible discontinuities
+
+### Decision
+
+Implement XTRX reception through the runtime-loaded libxtrx high-level API.
+Use `XTRX_WF_16` on the transport and `XTRX_IQ_INT16` on the host, then convert
+the interleaved signed I/Q values to `Complex32` in-tree with the same
+`1 / 2048` scale used by libxtrx's own 16-bit-to-float path.
+
+The backend exposes both physical receive channels as independent SISO sources.
+Channel A uses `XTRX_RSP_SISO_MODE`; channel B adds `XTRX_RSP_SWAP_AB`, matching
+SoapyXTRX's channel-selection convention. It does not expose an interleaved
+dual-channel stream through the single-channel `IqSource` contract.
+
+### Configuration and gain policy
+
+1. Set RX sample rate with TX disabled and retain the actual returned rate.
+2. Tune the shared RX LO and validate the returned frequency.
+3. Tune the selected channel's RX bandwidth and retain the actual value.
+4. Map the generic gain setting to the selected channel's LNA stage.
+5. Select the automatic RX antenna for that channel.
+6. Initialize native run parameters, override them for RX-only SISO, and start.
+
+The published capabilities follow SoapyXTRX at the pinned libxtrx revision:
+30 MHz through 3.8 GHz, two RX channels, RX rates through 80 MHz with the
+unsupported 56.250001 through 61.437499 MHz gap rejected, and 1 through 60 MHz
+RX bandwidth. Generic gain is deliberately limited to the LNA's 0 through
+30 dB range. TIA/PGA-specific controls should be exposed separately rather
+than hiding multiple stages behind one ambiguous number.
+
+### Timeout and discontinuity policy
+
+Every receive requests `RCVEX_TIMOUT`, `RCVEX_DONT_INSER_ZEROS`, and
+`RCVEX_DROP_OLD_ON_OVERFLOW`. Negative timeout errno values are recoverable
+empty reads. Other negative results terminate capture with the native code.
+
+For successful reads, Blueoxide combines:
+
+- `out_first_sample` continuity against the expected next sample.
+- `out_resumed_at - out_overrun_at` when libxtrx reports an overflow event.
+- Any native event bits, including unexpected filled-zero events.
+
+The largest exact gap is reported as dropped samples. Backward timestamps mark
+an overrun without wrapping subtraction. Invalid native overflow intervals and
+timestamp arithmetic overflow are contract errors.
+
+### Lifecycle and verification limitation
+
+Drop stops RX before closing the device. Configuration and run failures leave
+the state retryable without claiming a live stream.
+
+The ABI and behavior are checked against libxtrx commit
+`d9599fbf5be2714e6933c5a15acb3d8c57669859`, its bundled SoapyXTRX backend, and
+gr-osmosdr commit `aa95a6b568e04d3d15a3b4b055562ffa611c217f`. No installed
+libxtrx library or physical XTRX was available for an over-the-air test.

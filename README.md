@@ -31,6 +31,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - A live LimeSuite receive backend using interleaved `f32` I/Q, device-reported
   capability ranges, automatic RX calibration, hardware timestamps, FIFO
   overrun/dropped-packet status, and timestamp-gap accounting.
+- A live libxtrx receive backend using single-channel 16-bit wire/host streams,
+  in-tree Q11 conversion, hardware timestamps, finite timeout recovery, native
+  overflow intervals, and exact timestamp-gap accounting.
 - A finite live-capture pipeline that always stops the source after decode,
   callback, or read failures.
 
@@ -111,6 +114,20 @@ cargo run --release -- capture \
   --output-pcap capture.pcapng
 ```
 
+Use `--device xtrx` for XTRX channel A. Add `--rx-channel 1` for channel B:
+
+```text
+cargo run --release -- capture \
+  --device xtrx \
+  --channel 37 \
+  --sample-rate 4000000 \
+  --bandwidth 2000000 \
+  --gain 30 \
+  --rx-channel 0 \
+  --seconds 30 \
+  --output-pcap capture.pcapng
+```
+
 The bladeRF backend loads the vendor library at runtime, so the project still
 builds and its DSP/protocol tests run without an installed SDR SDK. The default
 library names are `bladeRF.dll`/`libbladeRF.dll` on Windows,
@@ -137,6 +154,22 @@ rate, bandwidth, and gain configuration. Calibration uses at least 2.5 MHz,
 matching SoapyLMS7 behavior, while the receive LPF remains at the requested
 bandwidth.
 
+The XTRX backend loads `xtrx.dll`/`libxtrx.dll` on Windows,
+`libxtrx.so.0`/`libxtrx.so` on Linux, or
+`libxtrx.0.dylib`/`libxtrx.dylib` on macOS. Set
+`BLUEOXIDE_XTRX_LIBRARY` to an exact path or name to override discovery. It
+configures receive-only SISO streaming with 16-bit wire and host formats,
+converts the device's Q11 sample values in-tree, and supports channel A or B.
+Channel B follows libxtrx's established `SISO_MODE|SWAP_AB` selection
+convention. The generic `--gain` value maps to the XTRX LNA stage and is
+therefore limited to 0 through 30 dB; additional stage-specific gain controls
+remain future CLI work.
+
+XTRX reads request finite native timeouts and disable gap-filling. Native
+overflow intervals and sample-counter jumps are reported as dropped samples,
+so the streaming decoder resets across discontinuities instead of treating
+inserted zeros as received RF data.
+
 ## Standalone implementation policy
 
 Blueoxide implements protocol framing, CRC, whitening, demodulation, buffering,
@@ -152,12 +185,12 @@ firmware compatibility, and hardware tests make that practical.
 
 ## Development direction
 
-The next hardware work is equivalent direct runtime integration for libxtrx,
-followed by recorded fixtures from all three supported SDR families. The next
-receive stages are wideband channelization and BLE connection following. Full
-packet decode is a project requirement: extended advertising, LL control,
-L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will
-be added incrementally while retaining undecoded packet bytes losslessly.
+The next hardware work is recorded fixtures and live smoke tests from all three
+supported SDR families. The next receive stages are wideband channelization
+and BLE connection following. Full packet decode is a project requirement:
+extended advertising, LL control, L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and
+Bluetooth Classic BR/EDR layers will be added incrementally while retaining
+undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

@@ -1,6 +1,7 @@
 use blueoxide::advertising::decode_advertising_pdu;
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
 use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
+use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
 use blueoxide::ble::BleChannel;
 use blueoxide::capture::{
     CaptureLimits, CaptureStats, CapturedAdvertisingPdu, capture_primary_advertising,
@@ -56,7 +57,7 @@ USAGE:
   blueoxide channels
   blueoxide backends
   blueoxide decode --input FILE --channel 37|38|39 --sample-rate HZ [OPTIONS]
-  blueoxide capture --device bladerf|limesdr --channel 37|38|39 [OPTIONS]
+  blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
 
 DECODE OPTIONS:
   --format f32le|s16le    Interleaved little-endian I/Q (default: f32le)
@@ -282,7 +283,7 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
     }
     Ok(CaptureArgs {
         device: device.ok_or_else(|| {
-            Error::InvalidConfiguration("capture requires --device bladerf|limesdr".to_owned())
+            Error::InvalidConfiguration("capture requires --device bladerf|limesdr|xtrx".to_owned())
         })?,
         identifier,
         channel: channel.ok_or_else(|| {
@@ -406,9 +407,9 @@ fn current_unix_time_ns() -> Result<u64> {
 
 fn capture(args: CaptureArgs) -> Result<()> {
     let device = args.device.to_ascii_lowercase();
-    if !matches!(device.as_str(), "bladerf" | "limesdr" | "lime") {
+    if !matches!(device.as_str(), "bladerf" | "limesdr" | "lime" | "xtrx") {
         return Err(Error::InvalidConfiguration(format!(
-            "capture device {:?} is not implemented; currently available: bladerf, limesdr",
+            "capture device {:?} is not implemented; currently available: bladerf, limesdr, xtrx",
             args.device
         )));
     }
@@ -451,6 +452,17 @@ fn capture(args: CaptureArgs) -> Result<()> {
             if let Some(applied) = source.applied_config() {
                 eprintln!(
                     "LimeSDR applied sample_rate={} bandwidth={}",
+                    applied.sample_rate_hz, applied.bandwidth_hz
+                );
+            }
+            stats
+        }
+        "xtrx" => {
+            let mut source = XtrxSource::open(args.identifier.as_deref(), XtrxOptions::default())?;
+            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            if let Some(applied) = source.applied_config() {
+                eprintln!(
+                    "XTRX applied sample_rate={} bandwidth={}",
                     applied.sample_rate_hz, applied.bandwidth_hz
                 );
             }
@@ -523,7 +535,10 @@ fn backends() {
         Ok(library) => println!("limesdr  library available: {library}"),
         Err(error) => println!("limesdr  unavailable: {error}"),
     }
-    println!("xtrx     backend not implemented");
+    match XtrxSource::probe_library() {
+        Ok(library) => println!("xtrx     library available: {library}"),
+        Err(error) => println!("xtrx     unavailable: {error}"),
+    }
 }
 
 fn run() -> Result<()> {
