@@ -3,6 +3,7 @@ use crate::{Error, Result};
 pub const LE_ADV_ACCESS_ADDRESS: u32 = 0x8e89_bed6;
 pub const LE_ADV_CRC_INIT: u32 = 0x55_55_55;
 pub const LE_PRIMARY_ADV_MAX_PAYLOAD: usize = 37;
+pub const LE_DATA_MAX_PAYLOAD: usize = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BleChannel(u8);
@@ -46,6 +47,129 @@ pub struct AdvertisingPdu {
     pub header: [u8; 2],
     pub payload: Vec<u8>,
     pub crc: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LePduLayout {
+    Advertising,
+    Data,
+}
+
+impl LePduLayout {
+    const fn maximum_payload_length(self) -> usize {
+        match self {
+            Self::Advertising => LE_PRIMARY_ADV_MAX_PAYLOAD,
+            Self::Data => LE_DATA_MAX_PAYLOAD,
+        }
+    }
+
+    const fn additional_header_length(self, header: [u8; 2]) -> usize {
+        match self {
+            Self::Advertising => 0,
+            Self::Data => {
+                if header[0] & 0x20 != 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    const fn maximum_additional_header_length(self) -> usize {
+        match self {
+            Self::Advertising => 0,
+            Self::Data => 1,
+        }
+    }
+
+    const fn payload_length(self, header: [u8; 2]) -> usize {
+        match self {
+            Self::Advertising => (header[1] & 0x3f) as usize,
+            Self::Data => header[1] as usize,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeFrameConfig {
+    pub access_address: u32,
+    pub crc_init: u32,
+    pub layout: LePduLayout,
+}
+
+impl LeFrameConfig {
+    pub const fn advertising() -> Self {
+        Self {
+            access_address: LE_ADV_ACCESS_ADDRESS,
+            crc_init: LE_ADV_CRC_INIT,
+            layout: LePduLayout::Advertising,
+        }
+    }
+
+    pub fn data(access_address: u32, crc_init: u32) -> Result<Self> {
+        let config = Self {
+            access_address,
+            crc_init,
+            layout: LePduLayout::Data,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if self.crc_init > 0x00ff_ffff {
+            return Err(Error::InvalidConfiguration(format!(
+                "LE CRC initialization 0x{:x} exceeds 24 bits",
+                self.crc_init
+            )));
+        }
+        Ok(())
+    }
+
+    pub const fn maximum_frame_bits(self) -> usize {
+        32 + (2
+            + self.layout.maximum_additional_header_length()
+            + self.layout.maximum_payload_length()
+            + 3)
+            * 8
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LePdu {
+    pub channel: BleChannel,
+    pub access_address: u32,
+    pub bit_offset: usize,
+    pub inverted: bool,
+    pub access_address_errors: u8,
+    pub header: [u8; 2],
+    /// Raw data-channel CTEInfo octet when the header's CP bit is set.
+    pub cte_info: Option<u8>,
+    /// Data-channel Payload and optional MIC, as counted by the Length octet.
+    pub payload: Vec<u8>,
+    pub crc: [u8; 3],
+}
+
+impl LePdu {
+    pub fn link_layer_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            4 + 2 + usize::from(self.cte_info.is_some()) + self.payload.len() + 3,
+        );
+        bytes.extend_from_slice(&self.access_address.to_le_bytes());
+        bytes.extend_from_slice(&self.header);
+        if let Some(cte_info) = self.cte_info {
+            bytes.push(cte_info);
+        }
+        bytes.extend_from_slice(&self.payload);
+        bytes.extend_from_slice(&self.crc);
+        bytes
+    }
+
+    pub const fn frame_bit_length(&self) -> usize {
+        let cte_info_length = if self.cte_info.is_some() { 1 } else { 0 };
+        32 + (2 + cte_info_length + self.payload.len() + 3) * 8
+    }
 }
 
 impl AdvertisingPdu {
@@ -170,29 +294,25 @@ pub fn bits_to_bytes_lsb(bits: &[bool]) -> Vec<u8> {
     bytes
 }
 
-/// Finds CRC-valid primary advertising packets in a hard-decision bit stream.
+/// Finds CRC-valid LE packets in a hard-decision bit stream.
 ///
-/// Both normal and inverted spectra are checked. Access-address errors are
-/// tolerated only up to `max_access_address_errors`; CRC validation remains
-/// mandatory before a packet is returned.
-pub fn decode_primary_advertising(
+/// The caller selects advertising or data-channel header length semantics.
+/// Both normal and inverted spectra are checked. Access-address errors may be
+/// tolerated, but every returned packet has a valid CRC.
+pub fn decode_le_frames(
     bits: &[bool],
     channel: BleChannel,
+    frame_config: LeFrameConfig,
     max_access_address_errors: u8,
-) -> Result<Vec<AdvertisingPdu>> {
-    if !channel.is_primary_advertising() {
-        return Err(Error::InvalidConfiguration(format!(
-            "channel {} is not a primary advertising channel",
-            channel.index()
-        )));
-    }
+) -> Result<Vec<LePdu>> {
+    frame_config.validate()?;
     if max_access_address_errors > 8 {
         return Err(Error::InvalidConfiguration(
             "access-address error tolerance must be 0..=8".to_owned(),
         ));
     }
 
-    let access_bits = bytes_to_bits_lsb(&LE_ADV_ACCESS_ADDRESS.to_le_bytes());
+    let access_bits = bytes_to_bits_lsb(&frame_config.access_address.to_le_bytes());
     let minimum_body_bits = (2 + 3) * 8;
     if bits.len() < access_bits.len() + minimum_body_bits {
         return Ok(Vec::new());
@@ -212,7 +332,11 @@ pub fn decode_primary_advertising(
 
             let body_start = offset + access_bits.len();
             let available = &bits[body_start..];
-            let maximum_body_bits = (2 + LE_PRIMARY_ADV_MAX_PAYLOAD + 3) * 8;
+            let maximum_body_bits = (2
+                + frame_config.layout.maximum_additional_header_length()
+                + frame_config.layout.maximum_payload_length()
+                + 3)
+                * 8;
             let mut body_bits: Vec<bool> = available
                 .iter()
                 .take(maximum_body_bits)
@@ -224,34 +348,76 @@ pub fn decode_primary_advertising(
                 continue;
             }
 
-            let payload_length = (body[1] & 0x3f) as usize;
-            if payload_length > LE_PRIMARY_ADV_MAX_PAYLOAD {
+            let header = [body[0], body[1]];
+            let payload_length = frame_config.layout.payload_length(header);
+            if payload_length > frame_config.layout.maximum_payload_length() {
                 continue;
             }
-            let pdu_length = 2 + payload_length;
+            let additional_header_length = frame_config.layout.additional_header_length(header);
+            let payload_start = 2 + additional_header_length;
+            let pdu_length = payload_start + payload_length;
             let total_length = pdu_length + 3;
             if body.len() < total_length {
                 continue;
             }
 
             let received_crc = [body[pdu_length], body[pdu_length + 1], body[pdu_length + 2]];
-            if crc24_bytes(&body[..pdu_length], LE_ADV_CRC_INIT) != received_crc {
+            if crc24_bytes(&body[..pdu_length], frame_config.crc_init) != received_crc {
                 continue;
             }
 
-            let packet = AdvertisingPdu {
+            packets.push(LePdu {
                 channel,
+                access_address: frame_config.access_address,
                 bit_offset: offset,
                 inverted,
                 access_address_errors: errors,
-                header: [body[0], body[1]],
-                payload: body[2..pdu_length].to_vec(),
+                header,
+                cte_info: (additional_header_length != 0).then(|| body[2]),
+                payload: body[payload_start..pdu_length].to_vec(),
                 crc: received_crc,
-            };
-            packets.push(packet);
+            });
         }
     }
     Ok(packets)
+}
+
+/// Finds CRC-valid primary advertising packets in a hard-decision bit stream.
+///
+/// Both normal and inverted spectra are checked. Access-address errors are
+/// tolerated only up to `max_access_address_errors`; CRC validation remains
+/// mandatory before a packet is returned.
+pub fn decode_primary_advertising(
+    bits: &[bool],
+    channel: BleChannel,
+    max_access_address_errors: u8,
+) -> Result<Vec<AdvertisingPdu>> {
+    if !channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "channel {} is not a primary advertising channel",
+            channel.index()
+        )));
+    }
+    Ok(decode_le_frames(
+        bits,
+        channel,
+        LeFrameConfig::advertising(),
+        max_access_address_errors,
+    )?
+    .into_iter()
+    .map(|packet| AdvertisingPdu {
+        channel: packet.channel,
+        bit_offset: packet.bit_offset,
+        inverted: packet.inverted,
+        access_address_errors: packet.access_address_errors,
+        header: packet.header,
+        payload: {
+            debug_assert!(packet.cte_info.is_none());
+            packet.payload
+        },
+        crc: packet.crc,
+    })
+    .collect())
 }
 
 #[cfg(test)]
@@ -384,5 +550,134 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn generic_decoder_uses_full_data_length_octet() {
+        let channel = BleChannel::new(12).unwrap();
+        let config = LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap();
+        let payload: Vec<u8> = (0..200).map(|value| value as u8).collect();
+        let mut pdu = vec![0x1d, payload.len() as u8];
+        pdu.extend_from_slice(&payload);
+        pdu.extend_from_slice(&crc24_bytes(&pdu, config.crc_init));
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+
+        let mut bits = vec![true, false, true, false];
+        bits.extend(bytes_to_bits_lsb(&config.access_address.to_le_bytes()));
+        bits.extend(body);
+
+        let packets = decode_le_frames(&bits, channel, config, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header, [0x1d, 200]);
+        assert_eq!(packets[0].payload, payload);
+        assert_eq!(packets[0].bit_offset, 4);
+    }
+
+    #[test]
+    fn generic_decoder_handles_inverted_data_packet() {
+        let channel = BleChannel::new(0).unwrap();
+        let config = LeFrameConfig::data(0x89ab_cdef, 0x0012_3456).unwrap();
+        let mut pdu = vec![0x02, 3, 0xaa, 0x55, 0x19];
+        pdu.extend_from_slice(&crc24_bytes(&pdu, config.crc_init));
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+        for bit in &mut bits {
+            *bit = !*bit;
+        }
+
+        let packets = decode_le_frames(&bits, channel, config, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].inverted);
+        assert_eq!(packets[0].payload, [0xaa, 0x55, 0x19]);
+    }
+
+    #[test]
+    fn data_decoder_separates_cte_info_from_declared_payload() {
+        let channel = BleChannel::new(9).unwrap();
+        let config = LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap();
+        let payload = [0x11, 0x22, 0x33];
+        let cte_info = 0x85;
+        let mut pdu = vec![0x22, payload.len() as u8, cte_info];
+        pdu.extend_from_slice(&payload);
+        pdu.extend_from_slice(&[0x27, 0xe2, 0xcf]);
+        let expected_link_layer_bytes = [
+            config.access_address.to_le_bytes().as_slice(),
+            pdu.as_slice(),
+        ]
+        .concat();
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+
+        let packets = decode_le_frames(&bits, channel, config, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header, [0x22, 3]);
+        assert_eq!(packets[0].cte_info, Some(cte_info));
+        assert_eq!(packets[0].payload, payload);
+        assert_eq!(packets[0].link_layer_bytes(), expected_link_layer_bytes);
+        assert_eq!(packets[0].frame_bit_length(), (4 + pdu.len()) * 8);
+    }
+
+    #[test]
+    fn data_decoder_accepts_cte_info_with_zero_declared_payload() {
+        let channel = BleChannel::new(3).unwrap();
+        let config = LeFrameConfig::data(0x89ab_cdef, 0x0012_3456).unwrap();
+        let mut pdu = vec![0x21, 0, 0x42];
+        pdu.extend_from_slice(&[0x7f, 0xd4, 0x6c]);
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+
+        let packets = decode_le_frames(&bits, channel, config, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].cte_info, Some(0x42));
+        assert!(packets[0].payload.is_empty());
+    }
+
+    #[test]
+    fn data_decoder_crc_covers_cte_info() {
+        let channel = BleChannel::new(7).unwrap();
+        let config = LeFrameConfig::data(0x1020_3040, 0x0055_aa33).unwrap();
+        let mut pdu = vec![0x21, 1, 0x85, 0x19];
+        let wrong_crc = crc24_bytes(&[0x21, 1, 0x19], config.crc_init);
+        pdu.extend_from_slice(&wrong_crc);
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+
+        assert!(
+            decode_le_frames(&bits, channel, config, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn data_decoder_rejects_missing_cte_info_octet() {
+        let channel = BleChannel::new(16).unwrap();
+        let config = LeFrameConfig::data(0x1357_9bdf, 0x0024_68ac).unwrap();
+        let mut truncated_body = vec![0x21, 0];
+        truncated_body.extend_from_slice(&crc24_bytes(&truncated_body, config.crc_init));
+        let mut body = bytes_to_bits_lsb(&truncated_body);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+
+        assert!(
+            decode_le_frames(&bits, channel, config, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn frame_config_rejects_wide_crc_init() {
+        assert!(LeFrameConfig::data(1, 0x0100_0000).is_err());
     }
 }

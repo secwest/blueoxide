@@ -2,12 +2,16 @@ use blueoxide::advertising::decode_advertising_pdu;
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
 use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
 use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
-use blueoxide::ble::BleChannel;
+use blueoxide::ble::{BleChannel, LeFrameConfig};
 use blueoxide::capture::{
     CaptureLimits, CaptureStats, CapturedAdvertisingPdu, capture_primary_advertising,
 };
-use blueoxide::demod::{Le1mDemodConfig, Le1mStreamDecoder, ReceivedAdvertisingPdu};
+use blueoxide::demod::{
+    Le1mDemodConfig, Le1mPacketStreamDecoder, Le1mStreamDecoder, ReceivedAdvertisingPdu,
+    ReceivedLePdu,
+};
 use blueoxide::iq::{IqFormat, open_iq_file};
+use blueoxide::link_layer::{DataChannelPdu, LogicalLinkId};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::{Error, Result};
@@ -26,6 +30,21 @@ struct DecodeArgs {
     format: IqFormat,
     channel: BleChannel,
     sample_rate_hz: u32,
+    max_samples: usize,
+    block_samples: usize,
+    max_access_address_errors: u8,
+    output_pcap: Option<PathBuf>,
+    capture_start_ns: u64,
+}
+
+#[derive(Debug)]
+struct DecodeDataArgs {
+    input: PathBuf,
+    format: IqFormat,
+    channel: BleChannel,
+    sample_rate_hz: u32,
+    access_address: u32,
+    crc_init: u32,
     max_samples: usize,
     block_samples: usize,
     max_access_address_errors: u8,
@@ -57,6 +76,8 @@ USAGE:
   blueoxide channels
   blueoxide backends
   blueoxide decode --input FILE --channel 37|38|39 --sample-rate HZ [OPTIONS]
+  blueoxide decode-data --input FILE --channel 0..36 --sample-rate HZ \
+    --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
 
 DECODE OPTIONS:
@@ -67,6 +88,10 @@ DECODE OPTIONS:
   --output-pcap FILE      Write CRC-valid packets as BLE PCAPNG
   --capture-start-ns N    Unix capture start in nanoseconds (default: 0)
   -h, --help              Show this help
+
+DECODE-DATA OPTIONS:
+  Uses the DECODE OPTIONS above and requires a connection access address and
+  24-bit CRC initialization value.
 
 CAPTURE OPTIONS:
   --identifier STRING     Native backend device identifier
@@ -94,6 +119,15 @@ fn parse_number<T: std::str::FromStr>(value: &str, option: &str) -> Result<T> {
     value
         .parse()
         .map_err(|_| Error::InvalidConfiguration(format!("invalid value {value:?} for {option}")))
+}
+
+fn parse_u32(value: &str, option: &str) -> Result<u32> {
+    let parsed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u32::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse());
+    parsed.map_err(|_| Error::InvalidConfiguration(format!("invalid value {value:?} for {option}")))
 }
 
 fn parse_decode_args(args: &[String]) -> Result<DecodeArgs> {
@@ -167,6 +201,111 @@ fn parse_decode_args(args: &[String]) -> Result<DecodeArgs> {
         sample_rate_hz: sample_rate_hz.ok_or_else(|| {
             Error::InvalidConfiguration("decode requires --sample-rate HZ".to_owned())
         })?,
+        max_samples,
+        block_samples,
+        max_access_address_errors,
+        output_pcap,
+        capture_start_ns,
+    })
+}
+
+fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
+    let mut input = None;
+    let mut format = IqFormat::F32Le;
+    let mut channel = None;
+    let mut sample_rate_hz = None;
+    let mut access_address = None;
+    let mut crc_init = None;
+    let mut max_samples = DEFAULT_MAX_SAMPLES;
+    let mut block_samples = DEFAULT_BLOCK_SAMPLES;
+    let mut max_access_address_errors = 1u8;
+    let mut output_pcap = None;
+    let mut capture_start_ns = 0u64;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--input" => input = Some(PathBuf::from(value_after(args, &mut index, "--input")?)),
+            "--format" => format = IqFormat::parse(&value_after(args, &mut index, "--format")?)?,
+            "--channel" => {
+                let value = value_after(args, &mut index, "--channel")?;
+                channel = Some(BleChannel::new(parse_number(&value, "--channel")?)?);
+            }
+            "--sample-rate" => {
+                let value = value_after(args, &mut index, "--sample-rate")?;
+                sample_rate_hz = Some(parse_number(&value, "--sample-rate")?);
+            }
+            "--access-address" => {
+                let value = value_after(args, &mut index, "--access-address")?;
+                access_address = Some(parse_u32(&value, "--access-address")?);
+            }
+            "--crc-init" => {
+                let value = value_after(args, &mut index, "--crc-init")?;
+                crc_init = Some(parse_u32(&value, "--crc-init")?);
+            }
+            "--max-samples" => {
+                let value = value_after(args, &mut index, "--max-samples")?;
+                max_samples = parse_number(&value, "--max-samples")?;
+            }
+            "--block-samples" => {
+                let value = value_after(args, &mut index, "--block-samples")?;
+                block_samples = parse_number(&value, "--block-samples")?;
+            }
+            "--aa-errors" => {
+                let value = value_after(args, &mut index, "--aa-errors")?;
+                max_access_address_errors = parse_number(&value, "--aa-errors")?;
+            }
+            "--output-pcap" => {
+                output_pcap = Some(PathBuf::from(value_after(
+                    args,
+                    &mut index,
+                    "--output-pcap",
+                )?));
+            }
+            "--capture-start-ns" => {
+                let value = value_after(args, &mut index, "--capture-start-ns")?;
+                capture_start_ns = parse_number(&value, "--capture-start-ns")?;
+            }
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown decode-data option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let channel = channel.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-data requires --channel 0..36".to_owned())
+    })?;
+    if channel.index() > 36 {
+        return Err(Error::InvalidConfiguration(format!(
+            "decode-data requires a data channel in 0..=36; got {}",
+            channel.index()
+        )));
+    }
+    let access_address = access_address.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-data requires --access-address".to_owned())
+    })?;
+    let crc_init = crc_init
+        .ok_or_else(|| Error::InvalidConfiguration("decode-data requires --crc-init".to_owned()))?;
+    LeFrameConfig::data(access_address, crc_init)?;
+
+    Ok(DecodeDataArgs {
+        input: input.ok_or_else(|| {
+            Error::InvalidConfiguration("decode-data requires --input FILE".to_owned())
+        })?,
+        format,
+        channel,
+        sample_rate_hz: sample_rate_hz.ok_or_else(|| {
+            Error::InvalidConfiguration("decode-data requires --sample-rate HZ".to_owned())
+        })?,
+        access_address,
+        crc_init,
         max_samples,
         block_samples,
         max_access_address_errors,
@@ -336,6 +475,81 @@ fn print_packet(packet: &ReceivedAdvertisingPdu) {
     );
 }
 
+fn describe_data_pdu(packet: &DataChannelPdu) -> String {
+    match packet.llid() {
+        LogicalLinkId::StartOrComplete => packet
+            .l2cap_start()
+            .map(|start| match start {
+                Some(start) => format!(
+                    "L2CAP length={} cid=0x{:04x} fragment_octets={}",
+                    start.payload_length,
+                    start.channel_id,
+                    start.fragment.len()
+                ),
+                None => unreachable!(),
+            })
+            .unwrap_or_else(|error| format!("decode_error={error}")),
+        LogicalLinkId::Control => packet
+            .control()
+            .map(|control| match control {
+                Some(control) => format!(
+                    "{} opcode=0x{:02x} parameter_octets={}",
+                    control.opcode_name(),
+                    control.opcode,
+                    control.parameters.len()
+                ),
+                None => unreachable!(),
+            })
+            .unwrap_or_else(|error| format!("decode_error={error}")),
+        LogicalLinkId::ContinuationOrEmpty if packet.payload.is_empty() => "empty".to_owned(),
+        LogicalLinkId::ContinuationOrEmpty => {
+            format!("L2CAP continuation_octets={}", packet.payload.len())
+        }
+        LogicalLinkId::Reserved => {
+            format!("reserved_llid payload_octets={}", packet.payload.len())
+        }
+    }
+}
+
+fn print_data_packet(packet: &ReceivedLePdu) {
+    let data = DataChannelPdu::from(packet.pdu.clone());
+    let cte = data
+        .constant_tone_extension_info()
+        .map(|info| {
+            format!(
+                "0x{:02x}:{}:{}us:rfu={}:reserved={}",
+                info.raw(),
+                info.cte_type_name(),
+                info.duration_us(),
+                info.rfu(),
+                info.has_reserved_value()
+            )
+        })
+        .unwrap_or_else(|| "none".to_owned());
+    println!(
+        "channel={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} llid={} nesn={} sn={} md={} cp={} cte={} rfu={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} plaintext_hint=\"{}\"",
+        data.channel.index(),
+        packet.access_address_sample,
+        packet.symbol_phase,
+        data.access_address,
+        data.inverted,
+        data.access_address_errors,
+        data.llid(),
+        data.next_expected_sequence_number(),
+        data.sequence_number(),
+        data.more_data(),
+        data.constant_tone_extension_present(),
+        cte,
+        data.reserved_header_bits(),
+        packet.estimated_carrier_offset_hz,
+        packet.estimated_deviation_hz,
+        print_hex(&data.header),
+        print_hex(&data.payload),
+        print_hex(&data.crc),
+        describe_data_pdu(&data).replace('"', "'"),
+    );
+}
+
 fn decode(args: DecodeArgs) -> Result<()> {
     if args.block_samples == 0 {
         return Err(Error::InvalidConfiguration(
@@ -392,6 +606,68 @@ fn decode(args: DecodeArgs) -> Result<()> {
         writer.into_inner().flush()?;
     }
     eprintln!("decoded {packet_count} CRC-valid packet(s) from {sample_count} sample(s)");
+    Ok(())
+}
+
+fn decode_data(args: DecodeDataArgs) -> Result<()> {
+    if args.block_samples == 0 {
+        return Err(Error::InvalidConfiguration(
+            "--block-samples must be greater than zero".to_owned(),
+        ));
+    }
+    let (mut reader, sample_count) = open_iq_file(&args.input, args.format)?;
+    if sample_count > args.max_samples {
+        return Err(Error::InvalidInput(format!(
+            "I/Q file contains {sample_count} samples, exceeding the configured limit of {}",
+            args.max_samples
+        )));
+    }
+
+    let demod_config = Le1mDemodConfig {
+        sample_rate_hz: args.sample_rate_hz,
+        max_access_address_errors: args.max_access_address_errors,
+    };
+    let frame_config = LeFrameConfig::data(args.access_address, args.crc_init)?;
+    let mut decoder = Le1mPacketStreamDecoder::new(args.channel, frame_config, demod_config)?;
+    let mut pcap = match &args.output_pcap {
+        Some(path) => Some(PcapNgWriter::new(BufWriter::new(File::create(path)?))?),
+        None => None,
+    };
+    let mut packet_count = 0usize;
+
+    loop {
+        let first_sample = reader.next_sample_index();
+        let samples = reader.read_block(args.block_samples)?;
+        if samples.is_empty() {
+            break;
+        }
+        let batch = decoder.push(first_sample, &samples)?;
+        if let Some(discontinuity) = batch.discontinuity {
+            eprintln!(
+                "sample discontinuity: expected {}, observed {}",
+                discontinuity.expected_first_sample, discontinuity.observed_first_sample
+            );
+        }
+        for packet in &batch.packets {
+            print_data_packet(packet);
+            if let Some(writer) = &mut pcap {
+                let timestamp = sample_timestamp_ns(
+                    args.capture_start_ns,
+                    packet.access_address_sample,
+                    args.sample_rate_hz,
+                )?;
+                writer.write_le(packet, timestamp)?;
+            }
+        }
+        packet_count += batch.packets.len();
+    }
+
+    if let Some(writer) = pcap {
+        writer.into_inner().flush()?;
+    }
+    eprintln!(
+        "decoded {packet_count} CRC-valid data-channel packet(s) from {sample_count} sample(s)"
+    );
     Ok(())
 }
 
@@ -545,6 +821,7 @@ fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("decode") => decode(parse_decode_args(&args[1..])?),
+        Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
         Some("capture") => capture(parse_capture_args(&args[1..])?),
         Some("backends") => {
             backends();

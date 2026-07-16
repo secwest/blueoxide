@@ -1,4 +1,5 @@
 use crate::ble::AdvertisingPdu;
+use crate::link_layer::{ChannelSelectionAlgorithm, ConnectionChannelSelector, DataChannelMap};
 use crate::{Error, Result};
 use std::fmt::{Display, Formatter};
 
@@ -116,6 +117,7 @@ pub struct ConnectRequest {
     pub channel_map: [u8; 5],
     pub hop_increment: u8,
     pub sleep_clock_accuracy: u8,
+    pub channel_selection_algorithm: ChannelSelectionAlgorithm,
 }
 
 impl ConnectRequest {
@@ -127,10 +129,35 @@ impl ConnectRequest {
         self.supervision_timeout as u32 * 10_000
     }
 
+    pub fn transmit_window_start_us(&self) -> u32 {
+        (self.window_offset as u32 + 1) * 1_250
+    }
+
+    pub fn transmit_window_size_us(&self) -> u32 {
+        self.window_size as u32 * 1_250
+    }
+
+    pub fn transmit_window_end_us(&self) -> u32 {
+        self.transmit_window_start_us() + self.transmit_window_size_us()
+    }
+
+    pub fn event_offset_from_anchor_us(&self, event_counter: u16) -> u64 {
+        event_counter as u64 * self.interval_us() as u64
+    }
+
     pub fn enabled_data_channels(&self) -> Vec<u8> {
         (0..=36)
             .filter(|channel| self.channel_map[*channel as usize / 8] & (1 << (*channel % 8)) != 0)
             .collect()
+    }
+
+    pub fn channel_selector(&self) -> Result<ConnectionChannelSelector> {
+        ConnectionChannelSelector::new(
+            self.channel_selection_algorithm,
+            DataChannelMap::new(self.channel_map)?,
+            self.access_address,
+            self.hop_increment,
+        )
     }
 }
 
@@ -237,13 +264,14 @@ impl Display for DecodedAdvertisingPdu {
                 request,
             } => write!(
                 formatter,
-                "CONNECT_IND initiator={initiator} initiator_type={initiator_kind} advertiser={advertiser} advertiser_type={advertiser_kind} access_address={:08x} interval_us={} latency={} timeout_us={} hop={} channels={}",
+                "CONNECT_IND initiator={initiator} initiator_type={initiator_kind} advertiser={advertiser} advertiser_type={advertiser_kind} access_address={:08x} interval_us={} latency={} timeout_us={} hop={} channels={} channel_selection={}",
                 request.access_address,
                 request.interval_us(),
                 request.latency,
                 request.supervision_timeout_us(),
                 request.hop_increment,
-                request.enabled_data_channels().len()
+                request.enabled_data_channels().len(),
+                request.channel_selection_algorithm
             ),
             Self::AdvScanInd {
                 advertiser,
@@ -366,6 +394,11 @@ pub fn decode_advertising_pdu(pdu: &AdvertisingPdu) -> Result<DecodedAdvertising
                 })?,
                 hop_increment: hop_and_sca & 0x1f,
                 sleep_clock_accuracy: hop_and_sca >> 5,
+                channel_selection_algorithm: if pdu.header[0] & 0x20 != 0 {
+                    ChannelSelectionAlgorithm::Csa2
+                } else {
+                    ChannelSelectionAlgorithm::Csa1
+                },
             };
             if !(5..=16).contains(&request.hop_increment) {
                 return Err(Error::InvalidInput(format!(
@@ -412,16 +445,9 @@ pub fn decode_advertising_pdu(pdu: &AdvertisingPdu) -> Result<DecodedAdvertising
                     minimum_timeout_us
                 )));
             }
-            if request.channel_map[4] & 0xe0 != 0 {
-                return Err(Error::InvalidInput(
-                    "CONNECT_IND channel map sets reserved bits 37..39".to_owned(),
-                ));
-            }
-            if request.enabled_data_channels().len() < 2 {
-                return Err(Error::InvalidInput(
-                    "CONNECT_IND channel map enables fewer than two data channels".to_owned(),
-                ));
-            }
+            DataChannelMap::new(request.channel_map).map_err(|error| {
+                Error::InvalidInput(format!("CONNECT_IND channel map is invalid: {error}"))
+            })?;
             Ok(DecodedAdvertisingPdu::ConnectInd {
                 initiator: DeviceAddress::from_air_bytes(&pdu.payload[..6])?,
                 initiator_kind: address_kind(pdu.tx_add_random()),
@@ -516,6 +542,43 @@ mod tests {
         assert_eq!(request.supervision_timeout_us(), 1_000_000);
         assert_eq!(request.enabled_data_channels().len(), 37);
         assert_eq!(request.hop_increment, 10);
+        assert_eq!(
+            request.channel_selection_algorithm,
+            ChannelSelectionAlgorithm::Csa1
+        );
+        assert_eq!(request.transmit_window_start_us(), 5_000);
+        assert_eq!(request.transmit_window_size_us(), 2_500);
+        assert_eq!(request.transmit_window_end_us(), 7_500);
+        assert_eq!(request.event_offset_from_anchor_us(2), 60_000);
+        assert_eq!(
+            request
+                .channel_selector()
+                .unwrap()
+                .channel_for_event(0)
+                .index(),
+            10
+        );
+    }
+
+    #[test]
+    fn connect_ind_chsel_bit_selects_csa2() {
+        let mut payload = vec![0; 34];
+        payload[12..16].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        payload[19] = 1;
+        payload[20..22].copy_from_slice(&0u16.to_le_bytes());
+        payload[22..24].copy_from_slice(&24u16.to_le_bytes());
+        payload[24..26].copy_from_slice(&0u16.to_le_bytes());
+        payload[26..28].copy_from_slice(&100u16.to_le_bytes());
+        payload[28..33].copy_from_slice(&[3, 0, 0, 0, 0]);
+        payload[33] = 5;
+        let decoded = decode_advertising_pdu(&pdu(5, 0x20, payload)).unwrap();
+        let DecodedAdvertisingPdu::ConnectInd { request, .. } = decoded else {
+            panic!("expected CONNECT_IND");
+        };
+        assert_eq!(
+            request.channel_selection_algorithm,
+            ChannelSelectionAlgorithm::Csa2
+        );
     }
 
     #[test]

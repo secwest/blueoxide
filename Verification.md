@@ -6,7 +6,7 @@ dependency.
 
 ## Environment
 
-- Date: 2026-07-13
+- Date: 2026-07-13 through 2026-07-15
 - Rust: 1.95.0
 - Python: 3.14.4
 - NumPy: 2.4.6
@@ -123,6 +123,94 @@ Scapy exposes access-address bytes `78 56 34 12` as integer `0x78563412`;
 Blueoxide reports the conventional little-endian numeric value `0x12345678`.
 The underlying packet bytes agree.
 
+## LE data-channel framing and channel-selection verification
+
+Specification reference:
+
+- Bluetooth Core Specification 6.0, Vol 6, Part B:
+  - Data Physical Channel PDU and CTEInfo layout.
+  - Data-channel PDU header and Length semantics.
+  - Channel Selection Algorithms #1 and #2.
+
+Primary implementation reference:
+
+- Project: Zephyr Bluetooth Controller
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/controller/ll_sw/pdu.h`
+  - `subsys/bluetooth/controller/ll_sw/pdu_df.h`
+  - `subsys/bluetooth/controller/ll_sw/lll_chan.c`
+
+Zephyr independently places CP at data-header bit 5, stores CTEInfo as one
+octet before link-layer data, and defines its fields as five CTE-time bits, one
+RFU bit, and two CTE-type bits. Its CSA#2 implementation derives the channel
+identifier by XORing the access-address halves, performs three permute and
+multiply-add rounds, uses `prn_e % 37`, and remaps with
+`floor(used_count * prn_e / 65536)`.
+
+Independent packet/CRC reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth4LE.py`
+- Functions/types: `BTLE.compute_crc`, `BTLE_DATA`, `BTLE_CTRL`,
+  `BTLE_CONNECT_REQ`
+
+Scapy's data-header model at this revision predates explicit CP/CTEInfo
+representation, so it was used as a raw-byte CRC oracle rather than as the
+CTEInfo parser. Fixed results generated independently by `BTLE.compute_crc`
+are:
+
+| Header + CTEInfo + payload | CRC init | Transmitted CRC |
+| --- | --- | --- |
+| `220385112233` | `abcdef` | `27e2cf` |
+| `210042` | `123456` | `7fd46c` |
+| `3e0985050004000a01000200` | `abcdef` | `421893` |
+
+These vectors prove that Blueoxide includes CTEInfo in CRC coverage while
+excluding it from the Length-counted payload. The final vector also passes
+through `decode-data` in 73-sample blocks and is checked byte-for-byte in the
+emitted PCAPNG.
+
+Connection-recovery reference:
+
+- Project: virtualabs/btlejack
+- Commit: `c487859888450f6a33f618180bac5358f104e367`
+- Files: `btlejack/packets.py`, `btlejack/supervisors.py`
+
+btlejack independently extracts access address, CRC initialization, interval,
+channel map, and hop increment from connection requests and carries explicit
+CSA#2 PRNG/event-counter recovery state. It was used to cross-check that these
+parameters remain distinct inputs rather than being collapsed into packet
+decoder state.
+
+Zephyr's Core-derived CSA#2 vectors are fixed in `src/link_layer.rs`:
+
+| Channel map | Event counters | Expected channels |
+| --- | --- | --- |
+| all 37 channels | 0, 1, 2, 3 | 25, 20, 6, 21 |
+| `0006e0001e` | 6, 7, 8 | 23, 9, 34 |
+| `0600000000` | 11, 12, 13 | 1, 2, 1 |
+
+Additional tests cover CSA#1 progression/remapping, invalid channel maps and
+hop increments, 16-bit event-counter limits, maximum 255-octet data PDUs split
+across stream blocks, CP with zero payload, inverted spectrum, malformed CRC,
+and reserved CTEInfo values.
+
+Final local gate for this increment:
+
+```text
+83 library tests
+2 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Internal audit matrix
 
 The checked-in test suite covers:
@@ -136,6 +224,8 @@ The checked-in test suite covers:
 - Malformed and non-finite I/Q input.
 - Short underlying reads.
 - CRC corruption rejection.
+- CTEInfo frame boundaries, CRC coverage, raw-value preservation, and maximum
+  data-PDU stream retention.
 - Truncated Advertising Data structures.
 - Invalid CONNECT_IND timing and channel constraints.
 - Arbitrary bounded advertising PDU payloads without panics.

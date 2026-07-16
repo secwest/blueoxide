@@ -31,9 +31,23 @@
   access.
 - CONNECT_IND validation for timing, latency, channel map, hop increment,
   reserved bits, and supervision-timeout relationships.
+- A shared CRC-gated LE frame decoder parameterized by access address, CRC
+  initialization, and advertising/data PDU length semantics.
+- LE data-channel header decoding for LLID, NESN, SN, MD, CP, reserved bits,
+  payload length, optional CTEInfo, and lossless payload/MIC bytes.
+- CTEInfo decoding for CTE time, AoA/AoD type, and reserved values, with the
+  CTEInfo octet included in CRC and capture bytes but excluded from the
+  Length-counted payload.
+- L2CAP start-header and LL control opcode views that retain unimplemented
+  parameters unchanged.
+- Validated LE data-channel maps and Channel Selection Algorithms #1 and #2,
+  including Core remapping vectors and 16-bit event-counter wrap behavior.
+- CONNECT_IND ChSel handling, first transmit-window bounds, anchor-relative
+  event timing, and construction of the selected channel algorithm.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
-- `blueoxide channels` and `blueoxide decode` commands.
+- `blueoxide channels`, `blueoxide decode`, and configurable
+  `blueoxide decode-data` commands.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
 - An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.
@@ -71,6 +85,8 @@
   lifecycle, timeout recovery, timestamp gaps/overflow, cleanup, and ABI layout.
 - Cross-implementation CRC/whitening fixtures and external Scapy PCAPNG
   interoperability checks.
+- Fixed Scapy CRC vectors for CTE-bearing data PDUs and Zephyr/Core CSA#2
+  all-channel and remapping vectors.
 - Linux and Windows GitHub Actions gates for formatting, tests, Clippy, and
   release builds.
 - Initial README and design log.
@@ -92,5 +108,6 @@
 - bladeRF live capture currently supports the RX0/X1 stream layout only.
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, connection
-  following, extended advertising, higher protocol layers, Bluetooth Classic,
-  LE 2M, and LE Coded PHY remain to be implemented.
+  anchor acquisition and live retuning, extended advertising, decryption and
+  higher protocol reassembly, Bluetooth Classic, LE 2M, and LE Coded PHY remain
+  to be implemented.

@@ -1,5 +1,5 @@
 use crate::ble::LE_ADV_ACCESS_ADDRESS;
-use crate::demod::ReceivedAdvertisingPdu;
+use crate::demod::{ReceivedAdvertisingPdu, ReceivedLePdu};
 use crate::{Error, Result};
 use std::io::Write;
 
@@ -49,19 +49,46 @@ impl<W: Write> PcapNgWriter<W> {
         packet: &ReceivedAdvertisingPdu,
         timestamp_ns: u64,
     ) -> Result<()> {
-        let mut captured = Vec::with_capacity(10 + 4 + 2 + packet.pdu.payload.len() + 3);
-        captured.push(packet.pdu.channel.index());
+        self.write_packet(
+            packet.pdu.channel.index(),
+            packet.pdu.access_address_errors,
+            LE_ADV_ACCESS_ADDRESS,
+            &packet.pdu.link_layer_bytes(),
+            timestamp_ns,
+        )
+    }
+
+    pub fn write_le(&mut self, packet: &ReceivedLePdu, timestamp_ns: u64) -> Result<()> {
+        self.write_packet(
+            packet.pdu.channel.index(),
+            packet.pdu.access_address_errors,
+            packet.pdu.access_address,
+            &packet.pdu.link_layer_bytes(),
+            timestamp_ns,
+        )
+    }
+
+    fn write_packet(
+        &mut self,
+        channel: u8,
+        access_address_errors: u8,
+        access_address: u32,
+        link_layer_bytes: &[u8],
+        timestamp_ns: u64,
+    ) -> Result<()> {
+        let mut captured = Vec::with_capacity(10 + link_layer_bytes.len());
+        captured.push(channel);
         captured.push(0);
         captured.push(0);
-        captured.push(packet.pdu.access_address_errors);
-        captured.extend_from_slice(&LE_ADV_ACCESS_ADDRESS.to_le_bytes());
+        captured.push(access_address_errors);
+        captured.extend_from_slice(&access_address.to_le_bytes());
         let flags = BLE_DEWHITENED
             | BLE_REFERENCE_ACCESS_ADDRESS_VALID
             | BLE_ACCESS_ADDRESS_OFFENSES_VALID
             | BLE_CRC_CHECKED
             | BLE_CRC_VALID;
         captured.extend_from_slice(&flags.to_le_bytes());
-        captured.extend_from_slice(&packet.pdu.link_layer_bytes());
+        captured.extend_from_slice(link_layer_bytes);
 
         let mut body = Vec::with_capacity(20 + captured.len() + 3);
         body.extend_from_slice(&0u32.to_le_bytes());

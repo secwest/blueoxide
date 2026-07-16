@@ -1,9 +1,8 @@
-use crate::ble::{AdvertisingPdu, BleChannel, decode_primary_advertising};
+use crate::ble::{AdvertisingPdu, BleChannel, LeFrameConfig, LePdu, decode_le_frames};
 use crate::complex::Complex32;
 use crate::{Error, Result};
 
 pub const LE_1M_SYMBOL_RATE: u32 = 1_000_000;
-const MAX_PRIMARY_ADV_BODY_BITS: usize = (2 + 37 + 3) * 8;
 const STREAM_THRESHOLD_CONTEXT_SYMBOLS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -23,6 +22,17 @@ pub struct ReceivedAdvertisingPdu {
     pub discriminator_separation: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ReceivedLePdu {
+    pub pdu: LePdu,
+    /// Sample index at the beginning of the detected access address.
+    pub access_address_sample: u64,
+    pub symbol_phase: usize,
+    pub estimated_carrier_offset_hz: f32,
+    pub estimated_deviation_hz: f32,
+    pub discriminator_separation: f32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SampleDiscontinuity {
     pub expected_first_sample: u64,
@@ -32,6 +42,12 @@ pub struct SampleDiscontinuity {
 #[derive(Clone, Debug, Default)]
 pub struct StreamDecodeBatch {
     pub packets: Vec<ReceivedAdvertisingPdu>,
+    pub discontinuity: Option<SampleDiscontinuity>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LeStreamDecodeBatch {
+    pub packets: Vec<ReceivedLePdu>,
     pub discontinuity: Option<SampleDiscontinuity>,
 }
 
@@ -102,15 +118,17 @@ fn robust_threshold(symbols: &[f32]) -> Option<SliceLevels> {
     }
 }
 
-fn same_observation(
-    left: &ReceivedAdvertisingPdu,
-    right: &ReceivedAdvertisingPdu,
+fn same_le_observation(
+    left: &ReceivedLePdu,
+    right: &ReceivedLePdu,
     samples_per_symbol: u64,
 ) -> bool {
     left.access_address_sample
         .abs_diff(right.access_address_sample)
         <= samples_per_symbol
+        && left.pdu.access_address == right.pdu.access_address
         && left.pdu.header == right.pdu.header
+        && left.pdu.cte_info == right.pdu.cte_info
         && left.pdu.payload == right.pdu.payload
         && left.pdu.crc == right.pdu.crc
 }
@@ -153,22 +171,19 @@ fn packet_slice_levels(
     })
 }
 
-/// Demodulates detailed LE 1M primary advertising observations.
+/// Demodulates detailed CRC-valid LE 1M observations.
 ///
-/// Every integer symbol phase is evaluated. Spectrum inversion is handled by
-/// the packet decoder, and only CRC-valid PDUs are returned.
-pub fn decode_le_1m_advertising_detailed(
+/// Every integer symbol phase is evaluated. The frame configuration selects
+/// the access address, CRC initialization, and PDU length semantics. Spectrum
+/// inversion is handled by the packet decoder.
+pub fn decode_le_1m_detailed(
     samples: &[Complex32],
     channel: BleChannel,
+    frame_config: LeFrameConfig,
     config: Le1mDemodConfig,
-) -> Result<Vec<ReceivedAdvertisingPdu>> {
+) -> Result<Vec<ReceivedLePdu>> {
     let samples_per_symbol = config.validate()?;
-    if !channel.is_primary_advertising() {
-        return Err(Error::InvalidConfiguration(format!(
-            "LE 1M advertising decoder requires channel 37, 38, or 39; got {}",
-            channel.index()
-        )));
-    }
+    frame_config.validate()?;
     if samples.len() < samples_per_symbol * 10 {
         return Ok(Vec::new());
     }
@@ -188,13 +203,17 @@ pub fn decode_le_1m_advertising_detailed(
             .iter()
             .map(|value| *value >= levels.threshold)
             .collect();
-        for packet in decode_primary_advertising(&bits, channel, config.max_access_address_errors)?
-        {
-            let packet_bits = 32 + (2 + packet.payload.len() + 3) * 8;
+        for packet in decode_le_frames(
+            &bits,
+            channel,
+            frame_config,
+            config.max_access_address_errors,
+        )? {
+            let packet_bits = packet.frame_bit_length();
             let packet_levels =
                 packet_slice_levels(&symbols, &bits, packet.bit_offset, packet_bits)
                     .unwrap_or(levels);
-            let observation = ReceivedAdvertisingPdu {
+            let observation = ReceivedLePdu {
                 access_address_sample: (phase + 1 + packet.bit_offset * samples_per_symbol) as u64,
                 symbol_phase: phase,
                 estimated_carrier_offset_hz: packet_levels.threshold * config.sample_rate_hz as f32
@@ -206,7 +225,7 @@ pub fn decode_le_1m_advertising_detailed(
                 pdu: packet,
             };
             if let Some(existing) = packets.iter_mut().find(|existing| {
-                same_observation(existing, &observation, samples_per_symbol as u64)
+                same_le_observation(existing, &observation, samples_per_symbol as u64)
             }) {
                 if observation.discriminator_separation > existing.discriminator_separation {
                     *existing = observation;
@@ -220,6 +239,44 @@ pub fn decode_le_1m_advertising_detailed(
     Ok(packets)
 }
 
+/// Demodulates detailed LE 1M primary advertising observations.
+pub fn decode_le_1m_advertising_detailed(
+    samples: &[Complex32],
+    channel: BleChannel,
+    config: Le1mDemodConfig,
+) -> Result<Vec<ReceivedAdvertisingPdu>> {
+    if !channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "LE 1M advertising decoder requires channel 37, 38, or 39; got {}",
+            channel.index()
+        )));
+    }
+    Ok(
+        decode_le_1m_detailed(samples, channel, LeFrameConfig::advertising(), config)?
+            .into_iter()
+            .map(|packet| ReceivedAdvertisingPdu {
+                pdu: AdvertisingPdu {
+                    channel: packet.pdu.channel,
+                    bit_offset: packet.pdu.bit_offset,
+                    inverted: packet.pdu.inverted,
+                    access_address_errors: packet.pdu.access_address_errors,
+                    header: packet.pdu.header,
+                    payload: {
+                        debug_assert!(packet.pdu.cte_info.is_none());
+                        packet.pdu.payload
+                    },
+                    crc: packet.pdu.crc,
+                },
+                access_address_sample: packet.access_address_sample,
+                symbol_phase: packet.symbol_phase,
+                estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
+                estimated_deviation_hz: packet.estimated_deviation_hz,
+                discriminator_separation: packet.discriminator_separation,
+            })
+            .collect(),
+    )
+}
+
 pub fn decode_le_1m_advertising(
     samples: &[Complex32],
     channel: BleChannel,
@@ -231,36 +288,33 @@ pub fn decode_le_1m_advertising(
         .collect())
 }
 
-/// Bounded, discontinuity-aware wrapper around the LE 1M block demodulator.
-///
-/// Incoming sample indices must be monotonically contiguous. A gap or overlap
-/// resets DSP history and is reported with the returned batch, preventing
-/// packets from being assembled across a discontinuous radio stream.
-pub struct Le1mStreamDecoder {
+/// Bounded, discontinuity-aware wrapper around the configurable LE 1M decoder.
+pub struct Le1mPacketStreamDecoder {
     channel: BleChannel,
+    frame_config: LeFrameConfig,
     config: Le1mDemodConfig,
     samples_per_symbol: usize,
     samples: Vec<Complex32>,
     buffer_first_sample: Option<u64>,
     expected_next_sample: Option<u64>,
-    recent_packets: Vec<ReceivedAdvertisingPdu>,
+    recent_packets: Vec<ReceivedLePdu>,
     maximum_buffer_samples: usize,
 }
 
-impl Le1mStreamDecoder {
-    pub fn new(channel: BleChannel, config: Le1mDemodConfig) -> Result<Self> {
+impl Le1mPacketStreamDecoder {
+    pub fn new(
+        channel: BleChannel,
+        frame_config: LeFrameConfig,
+        config: Le1mDemodConfig,
+    ) -> Result<Self> {
         let samples_per_symbol = config.validate()?;
-        if !channel.is_primary_advertising() {
-            return Err(Error::InvalidConfiguration(format!(
-                "LE 1M stream decoder requires channel 37, 38, or 39; got {}",
-                channel.index()
-            )));
-        }
-        let maximum_buffer_samples =
-            (32 + MAX_PRIMARY_ADV_BODY_BITS + STREAM_THRESHOLD_CONTEXT_SYMBOLS)
-                * samples_per_symbol;
+        frame_config.validate()?;
+        let maximum_buffer_samples = (frame_config.maximum_frame_bits()
+            + STREAM_THRESHOLD_CONTEXT_SYMBOLS)
+            * samples_per_symbol;
         Ok(Self {
             channel,
+            frame_config,
             config,
             samples_per_symbol,
             samples: Vec::with_capacity(maximum_buffer_samples),
@@ -282,8 +336,8 @@ impl Le1mStreamDecoder {
         &mut self,
         first_sample_index: u64,
         input: &[Complex32],
-    ) -> Result<StreamDecodeBatch> {
-        let mut batch = StreamDecodeBatch::default();
+    ) -> Result<LeStreamDecodeBatch> {
+        let mut batch = LeStreamDecodeBatch::default();
         if input.is_empty() {
             return Ok(batch);
         }
@@ -320,19 +374,19 @@ impl Le1mStreamDecoder {
         Ok(batch)
     }
 
-    fn decode_buffer(&mut self, output: &mut Vec<ReceivedAdvertisingPdu>) -> Result<()> {
+    fn decode_buffer(&mut self, output: &mut Vec<ReceivedLePdu>) -> Result<()> {
         let buffer_first = self.buffer_first_sample.ok_or_else(|| {
             Error::InvalidInput("stream decoder lost its buffer sample index".to_owned())
         })?;
         for mut observation in
-            decode_le_1m_advertising_detailed(&self.samples, self.channel, self.config)?
+            decode_le_1m_detailed(&self.samples, self.channel, self.frame_config, self.config)?
         {
             observation.access_address_sample = observation
                 .access_address_sample
                 .checked_add(buffer_first)
                 .ok_or_else(|| Error::InvalidInput("sample index overflow".to_owned()))?;
             if self.recent_packets.iter().any(|existing| {
-                same_observation(existing, &observation, self.samples_per_symbol as u64)
+                same_le_observation(existing, &observation, self.samples_per_symbol as u64)
             }) {
                 continue;
             }
@@ -358,6 +412,67 @@ impl Le1mStreamDecoder {
                     >= retained_from
             });
         }
+    }
+}
+
+/// Advertising-compatible wrapper around the configurable stream decoder.
+///
+/// Incoming sample indices must be monotonically contiguous. A gap or overlap
+/// resets DSP history and is reported with the returned batch, preventing
+/// packets from being assembled across a discontinuous radio stream.
+pub struct Le1mStreamDecoder {
+    inner: Le1mPacketStreamDecoder,
+}
+
+impl Le1mStreamDecoder {
+    pub fn new(channel: BleChannel, config: Le1mDemodConfig) -> Result<Self> {
+        if !channel.is_primary_advertising() {
+            return Err(Error::InvalidConfiguration(format!(
+                "LE 1M stream decoder requires channel 37, 38, or 39; got {}",
+                channel.index()
+            )));
+        }
+        Ok(Self {
+            inner: Le1mPacketStreamDecoder::new(channel, LeFrameConfig::advertising(), config)?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn push(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<StreamDecodeBatch> {
+        let batch = self.inner.push(first_sample_index, input)?;
+        Ok(StreamDecodeBatch {
+            packets: batch
+                .packets
+                .into_iter()
+                .map(|packet| ReceivedAdvertisingPdu {
+                    pdu: AdvertisingPdu {
+                        channel: packet.pdu.channel,
+                        bit_offset: packet.pdu.bit_offset,
+                        inverted: packet.pdu.inverted,
+                        access_address_errors: packet.pdu.access_address_errors,
+                        header: packet.pdu.header,
+                        payload: {
+                            debug_assert!(packet.pdu.cte_info.is_none());
+                            packet.pdu.payload
+                        },
+                        crc: packet.pdu.crc,
+                    },
+                    access_address_sample: packet.access_address_sample,
+                    symbol_phase: packet.symbol_phase,
+                    estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
+                    estimated_deviation_hz: packet.estimated_deviation_hz,
+                    discriminator_separation: packet.discriminator_separation,
+                })
+                .collect(),
+            discontinuity: batch.discontinuity,
+        })
     }
 }
 
@@ -539,6 +654,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn generic_stream_decoder_recovers_maximum_data_pdu_across_blocks() {
+        let channel = BleChannel::new(14).unwrap();
+        let frame_config = LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap();
+        let payload: Vec<u8> = (0..=254).collect();
+        let mut pdu = vec![0x1e, payload.len() as u8];
+        pdu.extend_from_slice(&payload);
+        pdu.extend_from_slice(&crc24_bytes(&pdu, frame_config.crc_init));
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&[0xaa]);
+        bits.extend(bytes_to_bits_lsb(
+            &frame_config.access_address.to_le_bytes(),
+        ));
+        bits.extend(body);
+        let mut samples = modulate(&bits, 2, -40_000.0);
+        for sample in &mut samples {
+            sample.im = -sample.im;
+        }
+
+        let mut decoder = Le1mPacketStreamDecoder::new(
+            channel,
+            frame_config,
+            Le1mDemodConfig {
+                sample_rate_hz: 2_000_000,
+                max_access_address_errors: 0,
+            },
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        for (index, chunk) in samples.chunks(97).enumerate() {
+            let batch = decoder.push((index * 97) as u64, chunk).unwrap();
+            assert!(batch.discontinuity.is_none());
+            packets.extend(batch.packets);
+        }
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].pdu.payload, payload);
+        assert!(packets[0].pdu.inverted);
+        assert!((packets[0].estimated_carrier_offset_hz - 40_000.0).abs() < 10_000.0);
+    }
+
+    #[test]
+    fn generic_stream_decoder_recovers_maximum_data_pdu_with_cte_info() {
+        let channel = BleChannel::new(26).unwrap();
+        let frame_config = LeFrameConfig::data(0x2468_ace0, 0x0013_579b).unwrap();
+        let payload: Vec<u8> = (0..=254).rev().collect();
+        let mut pdu = vec![0x3e, payload.len() as u8, 0x85];
+        pdu.extend_from_slice(&payload);
+        pdu.extend_from_slice(&crc24_bytes(&pdu, frame_config.crc_init));
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&[0xaa]);
+        bits.extend(bytes_to_bits_lsb(
+            &frame_config.access_address.to_le_bytes(),
+        ));
+        bits.extend(body);
+        let samples = modulate(&bits, 2, 25_000.0);
+
+        let mut decoder = Le1mPacketStreamDecoder::new(
+            channel,
+            frame_config,
+            Le1mDemodConfig {
+                sample_rate_hz: 2_000_000,
+                max_access_address_errors: 0,
+            },
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        for (index, chunk) in samples.chunks(101).enumerate() {
+            let batch = decoder.push((index * 101) as u64, chunk).unwrap();
+            assert!(batch.discontinuity.is_none());
+            packets.extend(batch.packets);
+        }
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].pdu.cte_info, Some(0x85));
+        assert_eq!(packets[0].pdu.payload, payload);
     }
 
     #[test]

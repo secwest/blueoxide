@@ -12,6 +12,8 @@ The repository now contains a dependency-free, buildable receive core with:
 - Bluetooth LE channel-to-frequency mapping.
 - LE whitening and 24-bit CRC implementations.
 - CRC-gated decoding of primary advertising PDUs on channels 37, 38, and 39.
+- Configurable CRC-gated LE 1M data-channel decoding for a known connection
+  access address, CRC initializer, and logical channel.
 - LE 1M quadrature demodulation with integer timing-phase search, robust slicing,
   spectrum-inversion handling, and configurable access-address tolerance.
 - Bounded streaming input for interleaved little-endian `f32` and signed 16-bit
@@ -20,6 +22,10 @@ The repository now contains a dependency-free, buildable receive core with:
   deviation estimates, and discontinuity reset/reporting.
 - Typed decoding for legacy advertising, scan, direct, and connection-request
   PDUs, including AD structures and validated CONNECT_IND timing/channel data.
+- Data-channel header, CTEInfo, L2CAP-start, and LL control-PDU decoding while
+  retaining unrecognized payload and MIC bytes losslessly.
+- Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
+  including CONNECT_IND ChSel selection and event-counter channel calculation.
 - Dependency-free PCAPNG output using the standard Bluetooth LE link-layer
   pseudo-header.
 - A hardware-neutral receive trait that requires backends to report overruns and
@@ -87,6 +93,29 @@ The decoder processes the file in bounded blocks and retains enough overlap to
 recover maximum-length primary advertisements split between reads. Repeated
 identical advertisements are preserved when they occur at different sample
 positions.
+
+Decode a recording from a known LE connection data channel:
+
+```text
+cargo run --release -- decode-data \
+  --input connection.cf32 \
+  --format f32le \
+  --channel 12 \
+  --sample-rate 4000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --block-samples 262144 \
+  --output-pcap connection.pcapng
+```
+
+`decode-data` accepts data channels 0 through 36. The connection access address
+and 24-bit CRC initializer normally come from a decoded CONNECT_IND. Data PDUs
+are emitted only after CRC validation. When the CP bit is set, the separate
+CTEInfo octet is retained and decoded without including it in the Length-counted
+payload. The payload field remains lossless and can include an encrypted MIC
+because decryption state is not yet tracked. Printed L2CAP and LL control
+interpretations are explicitly plaintext hints; encrypted payloads remain
+available as raw bytes but cannot yet be interpreted reliably.
 
 Capture live BLE advertising traffic from bladeRF RX0:
 
@@ -186,11 +215,13 @@ firmware compatibility, and hardware tests make that practical.
 ## Development direction
 
 The next hardware work is recorded fixtures and live smoke tests from all three
-supported SDR families. The next receive stages are wideband channelization
-and BLE connection following. Full packet decode is a project requirement:
-extended advertising, LL control, L2CAP, ATT/GATT, SMP, LE 2M/Coded PHY, and
-Bluetooth Classic BR/EDR layers will be added incrementally while retaining
-undecoded packet bytes losslessly.
+supported SDR families. Connection framing, channel selection, and first-window
+timing primitives are now present; the next receive stages are wideband
+channelization, anchor-point acquisition, timed retuning, and live BLE
+connection following. Full packet decode is a project requirement: extended
+advertising, complete LL control semantics, L2CAP reassembly, ATT/GATT, SMP,
+encryption, LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added
+incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

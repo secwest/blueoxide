@@ -506,3 +506,52 @@ The ABI and behavior are checked against libxtrx commit
 `d9599fbf5be2714e6933c5a15acb3d8c57669859`, its bundled SoapyXTRX backend, and
 gr-osmosdr commit `aa95a6b568e04d3d15a3b4b055562ffa611c217f`. No installed
 libxtrx library or physical XTRX was available for an over-the-air test.
+
+## 2026-07-15: Generalize LE framing before live connection following
+
+### Decision
+
+Use one bounded LE 1M frame decoder for advertising and connection data PDUs.
+The frame configuration supplies the access address, CRC initializer, and PDU
+layout. Keep the advertising APIs as compatibility wrappers while exposing a
+generic streaming decoder for known connection parameters.
+
+Add pure connection-state primitives before attempting hardware retuning:
+
+- Validated 37-bit data-channel maps.
+- Channel Selection Algorithms #1 and #2.
+- CONNECT_IND ChSel interpretation.
+- First transmit-window bounds relative to the end of CONNECT_IND.
+- Event offsets relative to an observed connection anchor point.
+
+### CTEInfo boundary
+
+For data PDUs with CP set, CTEInfo is a separate octet after the two-octet data
+header. The Length octet counts the following payload and optional MIC, not
+CTEInfo. CRC and whitening cover CTEInfo in its over-the-air position.
+
+`LePdu` and `DataChannelPdu` therefore retain CTEInfo separately. Semantic
+helpers expose CTE time, type, and RFU state, but CRC-valid reserved values are
+not discarded. This keeps captures lossless and lets later policy distinguish
+malformed, unsupported, and newly assigned values.
+
+L2CAP and LL control views are plaintext hints rather than proof that the
+connection is unencrypted. The framing layer retains ciphertext and MIC bytes
+unchanged; authoritative semantic decoding requires later encryption-state and
+reassembly support.
+
+### Timing boundary
+
+CONNECT_IND determines the first transmit window, but not the exact anchor
+point inside that window. The API exposes the window start and end relative to
+the request and exposes later event spacing only relative to an observed
+anchor. It deliberately does not present the beginning of the first window as
+the established connection schedule.
+
+### Current limitation
+
+`decode-data` decodes a recording already centered on one known data channel.
+Blueoxide does not yet acquire the first packet's anchor point, follow clock
+drift, process channel-map update instants, or retune a radio across connection
+events. Those steps require wideband channelization or a timed-retune backend
+contract built on the framing and selection primitives added here.
