@@ -552,6 +552,50 @@ the established connection schedule.
 
 `decode-data` decodes a recording already centered on one known data channel.
 Blueoxide does not yet acquire the first packet's anchor point, follow clock
-drift, process channel-map update instants, or retune a radio across connection
-events. Those steps require wideband channelization or a timed-retune backend
-contract built on the framing and selection primitives added here.
+drift, or retune a radio across connection events. Those steps require wideband
+channelization or a timed-retune backend contract built on the framing and
+selection primitives added here.
+
+## 2026-07-15: Anchor connection-event state before changing SDR contracts
+
+### State model
+
+`ConnectionTracker` starts from an event counter and the exact hardware sample
+where that event's access address was observed. It advances a separate 64-bit
+internal event index while preserving the 16-bit on-air counter wrap. Expected
+sample positions are calculated from the current anchor and interval with
+checked integer arithmetic and one final nearest-sample rounding step, avoiding
+per-event rounding drift.
+
+CONNECT_IND can construct this tracker only after the caller has supplied an
+observed anchor. The first transmit-window boundary remains a search bound, not
+an invented anchor.
+
+### Instant handling
+
+The Core modulo ordering is represented explicitly as future, reached, passed,
+or ambiguous. A passive receiver accepts any unambiguously future instant,
+including a retransmission observed fewer than six events before the instant;
+the six-event value used when initiating procedures is not imposed on received
+PDUs. Reached, passed, and the two half-range ambiguous differences are
+rejected.
+
+Only one instant-based update may be pending. This conservative restriction
+avoids silently choosing an ordering for overlapping procedures that the
+tracker does not yet model.
+
+At an LL_CHANNEL_MAP_IND instant, the new validated map is installed before
+selecting that event's channel. At an LL_CONNECTION_UPDATE_IND instant, the new
+interval, latency, and timeout become active, but timing enters an explicit
+anchor-observation-required state carrying WinOffset and WinSize. The tracker
+cannot advance again until the caller supplies the access-address sample
+actually observed at that instant.
+
+### Hardware boundary
+
+The current `IqSource` contract supports configure/start/read/stop but no timed
+retune while streaming. Connection-event state therefore remains pure protocol
+logic plus an offline `connection-plan` command. Live following will require
+either simultaneous wideband channelization or an explicit timed-tuning
+contract; this increment does not pretend that repeated stop/configure/start
+operations provide connection-event timing.

@@ -11,7 +11,10 @@ use blueoxide::demod::{
     ReceivedLePdu,
 };
 use blueoxide::iq::{IqFormat, open_iq_file};
-use blueoxide::link_layer::{DataChannelPdu, LogicalLinkId};
+use blueoxide::link_layer::{
+    ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
+    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu, LogicalLinkId,
+};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::{Error, Result};
@@ -69,6 +72,19 @@ struct CaptureArgs {
     capture_start_ns: Option<u64>,
 }
 
+#[derive(Debug)]
+struct ConnectionPlanArgs {
+    access_address: u32,
+    channel_map: DataChannelMap,
+    channel_selection_algorithm: ChannelSelectionAlgorithm,
+    hop_increment: u8,
+    parameters: ConnectionParameters,
+    sample_rate_hz: u32,
+    anchor_event_counter: u16,
+    anchor_access_address_sample: u64,
+    event_count: usize,
+}
+
 fn usage() -> &'static str {
     "blueoxide - Bluetooth/BLE SDR receive and capture tools
 
@@ -78,6 +94,8 @@ USAGE:
   blueoxide decode --input FILE --channel 37|38|39 --sample-rate HZ [OPTIONS]
   blueoxide decode-data --input FILE --channel 0..36 --sample-rate HZ \
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
+  blueoxide connection-plan --access-address 0xNNNNNNNN \
+    --channel-map HEX --csa 1|2 --interval N --sample-rate HZ [OPTIONS]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
 
 DECODE OPTIONS:
@@ -92,6 +110,18 @@ DECODE OPTIONS:
 DECODE-DATA OPTIONS:
   Uses the DECODE OPTIONS above and requires a connection access address and
   24-bit CRC initialization value.
+
+CONNECTION-PLAN OPTIONS:
+  --channel-map HEX       Five map octets in over-the-air order
+  --csa 1|2               Channel Selection Algorithm
+  --hop N                 CSA#1 hop increment, 5..=16 (default: 5)
+  --interval N            Connection interval in 1.25 ms units
+  --latency N             Peripheral latency (default: 0)
+  --timeout N             Supervision timeout in 10 ms units (default: 3200)
+  --sample-rate HZ        Hardware sample rate
+  --anchor-event N        Observed 16-bit event counter (default: 0)
+  --anchor-sample N       Observed access-address sample index (default: 0)
+  --events N              Number of events to print (default: 10)
 
 CAPTURE OPTIONS:
   --identifier STRING     Native backend device identifier
@@ -128,6 +158,141 @@ fn parse_u32(value: &str, option: &str) -> Result<u32> {
         .map(|hex| u32::from_str_radix(hex, 16))
         .unwrap_or_else(|| value.parse());
     parsed.map_err(|_| Error::InvalidConfiguration(format!("invalid value {value:?} for {option}")))
+}
+
+fn parse_channel_map(value: &str) -> Result<DataChannelMap> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if hex.len() != 10 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --channel-map; expected five hexadecimal octets"
+        )));
+    }
+    let mut bytes = [0u8; 5];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| {
+            Error::InvalidConfiguration(format!("invalid value {value:?} for --channel-map"))
+        })?;
+    }
+    DataChannelMap::new(bytes)
+}
+
+fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
+    let mut access_address = None;
+    let mut channel_map = None;
+    let mut channel_selection_algorithm = None;
+    let mut hop_increment = 5u8;
+    let mut interval = None;
+    let mut latency = 0u16;
+    let mut supervision_timeout = 3_200u16;
+    let mut sample_rate_hz = None;
+    let mut anchor_event_counter = 0u16;
+    let mut anchor_access_address_sample = 0u64;
+    let mut event_count = 10usize;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--access-address" => {
+                let value = value_after(args, &mut index, "--access-address")?;
+                access_address = Some(parse_u32(&value, "--access-address")?);
+            }
+            "--channel-map" => {
+                channel_map = Some(parse_channel_map(&value_after(
+                    args,
+                    &mut index,
+                    "--channel-map",
+                )?)?);
+            }
+            "--csa" => {
+                let value = value_after(args, &mut index, "--csa")?;
+                channel_selection_algorithm = Some(match value.to_ascii_lowercase().as_str() {
+                    "1" | "csa1" | "csa#1" => ChannelSelectionAlgorithm::Csa1,
+                    "2" | "csa2" | "csa#2" => ChannelSelectionAlgorithm::Csa2,
+                    _ => {
+                        return Err(Error::InvalidConfiguration(format!(
+                            "invalid value {value:?} for --csa; expected 1 or 2"
+                        )));
+                    }
+                });
+            }
+            "--hop" => {
+                let value = value_after(args, &mut index, "--hop")?;
+                hop_increment = parse_number(&value, "--hop")?;
+            }
+            "--interval" => {
+                let value = value_after(args, &mut index, "--interval")?;
+                interval = Some(parse_number(&value, "--interval")?);
+            }
+            "--latency" => {
+                let value = value_after(args, &mut index, "--latency")?;
+                latency = parse_number(&value, "--latency")?;
+            }
+            "--timeout" => {
+                let value = value_after(args, &mut index, "--timeout")?;
+                supervision_timeout = parse_number(&value, "--timeout")?;
+            }
+            "--sample-rate" => {
+                let value = value_after(args, &mut index, "--sample-rate")?;
+                sample_rate_hz = Some(parse_number(&value, "--sample-rate")?);
+            }
+            "--anchor-event" => {
+                let value = value_after(args, &mut index, "--anchor-event")?;
+                anchor_event_counter = parse_number(&value, "--anchor-event")?;
+            }
+            "--anchor-sample" => {
+                let value = value_after(args, &mut index, "--anchor-sample")?;
+                anchor_access_address_sample = parse_number(&value, "--anchor-sample")?;
+            }
+            "--events" => {
+                let value = value_after(args, &mut index, "--events")?;
+                event_count = parse_number(&value, "--events")?;
+            }
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown connection-plan option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if event_count == 0 || event_count > 1_000_000 {
+        return Err(Error::InvalidConfiguration(
+            "--events must be in 1..=1000000".to_owned(),
+        ));
+    }
+    Ok(ConnectionPlanArgs {
+        access_address: access_address.ok_or_else(|| {
+            Error::InvalidConfiguration("connection-plan requires --access-address".to_owned())
+        })?,
+        channel_map: channel_map.ok_or_else(|| {
+            Error::InvalidConfiguration("connection-plan requires --channel-map".to_owned())
+        })?,
+        channel_selection_algorithm: channel_selection_algorithm.ok_or_else(|| {
+            Error::InvalidConfiguration("connection-plan requires --csa 1|2".to_owned())
+        })?,
+        hop_increment,
+        parameters: ConnectionParameters::new(
+            interval.ok_or_else(|| {
+                Error::InvalidConfiguration("connection-plan requires --interval".to_owned())
+            })?,
+            latency,
+            supervision_timeout,
+        )?,
+        sample_rate_hz: sample_rate_hz.ok_or_else(|| {
+            Error::InvalidConfiguration("connection-plan requires --sample-rate".to_owned())
+        })?,
+        anchor_event_counter,
+        anchor_access_address_sample,
+        event_count,
+    })
 }
 
 fn parse_decode_args(args: &[String]) -> Result<DecodeArgs> {
@@ -475,6 +640,38 @@ fn print_packet(packet: &ReceivedAdvertisingPdu) {
     );
 }
 
+fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
+    if let Some(update) = control.connection_update_ind()? {
+        return Ok(format!(
+            "{} opcode=0x{:02x} window_offset={} window_size={} interval={} latency={} timeout={} instant={}",
+            control.opcode_name(),
+            control.opcode,
+            update.window_offset,
+            update.window_size,
+            update.parameters.interval,
+            update.parameters.latency,
+            update.parameters.supervision_timeout,
+            update.instant
+        ));
+    }
+    if let Some(update) = control.channel_map_ind()? {
+        return Ok(format!(
+            "{} opcode=0x{:02x} channel_map={} channels={} instant={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&update.channel_map.bytes()),
+            update.channel_map.used_count(),
+            update.instant
+        ));
+    }
+    Ok(format!(
+        "{} opcode=0x{:02x} parameter_octets={}",
+        control.opcode_name(),
+        control.opcode,
+        control.parameters.len()
+    ))
+}
+
 fn describe_data_pdu(packet: &DataChannelPdu) -> String {
     match packet.llid() {
         LogicalLinkId::StartOrComplete => packet
@@ -492,12 +689,8 @@ fn describe_data_pdu(packet: &DataChannelPdu) -> String {
         LogicalLinkId::Control => packet
             .control()
             .map(|control| match control {
-                Some(control) => format!(
-                    "{} opcode=0x{:02x} parameter_octets={}",
-                    control.opcode_name(),
-                    control.opcode,
-                    control.parameters.len()
-                ),
+                Some(control) => describe_control_pdu(control)
+                    .unwrap_or_else(|error| format!("decode_error={error}")),
                 None => unreachable!(),
             })
             .unwrap_or_else(|error| format!("decode_error={error}")),
@@ -817,11 +1010,51 @@ fn backends() {
     }
 }
 
+fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
+    let mut tracker = ConnectionTracker::new(
+        ConnectionTrackerConfig {
+            access_address: args.access_address,
+            channel_selection_algorithm: args.channel_selection_algorithm,
+            hop_increment: args.hop_increment,
+            channel_map: args.channel_map,
+            parameters: args.parameters,
+            sample_rate_hz: args.sample_rate_hz,
+        },
+        args.anchor_event_counter,
+        args.anchor_access_address_sample,
+    )?;
+
+    for index in 0..args.event_count {
+        let event = if index == 0 {
+            tracker.current_event()?
+        } else {
+            tracker.advance()?
+        };
+        let ConnectionEventTiming::Expected {
+            access_address_sample,
+        } = event.timing
+        else {
+            return Err(Error::InvalidState(
+                "offline connection plan unexpectedly requires an anchor observation".to_owned(),
+            ));
+        };
+        println!(
+            "event={} channel={} frequency_hz={} expected_sample={}",
+            event.event_counter,
+            event.channel.index(),
+            event.channel.center_frequency_hz(),
+            access_address_sample
+        );
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("decode") => decode(parse_decode_args(&args[1..])?),
         Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
+        Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("capture") => capture(parse_capture_args(&args[1..])?),
         Some("backends") => {
             backends();

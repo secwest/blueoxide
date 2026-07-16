@@ -197,10 +197,52 @@ hop increments, 16-bit event-counter limits, maximum 255-octet data PDUs split
 across stream blocks, CP with zero payload, inverted spectrum, malformed CRC,
 and reserved CTEInfo values.
 
+## Connection-event and instant verification
+
+Primary controller reference:
+
+- Project: Zephyr
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files: `subsys/bluetooth/controller/ll_sw/pdu.h`,
+  `ull_llcp_pdu.c`, and `ull_llcp_internal.h`
+
+The fixed LL control layouts match Zephyr's packed structures and
+little-endian encode/decode paths:
+
+| PDU | Opcode | Parameter octets | Layout |
+| --- | ---: | ---: | --- |
+| LL_CONNECTION_UPDATE_IND | `00` | 11 | WinSize, WinOffset, Interval, Latency, Timeout, Instant |
+| LL_CHANNEL_MAP_IND | `01` | 7 | ChM[5], Instant |
+
+Instant ordering follows the Core-derived modulo tests in Zephyr:
+
+```text
+future: ((instant - event_count) & 0xffff) < 0x7fff
+reached or passed: ((event_count - instant) & 0xffff) <= 0x7fff
+```
+
+Blueoxide tests the required wrap cases `65532 -> 2` as future by six events,
+`2 -> 65532` as passed by six events, equality as reached, and differences
+`0x7fff` and `0x8000` as ambiguous. It accepts a valid instant only one event
+ahead, reflecting passive observation of a retransmission rather than imposing
+Zephyr's six-event procedure-initiation delta.
+
+Tracker tests additionally verify:
+
+- Channel-map installation before channel selection at the instant.
+- Connection-parameter activation with mandatory anchor reacquisition.
+- Refusal to advance while the new anchor is unknown.
+- Rejection of reached, passed, ambiguous, malformed, and overlapping updates.
+- 16-bit event-counter wrap with a monotonic internal event index.
+- Anchor-relative nearest-sample calculation without cumulative rounding drift.
+- Offline CLI output for Core CSA#2 channels, BLE frequencies, sample timing,
+  malformed maps, and counter wrap.
+
 Final local gate for this increment:
 
 ```text
-83 library tests
+91 library tests
+2 connection-plan CLI integration tests
 2 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test
 7 live/backend CLI integration tests

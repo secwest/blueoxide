@@ -44,10 +44,17 @@
   including Core remapping vectors and 16-bit event-counter wrap behavior.
 - CONNECT_IND ChSel handling, first transmit-window bounds, anchor-relative
   event timing, and construction of the selected channel algorithm.
+- Validated connection parameters plus strict LL_CONNECTION_UPDATE_IND and
+  LL_CHANNEL_MAP_IND parameter decoding.
+- Anchored connection-event tracking with 16-bit counter wrapping, Core instant
+  ordering, map application before instant-event channel selection, checked
+  sample arithmetic, and explicit anchor reacquisition after timing changes.
+- CONNECT_IND construction of connection trackers and direct scheduling of
+  supported decoded LL control PDUs.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
-- `blueoxide channels`, `blueoxide decode`, and configurable
-  `blueoxide decode-data` commands.
+- `blueoxide channels`, `blueoxide decode`, configurable
+  `blueoxide decode-data`, and offline `blueoxide connection-plan` commands.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
 - An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.

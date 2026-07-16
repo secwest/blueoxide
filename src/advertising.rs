@@ -1,5 +1,8 @@
 use crate::ble::AdvertisingPdu;
-use crate::link_layer::{ChannelSelectionAlgorithm, ConnectionChannelSelector, DataChannelMap};
+use crate::link_layer::{
+    ChannelSelectionAlgorithm, ConnectionChannelSelector, ConnectionParameters, ConnectionTracker,
+    ConnectionTrackerConfig, DataChannelMap,
+};
 use crate::{Error, Result};
 use std::fmt::{Display, Formatter};
 
@@ -157,6 +160,30 @@ impl ConnectRequest {
             DataChannelMap::new(self.channel_map)?,
             self.access_address,
             self.hop_increment,
+        )
+    }
+
+    pub fn connection_parameters(&self) -> Result<ConnectionParameters> {
+        ConnectionParameters::new(self.interval, self.latency, self.supervision_timeout)
+    }
+
+    pub fn connection_tracker(
+        &self,
+        sample_rate_hz: u32,
+        observed_event_counter: u16,
+        observed_access_address_sample: u64,
+    ) -> Result<ConnectionTracker> {
+        ConnectionTracker::new(
+            ConnectionTrackerConfig {
+                access_address: self.access_address,
+                channel_selection_algorithm: self.channel_selection_algorithm,
+                hop_increment: self.hop_increment,
+                channel_map: DataChannelMap::new(self.channel_map)?,
+                parameters: self.connection_parameters()?,
+                sample_rate_hz,
+            },
+            observed_event_counter,
+            observed_access_address_sample,
         )
     }
 }
@@ -558,6 +585,9 @@ mod tests {
                 .index(),
             10
         );
+        let mut tracker = request.connection_tracker(4_000_000, 0, 400).unwrap();
+        assert_eq!(tracker.current_event().unwrap().channel.index(), 10);
+        assert_eq!(tracker.advance().unwrap().channel.index(), 20);
     }
 
     #[test]

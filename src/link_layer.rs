@@ -250,6 +250,44 @@ impl ControlPdu<'_> {
             _ => "LL_UNKNOWN_OPCODE",
         }
     }
+
+    pub fn connection_update_ind(self) -> Result<Option<ConnectionUpdateInd>> {
+        if self.opcode != 0x00 {
+            return Ok(None);
+        }
+        if self.parameters.len() != 11 {
+            return Err(Error::InvalidInput(format!(
+                "LL_CONNECTION_UPDATE_IND requires 11 parameter octets, received {}",
+                self.parameters.len()
+            )));
+        }
+        Ok(Some(ConnectionUpdateInd::new(
+            self.parameters[0],
+            u16::from_le_bytes([self.parameters[1], self.parameters[2]]),
+            u16::from_le_bytes([self.parameters[3], self.parameters[4]]),
+            u16::from_le_bytes([self.parameters[5], self.parameters[6]]),
+            u16::from_le_bytes([self.parameters[7], self.parameters[8]]),
+            u16::from_le_bytes([self.parameters[9], self.parameters[10]]),
+        )?))
+    }
+
+    pub fn channel_map_ind(self) -> Result<Option<ChannelMapInd>> {
+        if self.opcode != 0x01 {
+            return Ok(None);
+        }
+        if self.parameters.len() != 7 {
+            return Err(Error::InvalidInput(format!(
+                "LL_CHANNEL_MAP_IND requires 7 parameter octets, received {}",
+                self.parameters.len()
+            )));
+        }
+        Ok(Some(ChannelMapInd {
+            channel_map: DataChannelMap::new(self.parameters[..5].try_into().map_err(|_| {
+                Error::InvalidInput("LL_CHANNEL_MAP_IND channel map is truncated".to_owned())
+            })?)?,
+            instant: u16::from_le_bytes([self.parameters[5], self.parameters[6]]),
+        }))
+    }
 }
 
 pub fn decode_data_channel(
@@ -335,6 +373,144 @@ impl TryFrom<[u8; 5]> for DataChannelMap {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionParameters {
+    pub interval: u16,
+    pub latency: u16,
+    pub supervision_timeout: u16,
+}
+
+impl ConnectionParameters {
+    pub fn new(interval: u16, latency: u16, supervision_timeout: u16) -> Result<Self> {
+        let parameters = Self {
+            interval,
+            latency,
+            supervision_timeout,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if !(6..=3_200).contains(&self.interval) {
+            return Err(Error::InvalidInput(format!(
+                "connection interval {} is outside 6..=3200",
+                self.interval
+            )));
+        }
+        if self.latency > 499 {
+            return Err(Error::InvalidInput(format!(
+                "connection latency {} exceeds 499",
+                self.latency
+            )));
+        }
+        if !(10..=3_200).contains(&self.supervision_timeout) {
+            return Err(Error::InvalidInput(format!(
+                "connection supervision timeout {} is outside 10..=3200",
+                self.supervision_timeout
+            )));
+        }
+        let minimum_timeout_us =
+            2u64 * (u64::from(self.latency) + 1) * u64::from(self.interval_us());
+        if u64::from(self.supervision_timeout_us()) <= minimum_timeout_us {
+            return Err(Error::InvalidInput(format!(
+                "connection supervision timeout {} us must exceed {} us for interval and latency",
+                self.supervision_timeout_us(),
+                minimum_timeout_us
+            )));
+        }
+        Ok(())
+    }
+
+    pub const fn interval_us(self) -> u32 {
+        self.interval as u32 * 1_250
+    }
+
+    pub const fn supervision_timeout_us(self) -> u32 {
+        self.supervision_timeout as u32 * 10_000
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionUpdateInd {
+    pub window_size: u8,
+    pub window_offset: u16,
+    pub parameters: ConnectionParameters,
+    pub instant: u16,
+}
+
+impl ConnectionUpdateInd {
+    pub fn new(
+        window_size: u8,
+        window_offset: u16,
+        interval: u16,
+        latency: u16,
+        supervision_timeout: u16,
+        instant: u16,
+    ) -> Result<Self> {
+        let update = Self {
+            window_size,
+            window_offset,
+            parameters: ConnectionParameters::new(interval, latency, supervision_timeout)?,
+            instant,
+        };
+        update.validate()?;
+        Ok(update)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if !(1..=16).contains(&self.window_size) {
+            return Err(Error::InvalidInput(format!(
+                "connection-update window size {} is outside 1..=16",
+                self.window_size
+            )));
+        }
+        self.parameters.validate()?;
+        if self.window_offset > self.parameters.interval {
+            return Err(Error::InvalidInput(format!(
+                "connection-update window offset {} exceeds interval {}",
+                self.window_offset, self.parameters.interval
+            )));
+        }
+        Ok(())
+    }
+
+    pub const fn window_offset_us(self) -> u32 {
+        self.window_offset as u32 * 1_250
+    }
+
+    pub const fn window_size_us(self) -> u32 {
+        self.window_size as u32 * 1_250
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelMapInd {
+    pub channel_map: DataChannelMap,
+    pub instant: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstantRelation {
+    Future(u16),
+    Reached,
+    Passed(u16),
+    Ambiguous,
+}
+
+pub const fn instant_relation(current_event_counter: u16, instant: u16) -> InstantRelation {
+    let future = instant.wrapping_sub(current_event_counter);
+    if future == 0 {
+        InstantRelation::Reached
+    } else if future < 0x7fff {
+        InstantRelation::Future(future)
+    } else if future <= 0x8000 {
+        InstantRelation::Ambiguous
+    } else {
+        InstantRelation::Passed(current_event_counter.wrapping_sub(instant))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelSelectionAlgorithm {
     Csa1,
     Csa2,
@@ -344,6 +520,279 @@ pub enum ChannelSelectionAlgorithm {
 pub enum ConnectionChannelSelector {
     Csa1(ChannelSelectionAlgorithm1),
     Csa2(ChannelSelectionAlgorithm2),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionTrackerConfig {
+    pub access_address: u32,
+    pub channel_selection_algorithm: ChannelSelectionAlgorithm,
+    pub hop_increment: u8,
+    pub channel_map: DataChannelMap,
+    pub parameters: ConnectionParameters,
+    pub sample_rate_hz: u32,
+}
+
+impl ConnectionTrackerConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.parameters.validate()?;
+        if self.sample_rate_hz == 0 {
+            return Err(Error::InvalidConfiguration(
+                "connection tracker sample rate must be greater than zero".to_owned(),
+            ));
+        }
+        ConnectionChannelSelector::new(
+            self.channel_selection_algorithm,
+            self.channel_map.clone(),
+            self.access_address,
+            self.hop_increment,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionEventTiming {
+    Expected { access_address_sample: u64 },
+    AnchorObservationRequired { window_offset: u16, window_size: u8 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionEvent {
+    pub event_counter: u16,
+    pub channel: BleChannel,
+    pub timing: ConnectionEventTiming,
+}
+
+#[derive(Clone, Debug)]
+enum PendingConnectionUpdate {
+    ChannelMap {
+        target_event: u64,
+        update: ChannelMapInd,
+    },
+    Parameters {
+        target_event: u64,
+        update: ConnectionUpdateInd,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TrackerTiming {
+    Anchored {
+        event_index: u64,
+        access_address_sample: u64,
+    },
+    AwaitingAnchor {
+        update: ConnectionUpdateInd,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectionTracker {
+    config: ConnectionTrackerConfig,
+    selector: ConnectionChannelSelector,
+    event_counter: u16,
+    event_index: u64,
+    timing: TrackerTiming,
+    pending: Option<PendingConnectionUpdate>,
+}
+
+impl ConnectionTracker {
+    pub fn new(
+        config: ConnectionTrackerConfig,
+        observed_event_counter: u16,
+        observed_access_address_sample: u64,
+    ) -> Result<Self> {
+        config.validate()?;
+        let selector = ConnectionChannelSelector::new(
+            config.channel_selection_algorithm,
+            config.channel_map.clone(),
+            config.access_address,
+            config.hop_increment,
+        )?;
+        Ok(Self {
+            config,
+            selector,
+            event_counter: observed_event_counter,
+            event_index: 0,
+            timing: TrackerTiming::Anchored {
+                event_index: 0,
+                access_address_sample: observed_access_address_sample,
+            },
+            pending: None,
+        })
+    }
+
+    pub const fn event_counter(&self) -> u16 {
+        self.event_counter
+    }
+
+    pub const fn parameters(&self) -> ConnectionParameters {
+        self.config.parameters
+    }
+
+    pub fn channel_map(&self) -> &DataChannelMap {
+        &self.config.channel_map
+    }
+
+    pub fn current_event(&self) -> Result<ConnectionEvent> {
+        Ok(ConnectionEvent {
+            event_counter: self.event_counter,
+            channel: self.selector.channel_for_event(self.event_counter),
+            timing: self.current_timing()?,
+        })
+    }
+
+    pub fn advance(&mut self) -> Result<ConnectionEvent> {
+        if matches!(self.timing, TrackerTiming::AwaitingAnchor { .. }) {
+            return Err(Error::InvalidState(
+                "connection tracker requires an observed anchor before it can advance".to_owned(),
+            ));
+        }
+        self.event_index = self.event_index.checked_add(1).ok_or_else(|| {
+            Error::InvalidState("connection tracker event index overflow".to_owned())
+        })?;
+        self.event_counter = self.event_counter.wrapping_add(1);
+
+        if self.pending_target_event() == Some(self.event_index) {
+            match self.pending.take().expect("pending target was present") {
+                PendingConnectionUpdate::ChannelMap { update, .. } => {
+                    self.config.channel_map = update.channel_map;
+                    self.selector = ConnectionChannelSelector::new(
+                        self.config.channel_selection_algorithm,
+                        self.config.channel_map.clone(),
+                        self.config.access_address,
+                        self.config.hop_increment,
+                    )?;
+                }
+                PendingConnectionUpdate::Parameters { update, .. } => {
+                    self.config.parameters = update.parameters;
+                    self.timing = TrackerTiming::AwaitingAnchor { update };
+                }
+            }
+        }
+
+        self.current_event()
+    }
+
+    pub fn observe_anchor(&mut self, access_address_sample: u64) -> Result<ConnectionEvent> {
+        if !matches!(self.timing, TrackerTiming::AwaitingAnchor { .. }) {
+            return Err(Error::InvalidState(
+                "connection tracker is not waiting for an anchor observation".to_owned(),
+            ));
+        }
+        self.timing = TrackerTiming::Anchored {
+            event_index: self.event_index,
+            access_address_sample,
+        };
+        self.current_event()
+    }
+
+    pub fn schedule_channel_map(&mut self, update: ChannelMapInd) -> Result<()> {
+        let target_event = self.validate_new_instant(update.instant)?;
+        self.pending = Some(PendingConnectionUpdate::ChannelMap {
+            target_event,
+            update,
+        });
+        Ok(())
+    }
+
+    pub fn schedule_connection_update(&mut self, update: ConnectionUpdateInd) -> Result<()> {
+        update.validate()?;
+        let target_event = self.validate_new_instant(update.instant)?;
+        self.pending = Some(PendingConnectionUpdate::Parameters {
+            target_event,
+            update,
+        });
+        Ok(())
+    }
+
+    pub fn schedule_control(&mut self, control: ControlPdu<'_>) -> Result<bool> {
+        if let Some(update) = control.connection_update_ind()? {
+            self.schedule_connection_update(update)?;
+            return Ok(true);
+        }
+        if let Some(update) = control.channel_map_ind()? {
+            self.schedule_channel_map(update)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn validate_new_instant(&self, instant: u16) -> Result<u64> {
+        if matches!(self.timing, TrackerTiming::AwaitingAnchor { .. }) {
+            return Err(Error::InvalidState(
+                "connection tracker requires an observed anchor before scheduling another update"
+                    .to_owned(),
+            ));
+        }
+        if self.pending.is_some() {
+            return Err(Error::InvalidState(
+                "an instant-based connection update is already pending".to_owned(),
+            ));
+        }
+        let InstantRelation::Future(events) = instant_relation(self.event_counter, instant) else {
+            return Err(Error::InvalidInput(format!(
+                "instant {instant} is not unambiguously in the future of event {}",
+                self.event_counter
+            )));
+        };
+        self.event_index
+            .checked_add(u64::from(events))
+            .ok_or_else(|| Error::InvalidState("connection update event index overflow".to_owned()))
+    }
+
+    fn pending_target_event(&self) -> Option<u64> {
+        match &self.pending {
+            Some(PendingConnectionUpdate::ChannelMap { target_event, .. })
+            | Some(PendingConnectionUpdate::Parameters { target_event, .. }) => Some(*target_event),
+            None => None,
+        }
+    }
+
+    fn current_timing(&self) -> Result<ConnectionEventTiming> {
+        match self.timing {
+            TrackerTiming::Anchored {
+                event_index,
+                access_address_sample,
+            } => {
+                let elapsed_events =
+                    self.event_index.checked_sub(event_index).ok_or_else(|| {
+                        Error::InvalidState(
+                            "connection tracker event index precedes its timing anchor".to_owned(),
+                        )
+                    })?;
+                let numerator = u128::from(elapsed_events)
+                    .checked_mul(u128::from(self.config.parameters.interval_us()))
+                    .and_then(|value| value.checked_mul(u128::from(self.config.sample_rate_hz)))
+                    .ok_or_else(|| {
+                        Error::InvalidState(
+                            "connection tracker sample-offset arithmetic overflow".to_owned(),
+                        )
+                    })?;
+                let rounded_samples = numerator.checked_add(500_000).ok_or_else(|| {
+                    Error::InvalidState("connection tracker sample rounding overflow".to_owned())
+                })? / 1_000_000;
+                let rounded_samples = u64::try_from(rounded_samples).map_err(|_| {
+                    Error::InvalidState("connection tracker sample offset exceeds u64".to_owned())
+                })?;
+                Ok(ConnectionEventTiming::Expected {
+                    access_address_sample: access_address_sample
+                        .checked_add(rounded_samples)
+                        .ok_or_else(|| {
+                            Error::InvalidState(
+                                "connection tracker expected sample exceeds u64".to_owned(),
+                            )
+                        })?,
+                })
+            }
+            TrackerTiming::AwaitingAnchor { update } => {
+                Ok(ConnectionEventTiming::AnchorObservationRequired {
+                    window_offset: update.window_offset,
+                    window_size: update.window_size,
+                })
+            }
+        }
+    }
 }
 
 impl ConnectionChannelSelector {
@@ -472,6 +921,19 @@ mod tests {
 
     fn all_channels() -> DataChannelMap {
         DataChannelMap::new([0xff, 0xff, 0xff, 0xff, 0x1f]).unwrap()
+    }
+
+    fn tracker_config(
+        channel_selection_algorithm: ChannelSelectionAlgorithm,
+    ) -> ConnectionTrackerConfig {
+        ConnectionTrackerConfig {
+            access_address: 0x1234_5678,
+            channel_selection_algorithm,
+            hop_increment: 5,
+            channel_map: all_channels(),
+            parameters: ConnectionParameters::new(24, 0, 100).unwrap(),
+            sample_rate_hz: 4_000_000,
+        }
     }
 
     #[test]
@@ -604,5 +1066,247 @@ mod tests {
         let csa2 = ChannelSelectionAlgorithm2::new(all_channels(), 0xffff_ffff);
         assert!(csa1.channel_for_event(u16::MAX).index() <= 36);
         assert!(csa2.channel_for_event(u16::MAX).index() <= 36);
+    }
+
+    #[test]
+    fn parses_connection_update_and_channel_map_control_pdus() {
+        let connection_update = ControlPdu {
+            opcode: 0x00,
+            parameters: &[2, 3, 0, 24, 0, 4, 0, 100, 0, 0x34, 0x12],
+        }
+        .connection_update_ind()
+        .unwrap()
+        .unwrap();
+        assert_eq!(connection_update.window_size, 2);
+        assert_eq!(connection_update.window_offset, 3);
+        assert_eq!(connection_update.parameters.interval, 24);
+        assert_eq!(connection_update.parameters.latency, 4);
+        assert_eq!(connection_update.parameters.supervision_timeout, 100);
+        assert_eq!(connection_update.instant, 0x1234);
+        assert_eq!(connection_update.window_offset_us(), 3_750);
+        assert_eq!(connection_update.window_size_us(), 2_500);
+
+        let channel_map = ControlPdu {
+            opcode: 0x01,
+            parameters: &[0x06, 0, 0, 0, 0, 2, 0],
+        }
+        .channel_map_ind()
+        .unwrap()
+        .unwrap();
+        assert_eq!(channel_map.channel_map.used_channels(), [1, 2]);
+        assert_eq!(channel_map.instant, 2);
+
+        assert!(
+            ControlPdu {
+                opcode: 0x02,
+                parameters: &[]
+            }
+            .connection_update_ind()
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_instant_control_pdus() {
+        let short_update = ControlPdu {
+            opcode: 0x00,
+            parameters: &[1; 10],
+        };
+        assert!(short_update.connection_update_ind().is_err());
+
+        let invalid_window = ControlPdu {
+            opcode: 0x00,
+            parameters: &[0, 0, 0, 24, 0, 0, 0, 100, 0, 6, 0],
+        };
+        assert!(invalid_window.connection_update_ind().is_err());
+
+        let reserved_map = ControlPdu {
+            opcode: 0x01,
+            parameters: &[0x03, 0, 0, 0, 0x20, 6, 0],
+        };
+        assert!(reserved_map.channel_map_ind().is_err());
+
+        let short_map = ControlPdu {
+            opcode: 0x01,
+            parameters: &[0x03, 0, 0, 0, 0, 6],
+        };
+        assert!(short_map.channel_map_ind().is_err());
+    }
+
+    #[test]
+    fn classifies_instants_across_event_counter_wrap() {
+        assert_eq!(instant_relation(65_532, 2), InstantRelation::Future(6));
+        assert_eq!(instant_relation(2, 65_532), InstantRelation::Passed(6));
+        assert_eq!(instant_relation(44, 44), InstantRelation::Reached);
+        assert_eq!(instant_relation(0, 0x7fff), InstantRelation::Ambiguous);
+        assert_eq!(instant_relation(0, 0x8000), InstantRelation::Ambiguous);
+    }
+
+    #[test]
+    fn tracker_applies_channel_map_before_selecting_instant_event() {
+        let mut tracker = ConnectionTracker::new(
+            tracker_config(ChannelSelectionAlgorithm::Csa2),
+            65_532,
+            1_000,
+        )
+        .unwrap();
+        assert!(
+            tracker
+                .schedule_control(ControlPdu {
+                    opcode: 0x01,
+                    parameters: &[0x06, 0, 0, 0, 0, 2, 0],
+                })
+                .unwrap()
+        );
+
+        let mut event = tracker.current_event().unwrap();
+        for _ in 0..6 {
+            event = tracker.advance().unwrap();
+        }
+        assert_eq!(event.event_counter, 2);
+        assert!(matches!(event.channel.index(), 1 | 2));
+        assert_eq!(tracker.channel_map().used_channels(), [1, 2]);
+        assert_eq!(
+            event.timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 721_000
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_requires_a_new_anchor_at_connection_update_instant() {
+        let mut tracker =
+            ConnectionTracker::new(tracker_config(ChannelSelectionAlgorithm::Csa1), 10, 1_000)
+                .unwrap();
+        tracker
+            .schedule_connection_update(ConnectionUpdateInd::new(2, 3, 40, 0, 100, 12).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            tracker.advance().unwrap().timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 121_000
+            }
+        );
+        let update_event = tracker.advance().unwrap();
+        assert_eq!(update_event.event_counter, 12);
+        assert_eq!(
+            update_event.timing,
+            ConnectionEventTiming::AnchorObservationRequired {
+                window_offset: 3,
+                window_size: 2
+            }
+        );
+        assert_eq!(tracker.parameters().interval, 40);
+        assert!(tracker.advance().is_err());
+
+        assert_eq!(
+            tracker.observe_anchor(500_000).unwrap().timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 500_000
+            }
+        );
+        assert_eq!(
+            tracker.advance().unwrap().timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 700_000
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_rejects_nonfuture_and_overlapping_updates() {
+        let mut tracker =
+            ConnectionTracker::new(tracker_config(ChannelSelectionAlgorithm::Csa2), 100, 0)
+                .unwrap();
+        assert!(
+            tracker
+                .schedule_connection_update(ConnectionUpdateInd {
+                    window_size: 0,
+                    window_offset: 0,
+                    parameters: ConnectionParameters {
+                        interval: 24,
+                        latency: 0,
+                        supervision_timeout: 100,
+                    },
+                    instant: 101,
+                })
+                .is_err()
+        );
+        assert!(
+            tracker
+                .schedule_channel_map(ChannelMapInd {
+                    channel_map: all_channels(),
+                    instant: 100,
+                })
+                .is_err()
+        );
+        assert!(
+            tracker
+                .schedule_channel_map(ChannelMapInd {
+                    channel_map: all_channels(),
+                    instant: 99,
+                })
+                .is_err()
+        );
+        assert!(
+            tracker
+                .schedule_channel_map(ChannelMapInd {
+                    channel_map: all_channels(),
+                    instant: 100u16.wrapping_add(0x8000),
+                })
+                .is_err()
+        );
+
+        tracker
+            .schedule_channel_map(ChannelMapInd {
+                channel_map: all_channels(),
+                instant: 101,
+            })
+            .unwrap();
+        assert!(
+            tracker
+                .schedule_connection_update(
+                    ConnectionUpdateInd::new(1, 0, 24, 0, 100, 102).unwrap()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tracker_uses_anchor_relative_rounding_without_cumulative_drift() {
+        let mut config = tracker_config(ChannelSelectionAlgorithm::Csa2);
+        config.parameters = ConnectionParameters::new(6, 0, 100).unwrap();
+        config.sample_rate_hz = 2_000_001;
+        let mut tracker = ConnectionTracker::new(config, 0, 0).unwrap();
+
+        let mut event = tracker.current_event().unwrap();
+        for _ in 0..100 {
+            event = tracker.advance().unwrap();
+        }
+        assert_eq!(event.event_counter, 100);
+        assert_eq!(
+            event.timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 1_500_001
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_rejects_anchor_observation_when_timing_is_already_known() {
+        let mut tracker =
+            ConnectionTracker::new(tracker_config(ChannelSelectionAlgorithm::Csa2), 0, 0).unwrap();
+        assert!(tracker.observe_anchor(10).is_err());
+        assert!(
+            !tracker
+                .schedule_control(ControlPdu {
+                    opcode: 0x14,
+                    parameters: &[0; 8],
+                })
+                .unwrap()
+        );
     }
 }

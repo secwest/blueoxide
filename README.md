@@ -26,6 +26,9 @@ The repository now contains a dependency-free, buildable receive core with:
   retaining unrecognized payload and MIC bytes losslessly.
 - Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
   including CONNECT_IND ChSel selection and event-counter channel calculation.
+- Anchored connection-event tracking with wrap-safe instant handling, strict
+  LL_CHANNEL_MAP_IND/LL_CONNECTION_UPDATE_IND parsing, and explicit anchor
+  reacquisition after connection-parameter changes.
 - Dependency-free PCAPNG output using the standard Bluetooth LE link-layer
   pseudo-header.
 - A hardware-neutral receive trait that requires backends to report overruns and
@@ -116,6 +119,34 @@ payload. The payload field remains lossless and can include an encrypted MIC
 because decryption state is not yet tracked. Printed L2CAP and LL control
 interpretations are explicitly plaintext hints; encrypted payloads remain
 available as raw bytes but cannot yet be interpreted reliably.
+
+Generate an offline event/channel/sample plan from an observed connection
+anchor:
+
+```text
+cargo run --release -- connection-plan \
+  --access-address 0x12345678 \
+  --channel-map ffffffff1f \
+  --csa 2 \
+  --interval 24 \
+  --sample-rate 4000000 \
+  --anchor-event 0 \
+  --anchor-sample 1000 \
+  --events 10
+```
+
+The channel map is five hexadecimal octets in over-the-air order. Connection
+intervals use 1.25 ms units, supervision timeouts use 10 ms units, and the
+expected sample index is calculated relative to the observed access-address
+sample without accumulating per-event rounding error. `--hop` selects the
+5-through-16 hop increment for CSA#1.
+
+The library tracker can schedule decoded `LL_CHANNEL_MAP_IND` and
+`LL_CONNECTION_UPDATE_IND` control PDUs. A channel-map update is applied before
+choosing the channel at its instant. A connection-parameter update deliberately
+returns an anchor-observation-required state at its instant; scheduling resumes
+only after the caller supplies the access-address sample actually observed in
+that event.
 
 Capture live BLE advertising traffic from bladeRF RX0:
 
@@ -215,13 +246,14 @@ firmware compatibility, and hardware tests make that practical.
 ## Development direction
 
 The next hardware work is recorded fixtures and live smoke tests from all three
-supported SDR families. Connection framing, channel selection, and first-window
-timing primitives are now present; the next receive stages are wideband
-channelization, anchor-point acquisition, timed retuning, and live BLE
-connection following. Full packet decode is a project requirement: extended
-advertising, complete LL control semantics, L2CAP reassembly, ATT/GATT, SMP,
-encryption, LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added
-incrementally while retaining undecoded packet bytes losslessly.
+supported SDR families. Connection framing, channel selection, anchored event
+progression, and instant-based map/parameter updates are now present; the next
+receive stages are wideband channelization, automatic anchor acquisition,
+clock-drift tracking, timed retuning, and live BLE connection following. Full
+packet decode is a project requirement: extended advertising, complete LL
+control semantics, L2CAP reassembly, ATT/GATT, SMP, encryption, LE 2M/Coded
+PHY, and Bluetooth Classic BR/EDR layers will be added incrementally while
+retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;
