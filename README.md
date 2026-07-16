@@ -29,6 +29,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Anchored connection-event tracking with wrap-safe instant handling, strict
   LL_CHANNEL_MAP_IND/LL_CONNECTION_UPDATE_IND parsing, and explicit anchor
   reacquisition after connection-parameter changes.
+- CONNECT_IND event-0 acquisition windows, Core sleep-clock-accuracy mapping,
+  receiver-clock widening, missed-event matching, and observation-driven
+  re-anchoring.
 - Dependency-free PCAPNG output using the standard Bluetooth LE link-layer
   pseudo-header.
 - A hardware-neutral receive trait that requires backends to report overruns and
@@ -139,14 +142,52 @@ The channel map is five hexadecimal octets in over-the-air order. Connection
 intervals use 1.25 ms units, supervision timeouts use 10 ms units, and the
 expected sample index is calculated relative to the observed access-address
 sample without accumulating per-event rounding error. `--hop` selects the
-5-through-16 hop increment for CSA#1.
+5-through-16 hop increment for CSA#1. `--peer-sca` accepts the CONNECT_IND SCA
+field from 0 through 7, while `--receiver-ppm` supplies the receiver sample
+clock's worst-case error. Plans include the resulting earliest/latest sample
+bounds.
+
+Acquire event 0 from a decoded CONNECT_IND and continue with later CRC-valid
+observations:
+
+```text
+cargo run --release -- connection-acquire \
+  --access-address 0x12345678 \
+  --channel-map ffffffff1f \
+  --csa 1 \
+  --hop 10 \
+  --window-size 2 \
+  --window-offset 3 \
+  --interval 24 \
+  --sample-rate 4000000 \
+  --connect-sample 1000 \
+  --peer-sca 0 \
+  --receiver-ppm 20 \
+  --central-observe 10:30000 \
+  --observe 20:150020
+```
+
+`--connect-sample` is the CONNECT_IND access-address sample. The first
+`--central-observe` value must be a caller-identified, CRC-valid transmission
+from the central on event 0's selected channel inside the clock-widened
+WinOffset / WinSize search window. Blueoxide does not infer direction from an
+isolated data PDU: a peripheral response in that window is not an anchor.
+Usually the central transmission is the earliest decoded packet in the event,
+but packet order is not sufficient when the capture may have missed it. Each
+later `--observe CHANNEL:SAMPLE` value is matched against the expected hopping
+sequence and timing windows. A successful match reports skipped events and
+timing error, then uses the observed access-address sample as the new anchor.
+
+For a connection with an existing anchor, use `connection-sync` with repeated
+`--observe CHANNEL:SAMPLE` values. `--max-event-advance` bounds the amount of
+state searched for each observation.
 
 The library tracker can schedule decoded `LL_CHANNEL_MAP_IND` and
 `LL_CONNECTION_UPDATE_IND` control PDUs. A channel-map update is applied before
 choosing the channel at its instant. A connection-parameter update deliberately
-returns an anchor-observation-required state at its instant; scheduling resumes
-only after the caller supplies the access-address sample actually observed in
-that event.
+returns an anchor-observation-required state at its instant; ordinary
+missed-event searches stop there, and scheduling resumes only after the caller
+supplies the access-address sample actually observed in that event.
 
 Capture live BLE advertising traffic from bladeRF RX0:
 
@@ -247,9 +288,10 @@ firmware compatibility, and hardware tests make that practical.
 
 The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
-progression, and instant-based map/parameter updates are now present; the next
-receive stages are wideband channelization, automatic anchor acquisition,
-clock-drift tracking, timed retuning, and live BLE connection following. Full
+progression, clock-error windows, offline anchor acquisition, observation
+synchronization, and instant-based map/parameter updates are now present; the
+next receive stages are wideband channelization or timed retuning, automatic
+capture-driven observation delivery, and live BLE connection following. Full
 packet decode is a project requirement: extended advertising, complete LL
 control semantics, L2CAP reassembly, ATT/GATT, SMP, encryption, LE 2M/Coded
 PHY, and Bluetooth Classic BR/EDR layers will be added incrementally while

@@ -238,11 +238,56 @@ Tracker tests additionally verify:
 - Offline CLI output for Core CSA#2 channels, BLE frequencies, sample timing,
   malformed maps, and counter wrap.
 
+## Anchor acquisition and clock-window verification
+
+Additional Zephyr references at commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4`:
+
+- `subsys/bluetooth/controller/ll_sw/nordic/lll/lll_clock.c`
+- `subsys/bluetooth/controller/ll_sw/ull_peripheral.c`
+- `subsys/bluetooth/controller/ll_sw/ull_conn.c`
+
+Zephyr's SCA lookup table is fixed as:
+
+```text
+{500, 250, 150, 100, 75, 50, 30, 20} ppm
+```
+
+Its peripheral connection setup calculates per-event widening with the sum of
+local and peer clock accuracy, rounded upward, and caps accumulated widening at
+half the connection interval minus the 150 us inter-frame spacing. Blueoxide
+uses the equivalent elapsed-time calculation directly in sample units, avoiding
+extra over-widening from rounding each event independently.
+
+Fixed 4 MHz vectors cover:
+
+| Case | Expected result |
+| --- | --- |
+| 30 ms after anchor, peer 500 ppm, receiver 20 ppm | 63 samples one-sided widening |
+| 60 ms after anchor, same clocks | 125 samples one-sided widening |
+| 7.5 ms interval with extreme receiver bound | capped at 14,400 samples |
+| CONNECT_IND AA sample 1,000, WinOffset 3, WinSize 2 | nominal event-0 window 22,376 through 32,376 |
+| Same event-0 window with 520 ppm combined error | widened bounds 22,360 through 32,392 |
+
+The acquisition test accepts a caller-identified event-0 central transmission
+on CSA#1 channel 10 at sample 30,000 and rejects the wrong channel,
+out-of-window samples, advertising channels, invalid WinSize, invalid SCA,
+non-integral LE 1M sample rates, and receiver bounds above one million ppm.
+The CLI separately requires `--central-observe`; a generic `--observe` cannot
+silently establish event 0 because Blueoxide does not infer packet direction.
+
+The observation-recovery vector starts at event 0/sample 1,000, observes CSA#2
+event 3/channel 21 at sample 361,050, reports two missed intervening events and
+a 50-sample late error, then re-anchors. Event 4 is consequently expected at
+sample 481,050 with only one interval of widening. Searches that fail channel
+or time checks, or reach an unknown connection-update anchor, leave the tracker
+unchanged.
+
 Final local gate for this increment:
 
 ```text
-91 library tests
-2 connection-plan CLI integration tests
+97 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
 2 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test
 7 live/backend CLI integration tests

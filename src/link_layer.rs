@@ -511,6 +511,28 @@ pub const fn instant_relation(current_event_counter: u16, instant: u16) -> Insta
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SleepClockAccuracy(u8);
+
+impl SleepClockAccuracy {
+    pub fn new(raw: u8) -> Result<Self> {
+        if raw > 7 {
+            return Err(Error::InvalidInput(format!(
+                "sleep clock accuracy {raw} is outside 0..=7"
+            )));
+        }
+        Ok(Self(raw))
+    }
+
+    pub const fn raw(self) -> u8 {
+        self.0
+    }
+
+    pub const fn maximum_ppm(self) -> u16 {
+        [500, 250, 150, 100, 75, 50, 30, 20][self.0 as usize]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelSelectionAlgorithm {
     Csa1,
     Csa2,
@@ -561,6 +583,38 @@ pub struct ConnectionEvent {
     pub event_counter: u16,
     pub channel: BleChannel,
     pub timing: ConnectionEventTiming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionTimingWindow {
+    pub expected_sample: u64,
+    pub earliest_sample: u64,
+    pub latest_sample: u64,
+    pub widening_samples: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleTimingError {
+    Early(u64),
+    OnTime,
+    Late(u64),
+}
+
+impl SampleTimingError {
+    pub const fn absolute_samples(self) -> u64 {
+        match self {
+            Self::Early(samples) | Self::Late(samples) => samples,
+            Self::OnTime => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionObservation {
+    pub event: ConnectionEvent,
+    pub timing_window: ConnectionTimingWindow,
+    pub advanced_events: u16,
+    pub timing_error: SampleTimingError,
 }
 
 #[derive(Clone, Debug)]
@@ -642,6 +696,69 @@ impl ConnectionTracker {
         })
     }
 
+    pub fn current_timing_window(
+        &self,
+        peer_clock_accuracy: SleepClockAccuracy,
+        receiver_clock_accuracy_ppm: u32,
+    ) -> Result<Option<ConnectionTimingWindow>> {
+        if receiver_clock_accuracy_ppm > 1_000_000 {
+            return Err(Error::InvalidConfiguration(format!(
+                "receiver clock accuracy {receiver_clock_accuracy_ppm} ppm exceeds 1000000"
+            )));
+        }
+        let ConnectionEventTiming::Expected {
+            access_address_sample: expected_sample,
+        } = self.current_timing()?
+        else {
+            return Ok(None);
+        };
+        let TrackerTiming::Anchored { event_index, .. } = self.timing else {
+            return Ok(None);
+        };
+        let elapsed_events = self.event_index.checked_sub(event_index).ok_or_else(|| {
+            Error::InvalidState(
+                "connection tracker event index precedes its timing anchor".to_owned(),
+            )
+        })?;
+        let elapsed_us = u128::from(elapsed_events)
+            .checked_mul(u128::from(self.config.parameters.interval_us()))
+            .ok_or_else(|| {
+                Error::InvalidState("connection timing elapsed-time overflow".to_owned())
+            })?;
+        let combined_ppm = u128::from(receiver_clock_accuracy_ppm)
+            .checked_add(u128::from(peer_clock_accuracy.maximum_ppm()))
+            .ok_or_else(|| Error::InvalidState("connection clock-accuracy overflow".to_owned()))?;
+        let widening_numerator = elapsed_us
+            .checked_mul(combined_ppm)
+            .and_then(|value| value.checked_mul(u128::from(self.config.sample_rate_hz)))
+            .ok_or_else(|| {
+                Error::InvalidState("connection timing-window arithmetic overflow".to_owned())
+            })?;
+        let widening_samples = divide_round_up(widening_numerator, 1_000_000_000_000)?;
+        let maximum_widening_us = u128::from(self.config.parameters.interval_us() / 2 - 150);
+        let maximum_widening_samples = divide_round_up(
+            maximum_widening_us
+                .checked_mul(u128::from(self.config.sample_rate_hz))
+                .ok_or_else(|| {
+                    Error::InvalidState(
+                        "connection maximum timing-window arithmetic overflow".to_owned(),
+                    )
+                })?,
+            1_000_000,
+        )?;
+        let widening_samples = widening_samples.min(maximum_widening_samples);
+        Ok(Some(ConnectionTimingWindow {
+            expected_sample,
+            earliest_sample: expected_sample.saturating_sub(widening_samples),
+            latest_sample: expected_sample
+                .checked_add(widening_samples)
+                .ok_or_else(|| {
+                    Error::InvalidState("connection timing window exceeds u64".to_owned())
+                })?,
+            widening_samples,
+        }))
+    }
+
     pub fn advance(&mut self) -> Result<ConnectionEvent> {
         if matches!(self.timing, TrackerTiming::AwaitingAnchor { .. }) {
             return Err(Error::InvalidState(
@@ -685,6 +802,87 @@ impl ConnectionTracker {
             access_address_sample,
         };
         self.current_event()
+    }
+
+    pub fn synchronize_observation(
+        &mut self,
+        channel: BleChannel,
+        access_address_sample: u64,
+        peer_clock_accuracy: SleepClockAccuracy,
+        receiver_clock_accuracy_ppm: u32,
+        maximum_event_advance: u16,
+    ) -> Result<ConnectionObservation> {
+        if channel.index() > 36 {
+            return Err(Error::InvalidInput(format!(
+                "connection observation requires a data channel in 0..=36; got {}",
+                channel.index()
+            )));
+        }
+
+        let mut candidate = self.clone();
+        let mut best: Option<(Self, ConnectionObservation)> = None;
+        let mut tied = false;
+        for advanced_events in 0..=maximum_event_advance {
+            let event = candidate.current_event()?;
+            let Some(timing_window) = candidate
+                .current_timing_window(peer_clock_accuracy, receiver_clock_accuracy_ppm)?
+            else {
+                break;
+            };
+            if event.channel == channel
+                && (timing_window.earliest_sample..=timing_window.latest_sample)
+                    .contains(&access_address_sample)
+            {
+                let timing_error = if access_address_sample < timing_window.expected_sample {
+                    SampleTimingError::Early(timing_window.expected_sample - access_address_sample)
+                } else if access_address_sample > timing_window.expected_sample {
+                    SampleTimingError::Late(access_address_sample - timing_window.expected_sample)
+                } else {
+                    SampleTimingError::OnTime
+                };
+                let observation = ConnectionObservation {
+                    event,
+                    timing_window,
+                    advanced_events,
+                    timing_error,
+                };
+                let replace = best.as_ref().is_none_or(|(_, existing)| {
+                    timing_error.absolute_samples() < existing.timing_error.absolute_samples()
+                });
+                if replace {
+                    let mut matched = candidate.clone();
+                    matched.timing = TrackerTiming::Anchored {
+                        event_index: matched.event_index,
+                        access_address_sample,
+                    };
+                    best = Some((matched, observation));
+                    tied = false;
+                } else if best.as_ref().is_some_and(|(_, existing)| {
+                    timing_error.absolute_samples() == existing.timing_error.absolute_samples()
+                }) {
+                    tied = true;
+                }
+            }
+            if advanced_events != maximum_event_advance {
+                candidate.advance()?;
+            }
+        }
+
+        if tied {
+            return Err(Error::InvalidInput(
+                "connection observation matches multiple events equally".to_owned(),
+            ));
+        }
+        let Some((matched, observation)) = best else {
+            return Err(Error::InvalidInput(format!(
+                "connection observation on channel {} at sample {} did not match the next {} event(s)",
+                channel.index(),
+                access_address_sample,
+                u32::from(maximum_event_advance) + 1
+            )));
+        };
+        *self = matched;
+        Ok(observation)
     }
 
     pub fn schedule_channel_map(&mut self, update: ChannelMapInd) -> Result<()> {
@@ -793,6 +991,15 @@ impl ConnectionTracker {
             }
         }
     }
+}
+
+fn divide_round_up(numerator: u128, denominator: u128) -> Result<u64> {
+    let rounded = numerator
+        .checked_add(denominator - 1)
+        .ok_or_else(|| Error::InvalidState("integer ceiling arithmetic overflow".to_owned()))?
+        / denominator;
+    u64::try_from(rounded)
+        .map_err(|_| Error::InvalidState("integer ceiling result exceeds u64".to_owned()))
 }
 
 impl ConnectionChannelSelector {
@@ -1308,5 +1515,148 @@ mod tests {
                 })
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn sleep_clock_accuracy_matches_core_ranges() {
+        let ppm: Vec<u16> = (0..=7)
+            .map(|raw| SleepClockAccuracy::new(raw).unwrap().maximum_ppm())
+            .collect();
+        assert_eq!(ppm, [500, 250, 150, 100, 75, 50, 30, 20]);
+        assert!(SleepClockAccuracy::new(8).is_err());
+    }
+
+    #[test]
+    fn timing_windows_accumulate_combined_clock_uncertainty() {
+        let mut tracker =
+            ConnectionTracker::new(tracker_config(ChannelSelectionAlgorithm::Csa2), 0, 1_000)
+                .unwrap();
+        let sca = SleepClockAccuracy::new(0).unwrap();
+        assert_eq!(
+            tracker.current_timing_window(sca, 20).unwrap().unwrap(),
+            ConnectionTimingWindow {
+                expected_sample: 1_000,
+                earliest_sample: 1_000,
+                latest_sample: 1_000,
+                widening_samples: 0,
+            }
+        );
+        tracker.advance().unwrap();
+        assert_eq!(
+            tracker.current_timing_window(sca, 20).unwrap().unwrap(),
+            ConnectionTimingWindow {
+                expected_sample: 121_000,
+                earliest_sample: 120_937,
+                latest_sample: 121_063,
+                widening_samples: 63,
+            }
+        );
+        assert!(tracker.current_timing_window(sca, 1_000_001).is_err());
+    }
+
+    #[test]
+    fn timing_window_is_capped_before_adjacent_events_overlap() {
+        let mut config = tracker_config(ChannelSelectionAlgorithm::Csa2);
+        config.parameters = ConnectionParameters::new(6, 0, 100).unwrap();
+        let mut tracker = ConnectionTracker::new(config, 0, 20_000).unwrap();
+        tracker.advance().unwrap();
+        let window = tracker
+            .current_timing_window(SleepClockAccuracy::new(0).unwrap(), 1_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(window.widening_samples, 14_400);
+    }
+
+    #[test]
+    fn tracker_matches_missed_event_and_reanchors_to_observation() {
+        let mut config = tracker_config(ChannelSelectionAlgorithm::Csa2);
+        config.access_address = 0x8e89_bed6;
+        let mut tracker = ConnectionTracker::new(config, 0, 1_000).unwrap();
+        let observation = tracker
+            .synchronize_observation(
+                BleChannel::new(21).unwrap(),
+                361_050,
+                SleepClockAccuracy::new(0).unwrap(),
+                20,
+                5,
+            )
+            .unwrap();
+        assert_eq!(observation.event.event_counter, 3);
+        assert_eq!(observation.advanced_events, 3);
+        assert_eq!(observation.timing_error, SampleTimingError::Late(50));
+        assert_eq!(observation.timing_window.widening_samples, 188);
+        assert_eq!(tracker.event_counter(), 3);
+        assert_eq!(
+            tracker.current_event().unwrap().timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 361_050
+            }
+        );
+        assert_eq!(
+            tracker.advance().unwrap().timing,
+            ConnectionEventTiming::Expected {
+                access_address_sample: 481_050
+            }
+        );
+        assert_eq!(
+            tracker
+                .current_timing_window(SleepClockAccuracy::new(0).unwrap(), 20)
+                .unwrap()
+                .unwrap()
+                .widening_samples,
+            63
+        );
+    }
+
+    #[test]
+    fn tracker_rejects_observation_outside_channel_or_timing_window() {
+        let mut config = tracker_config(ChannelSelectionAlgorithm::Csa2);
+        config.access_address = 0x8e89_bed6;
+        let mut tracker = ConnectionTracker::new(config, 0, 1_000).unwrap();
+        assert!(
+            tracker
+                .synchronize_observation(
+                    BleChannel::new(20).unwrap(),
+                    361_050,
+                    SleepClockAccuracy::new(0).unwrap(),
+                    20,
+                    5,
+                )
+                .is_err()
+        );
+        assert!(
+            tracker
+                .synchronize_observation(
+                    BleChannel::new(21).unwrap(),
+                    362_000,
+                    SleepClockAccuracy::new(0).unwrap(),
+                    20,
+                    5,
+                )
+                .is_err()
+        );
+        assert_eq!(tracker.event_counter(), 0);
+    }
+
+    #[test]
+    fn observation_search_stops_at_unknown_connection_update_anchor() {
+        let mut config = tracker_config(ChannelSelectionAlgorithm::Csa2);
+        config.access_address = 0x8e89_bed6;
+        let mut tracker = ConnectionTracker::new(config, 0, 1_000).unwrap();
+        tracker
+            .schedule_connection_update(ConnectionUpdateInd::new(1, 0, 24, 0, 100, 2).unwrap())
+            .unwrap();
+        assert!(
+            tracker
+                .synchronize_observation(
+                    BleChannel::new(21).unwrap(),
+                    361_000,
+                    SleepClockAccuracy::new(0).unwrap(),
+                    20,
+                    5,
+                )
+                .is_err()
+        );
+        assert_eq!(tracker.event_counter(), 0);
     }
 }

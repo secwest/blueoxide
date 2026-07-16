@@ -551,10 +551,10 @@ the established connection schedule.
 ### Current limitation
 
 `decode-data` decodes a recording already centered on one known data channel.
-Blueoxide does not yet acquire the first packet's anchor point, follow clock
-drift, or retune a radio across connection events. Those steps require wideband
-channelization or a timed-retune backend contract built on the framing and
-selection primitives added here.
+This increment did not yet acquire the first packet's anchor point, follow
+clock drift, or retune a radio across connection events. Those steps require
+additional synchronization state plus wideband channelization or a timed-retune
+backend contract built on the framing and selection primitives added here.
 
 ## 2026-07-15: Anchor connection-event state before changing SDR contracts
 
@@ -599,3 +599,61 @@ logic plus an offline `connection-plan` command. Live following will require
 either simultaneous wideband channelization or an explicit timed-tuning
 contract; this increment does not pretend that repeated stop/configure/start
 operations provide connection-event timing.
+
+## 2026-07-16: Acquire and maintain anchors from bounded observations
+
+### Clock model
+
+Map CONNECT_IND SCA values 0 through 7 to the Core worst-case bounds of 500,
+250, 150, 100, 75, 50, 30, and 20 ppm. The passive receiver adds its own
+declared sample-clock error to the peer bound.
+
+For an elapsed interval and sample rate, calculate the one-sided uncertainty as:
+
+```text
+ceil(elapsed_us * combined_ppm * sample_rate_hz / 1e12)
+```
+
+The calculation uses checked integer arithmetic. Connection-event widening is
+capped at half the connection interval minus the 150 us inter-frame spacing,
+matching the controller constraint that uncertainty must not consume adjacent
+events. Every successful packet observation resets the elapsed-time origin, so
+uncertainty grows only across events that were actually missed.
+
+### First-event acquisition
+
+A decoded legacy CONNECT_IND has a fixed 344 LE 1M symbols from the first
+access-address bit through the end of its CRC. Starting from the demodulator's
+exact access-address sample, add that frame length and the request's WinOffset /
+WinSize to obtain event 0's nominal search window.
+
+Expand both sides conservatively using the combined clock error evaluated at
+the end of the transmit window. Accept the anchor only from a caller-identified,
+CRC-valid central transmission on CSA#1/CSA#2's event-0 channel inside those
+bounds. A peripheral response can also fall inside the broad window and is not
+an anchor. Blueoxide does not yet infer packet direction; the typed library
+input and `--central-observe` CLI option make that precondition explicit. The
+earliest decoded packet is typically the central transmission only when the
+capture is known not to have missed it. The window beginning remains a bound;
+the observed central access-address sample becomes the anchor.
+
+### Missed-event synchronization
+
+Search a caller-bounded number of future events using both selected channel and
+clock-widened sample range. Choose the matching event with the smallest absolute
+timing error, reject equal-distance ambiguity, and leave the original tracker
+unchanged when no match exists. On success, advance all pending protocol state
+to that event and re-anchor at the observed access-address sample.
+
+An ordinary observation search stops when it reaches a
+LL_CONNECTION_UPDATE_IND whose new anchor has not been observed. It does not
+search across unknown timing. The explicit connection-update anchor path
+remains responsible for resuming progression.
+
+### Offline and live boundaries
+
+`connection-acquire`, `connection-sync`, and the widened `connection-plan`
+exercise acquisition, missed-event recovery, and re-anchoring without hardware.
+The remaining live problem is delivering data-channel observations at the
+required frequencies. That still requires validated wideband channelization or
+a backend contract with measurable timed retuning.

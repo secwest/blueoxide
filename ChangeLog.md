@@ -51,10 +51,19 @@
   sample arithmetic, and explicit anchor reacquisition after timing changes.
 - CONNECT_IND construction of connection trackers and direct scheduling of
   supported decoded LL control PDUs.
+- Core sleep-clock-accuracy ranges, combined peer/receiver clock-widened sample
+  windows, and caps that prevent search windows from consuming adjacent
+  connection events.
+- CONNECT_IND event-0 acquisition from exact packet sample positions,
+  WinOffset/WinSize, selected channel, and a caller-identified CRC-valid central
+  transmission; packet direction is not inferred.
+- Missed-event observation matching by channel and sample window with bounded
+  search, timing-error reporting, and successful-observation re-anchoring.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
 - `blueoxide channels`, `blueoxide decode`, configurable
-  `blueoxide decode-data`, and offline `blueoxide connection-plan` commands.
+  `blueoxide decode-data`, and offline `blueoxide connection-plan`,
+  `blueoxide connection-acquire`, and `blueoxide connection-sync` commands.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
 - An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.
@@ -114,7 +123,7 @@
   environment.
 - bladeRF live capture currently supports the RX0/X1 stream layout only.
 - The demodulator requires an integer multiple of 1 MHz sample rate.
-- Hardware-correlated wall-clock time, calibrated RSSI/SNR, connection
-  anchor acquisition and live retuning, extended advertising, decryption and
-  higher protocol reassembly, Bluetooth Classic, LE 2M, and LE Coded PHY remain
-  to be implemented.
+- Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
+  capture-driven connection following and retuning, extended advertising,
+  decryption and higher protocol reassembly, Bluetooth Classic, LE 2M, and LE
+  Coded PHY remain to be implemented.

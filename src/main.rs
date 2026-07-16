@@ -1,4 +1,4 @@
-use blueoxide::advertising::decode_advertising_pdu;
+use blueoxide::advertising::{ConnectRequest, FirstCentralTransmission, decode_advertising_pdu};
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
 use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
 use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
@@ -14,6 +14,7 @@ use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
     ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
     ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu, LogicalLinkId,
+    SampleTimingError, SleepClockAccuracy,
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
@@ -83,6 +84,20 @@ struct ConnectionPlanArgs {
     anchor_event_counter: u16,
     anchor_access_address_sample: u64,
     event_count: usize,
+    peer_clock_accuracy: SleepClockAccuracy,
+    receiver_clock_accuracy_ppm: u32,
+    maximum_event_advance: u16,
+    first_central_transmission: Option<ConnectionObservationArg>,
+    observations: Vec<ConnectionObservationArg>,
+    window_size: u8,
+    window_offset: u16,
+    connect_ind_access_address_sample: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConnectionObservationArg {
+    channel: BleChannel,
+    access_address_sample: u64,
 }
 
 fn usage() -> &'static str {
@@ -96,6 +111,12 @@ USAGE:
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide connection-plan --access-address 0xNNNNNNNN \
     --channel-map HEX --csa 1|2 --interval N --sample-rate HZ [OPTIONS]
+  blueoxide connection-sync --access-address 0xNNNNNNNN \
+    --channel-map HEX --csa 1|2 --interval N --sample-rate HZ \
+    --observe CHANNEL:SAMPLE [OPTIONS]
+  blueoxide connection-acquire --access-address 0xNNNNNNNN \
+    --channel-map HEX --csa 1|2 --hop N --interval N --sample-rate HZ \
+    --connect-sample N --central-observe CHANNEL:SAMPLE [OPTIONS]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
 
 DECODE OPTIONS:
@@ -122,6 +143,16 @@ CONNECTION-PLAN OPTIONS:
   --anchor-event N        Observed 16-bit event counter (default: 0)
   --anchor-sample N       Observed access-address sample index (default: 0)
   --events N              Number of events to print (default: 10)
+  --peer-sca N            CONNECT_IND sleep-clock accuracy, 0..=7 (default: 0)
+  --receiver-ppm N        Receiver sample-clock error bound (default: 20)
+  --max-event-advance N   Events searched per observation (default: 32)
+  --central-observe CHANNEL:SAMPLE
+                          CRC-valid central transmission for event-0 acquisition
+  --observe CHANNEL:SAMPLE
+                          Later CRC-valid observation; repeat as needed
+  --window-size N         CONNECT_IND WinSize in 1.25 ms units (default: 1)
+  --window-offset N       CONNECT_IND WinOffset in 1.25 ms units (default: 0)
+  --connect-sample N      CONNECT_IND access-address sample for acquisition
 
 CAPTURE OPTIONS:
   --identifier STRING     Native backend device identifier
@@ -179,6 +210,25 @@ fn parse_channel_map(value: &str) -> Result<DataChannelMap> {
     DataChannelMap::new(bytes)
 }
 
+fn parse_connection_observation(value: &str, option: &str) -> Result<ConnectionObservationArg> {
+    let (channel, sample) = value.split_once(':').ok_or_else(|| {
+        Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected CHANNEL:SAMPLE"
+        ))
+    })?;
+    let channel = BleChannel::new(parse_number(channel, &format!("{option} channel"))?)?;
+    if channel.index() > 36 {
+        return Err(Error::InvalidConfiguration(format!(
+            "{option} requires a data channel in 0..=36; got {}",
+            channel.index()
+        )));
+    }
+    Ok(ConnectionObservationArg {
+        channel,
+        access_address_sample: parse_number(sample, &format!("{option} sample"))?,
+    })
+}
+
 fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
     let mut access_address = None;
     let mut channel_map = None;
@@ -191,6 +241,14 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
     let mut anchor_event_counter = 0u16;
     let mut anchor_access_address_sample = 0u64;
     let mut event_count = 10usize;
+    let mut peer_clock_accuracy = SleepClockAccuracy::new(0)?;
+    let mut receiver_clock_accuracy_ppm = 20u32;
+    let mut maximum_event_advance = 32u16;
+    let mut first_central_transmission = None;
+    let mut observations = Vec::new();
+    let mut window_size = 1u8;
+    let mut window_offset = 0u16;
+    let mut connect_ind_access_address_sample = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -250,6 +308,45 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
                 let value = value_after(args, &mut index, "--events")?;
                 event_count = parse_number(&value, "--events")?;
             }
+            "--peer-sca" => {
+                let value = value_after(args, &mut index, "--peer-sca")?;
+                peer_clock_accuracy = SleepClockAccuracy::new(parse_number(&value, "--peer-sca")?)?;
+            }
+            "--receiver-ppm" => {
+                let value = value_after(args, &mut index, "--receiver-ppm")?;
+                receiver_clock_accuracy_ppm = parse_number(&value, "--receiver-ppm")?;
+            }
+            "--max-event-advance" => {
+                let value = value_after(args, &mut index, "--max-event-advance")?;
+                maximum_event_advance = parse_number(&value, "--max-event-advance")?;
+            }
+            "--central-observe" => {
+                let observation = parse_connection_observation(
+                    &value_after(args, &mut index, "--central-observe")?,
+                    "--central-observe",
+                )?;
+                if first_central_transmission.replace(observation).is_some() {
+                    return Err(Error::InvalidConfiguration(
+                        "--central-observe may only be supplied once".to_owned(),
+                    ));
+                }
+            }
+            "--observe" => observations.push(parse_connection_observation(
+                &value_after(args, &mut index, "--observe")?,
+                "--observe",
+            )?),
+            "--window-size" => {
+                let value = value_after(args, &mut index, "--window-size")?;
+                window_size = parse_number(&value, "--window-size")?;
+            }
+            "--window-offset" => {
+                let value = value_after(args, &mut index, "--window-offset")?;
+                window_offset = parse_number(&value, "--window-offset")?;
+            }
+            "--connect-sample" => {
+                let value = value_after(args, &mut index, "--connect-sample")?;
+                connect_ind_access_address_sample = Some(parse_number(&value, "--connect-sample")?);
+            }
             "-h" | "--help" => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -292,6 +389,14 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
         anchor_event_counter,
         anchor_access_address_sample,
         event_count,
+        peer_clock_accuracy,
+        receiver_clock_accuracy_ppm,
+        maximum_event_advance,
+        first_central_transmission,
+        observations,
+        window_size,
+        window_offset,
+        connect_ind_access_address_sample,
     })
 }
 
@@ -1010,19 +1115,28 @@ fn backends() {
     }
 }
 
-fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
-    let mut tracker = ConnectionTracker::new(
+fn connection_tracker(args: &ConnectionPlanArgs) -> Result<ConnectionTracker> {
+    ConnectionTracker::new(
         ConnectionTrackerConfig {
             access_address: args.access_address,
             channel_selection_algorithm: args.channel_selection_algorithm,
             hop_increment: args.hop_increment,
-            channel_map: args.channel_map,
+            channel_map: args.channel_map.clone(),
             parameters: args.parameters,
             sample_rate_hz: args.sample_rate_hz,
         },
         args.anchor_event_counter,
         args.anchor_access_address_sample,
-    )?;
+    )
+}
+
+fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
+    if args.first_central_transmission.is_some() || !args.observations.is_empty() {
+        return Err(Error::InvalidConfiguration(
+            "observation options are not accepted by connection-plan".to_owned(),
+        ));
+    }
+    let mut tracker = connection_tracker(&args)?;
 
     for index in 0..args.event_count {
         let event = if index == 0 {
@@ -1038,13 +1152,135 @@ fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
                 "offline connection plan unexpectedly requires an anchor observation".to_owned(),
             ));
         };
+        let timing_window = tracker
+            .current_timing_window(args.peer_clock_accuracy, args.receiver_clock_accuracy_ppm)?
+            .ok_or_else(|| {
+                Error::InvalidState(
+                    "offline connection plan unexpectedly lost its timing anchor".to_owned(),
+                )
+            })?;
         println!(
-            "event={} channel={} frequency_hz={} expected_sample={}",
+            "event={} channel={} frequency_hz={} expected_sample={} earliest_sample={} latest_sample={} widening_samples={}",
             event.event_counter,
             event.channel.index(),
             event.channel.center_frequency_hz(),
-            access_address_sample
+            access_address_sample,
+            timing_window.earliest_sample,
+            timing_window.latest_sample,
+            timing_window.widening_samples
         );
+    }
+    Ok(())
+}
+
+fn connection_sync(args: ConnectionPlanArgs) -> Result<()> {
+    if args.first_central_transmission.is_some() {
+        return Err(Error::InvalidConfiguration(
+            "--central-observe is accepted by connection-acquire, not connection-sync".to_owned(),
+        ));
+    }
+    if args.observations.is_empty() {
+        return Err(Error::InvalidConfiguration(
+            "connection-sync requires at least one --observe CHANNEL:SAMPLE".to_owned(),
+        ));
+    }
+    let mut tracker = connection_tracker(&args)?;
+    for observed in args.observations {
+        let observation = tracker.synchronize_observation(
+            observed.channel,
+            observed.access_address_sample,
+            args.peer_clock_accuracy,
+            args.receiver_clock_accuracy_ppm,
+            args.maximum_event_advance,
+        )?;
+        print_synchronized_observation(observed, observation);
+    }
+    Ok(())
+}
+
+fn print_synchronized_observation(
+    observed: ConnectionObservationArg,
+    observation: blueoxide::link_layer::ConnectionObservation,
+) {
+    let missed_events = observation.advanced_events.saturating_sub(1);
+    let timing = match observation.timing_error {
+        SampleTimingError::Early(samples) => format!("early:{samples}"),
+        SampleTimingError::OnTime => "on-time:0".to_owned(),
+        SampleTimingError::Late(samples) => format!("late:{samples}"),
+    };
+    println!(
+        "event={} channel={} observed_sample={} advanced_events={} missed_events={} expected_sample={} timing={} earliest_sample={} latest_sample={} widening_samples={}",
+        observation.event.event_counter,
+        observation.event.channel.index(),
+        observed.access_address_sample,
+        observation.advanced_events,
+        missed_events,
+        observation.timing_window.expected_sample,
+        timing,
+        observation.timing_window.earliest_sample,
+        observation.timing_window.latest_sample,
+        observation.timing_window.widening_samples
+    );
+}
+
+fn connection_acquire(args: ConnectionPlanArgs) -> Result<()> {
+    let connect_ind_access_address_sample =
+        args.connect_ind_access_address_sample.ok_or_else(|| {
+            Error::InvalidConfiguration("connection-acquire requires --connect-sample".to_owned())
+        })?;
+    let first_central_transmission = args.first_central_transmission.ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "connection-acquire requires --central-observe CHANNEL:SAMPLE".to_owned(),
+        )
+    })?;
+    let request = ConnectRequest {
+        access_address: args.access_address,
+        crc_init: 0,
+        window_size: args.window_size,
+        window_offset: args.window_offset,
+        interval: args.parameters.interval,
+        latency: args.parameters.latency,
+        supervision_timeout: args.parameters.supervision_timeout,
+        channel_map: args.channel_map.bytes(),
+        hop_increment: args.hop_increment,
+        sleep_clock_accuracy: args.peer_clock_accuracy.raw(),
+        channel_selection_algorithm: args.channel_selection_algorithm,
+    };
+    let first_window = request.first_event_window(
+        connect_ind_access_address_sample,
+        args.sample_rate_hz,
+        args.receiver_clock_accuracy_ppm,
+    )?;
+    let observed_central = FirstCentralTransmission::new(
+        first_central_transmission.channel,
+        first_central_transmission.access_address_sample,
+    )?;
+    let mut tracker = request.acquire_first_event_anchor(
+        connect_ind_access_address_sample,
+        args.sample_rate_hz,
+        args.receiver_clock_accuracy_ppm,
+        observed_central,
+    )?;
+    println!(
+        "event=0 channel={} central_sample={} connect_ind_sample={} nominal_start_sample={} nominal_end_sample={} earliest_sample={} latest_sample={} widening_samples={}",
+        first_window.channel.index(),
+        first_central_transmission.access_address_sample,
+        connect_ind_access_address_sample,
+        first_window.nominal_start_sample,
+        first_window.nominal_end_sample,
+        first_window.earliest_sample,
+        first_window.latest_sample,
+        first_window.widening_samples
+    );
+    for observed in args.observations {
+        let observation = tracker.synchronize_observation(
+            observed.channel,
+            observed.access_address_sample,
+            args.peer_clock_accuracy,
+            args.receiver_clock_accuracy_ppm,
+            args.maximum_event_advance,
+        )?;
+        print_synchronized_observation(observed, observation);
     }
     Ok(())
 }
@@ -1055,6 +1291,8 @@ fn run() -> Result<()> {
         Some("decode") => decode(parse_decode_args(&args[1..])?),
         Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
+        Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
+        Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),
         Some("capture") => capture(parse_capture_args(&args[1..])?),
         Some("backends") => {
             backends();

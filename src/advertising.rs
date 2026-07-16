@@ -1,7 +1,8 @@
-use crate::ble::AdvertisingPdu;
+use crate::ble::{AdvertisingPdu, BleChannel};
+use crate::demod::Le1mDemodConfig;
 use crate::link_layer::{
     ChannelSelectionAlgorithm, ConnectionChannelSelector, ConnectionParameters, ConnectionTracker,
-    ConnectionTrackerConfig, DataChannelMap,
+    ConnectionTrackerConfig, DataChannelMap, SleepClockAccuracy,
 };
 use crate::{Error, Result};
 use std::fmt::{Display, Formatter};
@@ -123,6 +124,50 @@ pub struct ConnectRequest {
     pub channel_selection_algorithm: ChannelSelectionAlgorithm,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirstConnectionEventWindow {
+    pub channel: BleChannel,
+    pub nominal_start_sample: u64,
+    pub nominal_end_sample: u64,
+    pub earliest_sample: u64,
+    pub latest_sample: u64,
+    pub widening_samples: u64,
+}
+
+/// A caller-identified central transmission at the start of connection event 0.
+///
+/// Blueoxide does not infer packet direction from an isolated data-channel PDU.
+/// Callers must only construct this value for a CRC-valid transmission known to
+/// have come from the central, not for a peripheral response in the same event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirstCentralTransmission {
+    channel: BleChannel,
+    access_address_sample: u64,
+}
+
+impl FirstCentralTransmission {
+    pub fn new(channel: BleChannel, access_address_sample: u64) -> Result<Self> {
+        if channel.index() > 36 {
+            return Err(Error::InvalidInput(format!(
+                "first central transmission requires a data channel in 0..=36; got {}",
+                channel.index()
+            )));
+        }
+        Ok(Self {
+            channel,
+            access_address_sample,
+        })
+    }
+
+    pub const fn channel(self) -> BleChannel {
+        self.channel
+    }
+
+    pub const fn access_address_sample(self) -> u64 {
+        self.access_address_sample
+    }
+}
+
 impl ConnectRequest {
     pub fn interval_us(&self) -> u32 {
         self.interval as u32 * 1_250
@@ -165,6 +210,137 @@ impl ConnectRequest {
 
     pub fn connection_parameters(&self) -> Result<ConnectionParameters> {
         ConnectionParameters::new(self.interval, self.latency, self.supervision_timeout)
+    }
+
+    pub fn peer_clock_accuracy(&self) -> Result<SleepClockAccuracy> {
+        SleepClockAccuracy::new(self.sleep_clock_accuracy)
+    }
+
+    pub fn first_event_window(
+        &self,
+        connect_ind_access_address_sample: u64,
+        sample_rate_hz: u32,
+        receiver_clock_accuracy_ppm: u32,
+    ) -> Result<FirstConnectionEventWindow> {
+        self.connection_parameters()?;
+        if !(1..=16).contains(&self.window_size) {
+            return Err(Error::InvalidInput(format!(
+                "CONNECT_IND window size {} is outside 1..=16",
+                self.window_size
+            )));
+        }
+        if self.window_offset > self.interval {
+            return Err(Error::InvalidInput(format!(
+                "CONNECT_IND window offset {} exceeds interval {}",
+                self.window_offset, self.interval
+            )));
+        }
+        let samples_per_symbol = Le1mDemodConfig {
+            sample_rate_hz,
+            max_access_address_errors: 0,
+        }
+        .validate()?;
+        if receiver_clock_accuracy_ppm > 1_000_000 {
+            return Err(Error::InvalidConfiguration(format!(
+                "receiver clock accuracy {receiver_clock_accuracy_ppm} ppm exceeds 1000000"
+            )));
+        }
+
+        const CONNECT_IND_BITS_FROM_ACCESS_ADDRESS: u64 = (4 + 2 + 34 + 3) * 8;
+        let connect_ind_end_sample = connect_ind_access_address_sample
+            .checked_add(
+                CONNECT_IND_BITS_FROM_ACCESS_ADDRESS
+                    .checked_mul(samples_per_symbol as u64)
+                    .ok_or_else(|| {
+                        Error::InvalidInput("CONNECT_IND sample-length overflow".to_owned())
+                    })?,
+            )
+            .ok_or_else(|| Error::InvalidInput("CONNECT_IND end sample overflow".to_owned()))?;
+        let nominal_start_sample = connect_ind_end_sample
+            .checked_add(
+                u64::from(self.transmit_window_start_us())
+                    .checked_mul(u64::from(sample_rate_hz))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "first transmit-window start arithmetic overflow".to_owned(),
+                        )
+                    })?
+                    / 1_000_000,
+            )
+            .ok_or_else(|| {
+                Error::InvalidInput("first transmit-window start exceeds u64".to_owned())
+            })?;
+        let nominal_end_sample = connect_ind_end_sample
+            .checked_add(
+                u64::from(self.transmit_window_end_us())
+                    .checked_mul(u64::from(sample_rate_hz))
+                    .ok_or_else(|| {
+                        Error::InvalidInput(
+                            "first transmit-window end arithmetic overflow".to_owned(),
+                        )
+                    })?
+                    / 1_000_000,
+            )
+            .ok_or_else(|| {
+                Error::InvalidInput("first transmit-window end exceeds u64".to_owned())
+            })?;
+        let combined_ppm = u128::from(
+            receiver_clock_accuracy_ppm + u32::from(self.peer_clock_accuracy()?.maximum_ppm()),
+        );
+        let widening_numerator = u128::from(self.transmit_window_end_us())
+            .checked_mul(combined_ppm)
+            .and_then(|value| value.checked_mul(u128::from(sample_rate_hz)))
+            .ok_or_else(|| {
+                Error::InvalidInput("first transmit-window widening overflow".to_owned())
+            })?;
+        let widening_samples = u64::try_from(widening_numerator.div_ceil(1_000_000_000_000))
+            .map_err(|_| {
+                Error::InvalidInput("first transmit-window widening exceeds u64".to_owned())
+            })?;
+        Ok(FirstConnectionEventWindow {
+            channel: self.channel_selector()?.channel_for_event(0),
+            nominal_start_sample,
+            nominal_end_sample,
+            earliest_sample: nominal_start_sample.saturating_sub(widening_samples),
+            latest_sample: nominal_end_sample
+                .checked_add(widening_samples)
+                .ok_or_else(|| {
+                    Error::InvalidInput("first transmit-window bound exceeds u64".to_owned())
+                })?,
+            widening_samples,
+        })
+    }
+
+    pub fn acquire_first_event_anchor(
+        &self,
+        connect_ind_access_address_sample: u64,
+        sample_rate_hz: u32,
+        receiver_clock_accuracy_ppm: u32,
+        observed_central: FirstCentralTransmission,
+    ) -> Result<ConnectionTracker> {
+        let window = self.first_event_window(
+            connect_ind_access_address_sample,
+            sample_rate_hz,
+            receiver_clock_accuracy_ppm,
+        )?;
+        if observed_central.channel() != window.channel {
+            return Err(Error::InvalidInput(format!(
+                "first connection event was expected on channel {}, observed channel {}",
+                window.channel.index(),
+                observed_central.channel().index()
+            )));
+        }
+        if !(window.earliest_sample..=window.latest_sample)
+            .contains(&observed_central.access_address_sample())
+        {
+            return Err(Error::InvalidInput(format!(
+                "first central connection-event sample {} is outside {}..={}",
+                observed_central.access_address_sample(),
+                window.earliest_sample,
+                window.latest_sample
+            )));
+        }
+        self.connection_tracker(sample_rate_hz, 0, observed_central.access_address_sample())
     }
 
     pub fn connection_tracker(
@@ -577,6 +753,19 @@ mod tests {
         assert_eq!(request.transmit_window_size_us(), 2_500);
         assert_eq!(request.transmit_window_end_us(), 7_500);
         assert_eq!(request.event_offset_from_anchor_us(2), 60_000);
+        assert_eq!(request.peer_clock_accuracy().unwrap().raw(), 0);
+        assert_eq!(request.peer_clock_accuracy().unwrap().maximum_ppm(), 500);
+        assert_eq!(
+            request.first_event_window(1_000, 4_000_000, 20).unwrap(),
+            FirstConnectionEventWindow {
+                channel: crate::ble::BleChannel::new(10).unwrap(),
+                nominal_start_sample: 22_376,
+                nominal_end_sample: 32_376,
+                earliest_sample: 22_360,
+                latest_sample: 32_392,
+                widening_samples: 16,
+            }
+        );
         assert_eq!(
             request
                 .channel_selector()
@@ -588,6 +777,75 @@ mod tests {
         let mut tracker = request.connection_tracker(4_000_000, 0, 400).unwrap();
         assert_eq!(tracker.current_event().unwrap().channel.index(), 10);
         assert_eq!(tracker.advance().unwrap().channel.index(), 20);
+        let tracker = request
+            .acquire_first_event_anchor(
+                1_000,
+                4_000_000,
+                20,
+                FirstCentralTransmission::new(crate::ble::BleChannel::new(10).unwrap(), 30_000)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(tracker.event_counter(), 0);
+        assert_eq!(
+            tracker.current_event().unwrap().timing,
+            crate::link_layer::ConnectionEventTiming::Expected {
+                access_address_sample: 30_000
+            }
+        );
+        assert!(
+            request
+                .acquire_first_event_anchor(
+                    1_000,
+                    4_000_000,
+                    20,
+                    FirstCentralTransmission::new(
+                        crate::ble::BleChannel::new(11).unwrap(),
+                        30_000,
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+        );
+        assert!(
+            request
+                .acquire_first_event_anchor(
+                    1_000,
+                    4_000_000,
+                    20,
+                    FirstCentralTransmission::new(
+                        crate::ble::BleChannel::new(10).unwrap(),
+                        40_000,
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+        );
+        assert!(
+            FirstCentralTransmission::new(crate::ble::BleChannel::new(37).unwrap(), 30_000)
+                .is_err()
+        );
+        assert!(request.first_event_window(1_000, 3_999_999, 20).is_err());
+        assert!(
+            request
+                .first_event_window(1_000, 4_000_000, 1_000_001)
+                .is_err()
+        );
+
+        let mut invalid_window = request;
+        invalid_window.window_size = 0;
+        assert!(
+            invalid_window
+                .first_event_window(1_000, 4_000_000, 20)
+                .is_err()
+        );
+        invalid_window.window_size = 1;
+        invalid_window.sleep_clock_accuracy = 8;
+        assert!(
+            invalid_window
+                .first_event_window(1_000, 4_000_000, 20)
+                .is_err()
+        );
     }
 
     #[test]
