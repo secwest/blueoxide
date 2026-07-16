@@ -13,8 +13,9 @@ use blueoxide::demod::{
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
     ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
-    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu, LogicalLinkId,
-    SampleTimingError, SleepClockAccuracy,
+    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu, IncompleteL2capPdu,
+    L2capReassembler, L2capReassemblyOutcome, LinkDirection, LogicalLinkId, SampleTimingError,
+    SleepClockAccuracy,
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
@@ -54,6 +55,8 @@ struct DecodeDataArgs {
     max_access_address_errors: u8,
     output_pcap: Option<PathBuf>,
     capture_start_ns: u64,
+    plaintext_l2cap_direction: Option<LinkDirection>,
+    maximum_l2cap_payload_length: usize,
 }
 
 #[derive(Debug)]
@@ -131,6 +134,9 @@ DECODE OPTIONS:
 DECODE-DATA OPTIONS:
   Uses the DECODE OPTIONS above and requires a connection access address and
   24-bit CRC initialization value.
+  --plaintext-l2cap-direction central-to-peripheral|peripheral-to-central
+                          Reassemble an asserted single-direction plaintext stream
+  --max-l2cap-payload N   Maximum reassembled payload length (default: 65535)
 
 CONNECTION-PLAN OPTIONS:
   --channel-map HEX       Five map octets in over-the-air order
@@ -491,6 +497,9 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     let mut max_access_address_errors = 1u8;
     let mut output_pcap = None;
     let mut capture_start_ns = 0u64;
+    let mut plaintext_l2cap_direction = None;
+    let mut maximum_l2cap_payload_length = usize::from(u16::MAX);
+    let mut maximum_l2cap_payload_length_supplied = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -536,6 +545,27 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
                 let value = value_after(args, &mut index, "--capture-start-ns")?;
                 capture_start_ns = parse_number(&value, "--capture-start-ns")?;
             }
+            "--plaintext-l2cap-direction" => {
+                let value = value_after(args, &mut index, "--plaintext-l2cap-direction")?;
+                plaintext_l2cap_direction = Some(match value.as_str() {
+                    "central-to-peripheral" | "central" | "c2p" => {
+                        LinkDirection::CentralToPeripheral
+                    }
+                    "peripheral-to-central" | "peripheral" | "p2c" => {
+                        LinkDirection::PeripheralToCentral
+                    }
+                    _ => {
+                        return Err(Error::InvalidConfiguration(format!(
+                            "invalid value {value:?} for --plaintext-l2cap-direction; expected central-to-peripheral or peripheral-to-central"
+                        )));
+                    }
+                });
+            }
+            "--max-l2cap-payload" => {
+                let value = value_after(args, &mut index, "--max-l2cap-payload")?;
+                maximum_l2cap_payload_length = parse_number(&value, "--max-l2cap-payload")?;
+                maximum_l2cap_payload_length_supplied = true;
+            }
             "-h" | "--help" => {
                 print!("{}", usage());
                 std::process::exit(0);
@@ -564,6 +594,14 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     let crc_init = crc_init
         .ok_or_else(|| Error::InvalidConfiguration("decode-data requires --crc-init".to_owned()))?;
     LeFrameConfig::data(access_address, crc_init)?;
+    if maximum_l2cap_payload_length_supplied && plaintext_l2cap_direction.is_none() {
+        return Err(Error::InvalidConfiguration(
+            "--max-l2cap-payload requires --plaintext-l2cap-direction".to_owned(),
+        ));
+    }
+    if plaintext_l2cap_direction.is_some() {
+        L2capReassembler::new(maximum_l2cap_payload_length)?;
+    }
 
     Ok(DecodeDataArgs {
         input: input.ok_or_else(|| {
@@ -581,6 +619,8 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
         max_access_address_errors,
         output_pcap,
         capture_start_ns,
+        plaintext_l2cap_direction,
+        maximum_l2cap_payload_length,
     })
 }
 
@@ -809,8 +849,7 @@ fn describe_data_pdu(packet: &DataChannelPdu) -> String {
     }
 }
 
-fn print_data_packet(packet: &ReceivedLePdu) {
-    let data = DataChannelPdu::from(packet.pdu.clone());
+fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) {
     let cte = data
         .constant_tone_extension_info()
         .map(|info| {
@@ -844,8 +883,19 @@ fn print_data_packet(packet: &ReceivedLePdu) {
         print_hex(&data.header),
         print_hex(&data.payload),
         print_hex(&data.crc),
-        describe_data_pdu(&data).replace('"', "'"),
+        describe_data_pdu(data).replace('"', "'"),
     );
+}
+
+fn describe_incomplete_l2cap(incomplete: IncompleteL2capPdu) -> String {
+    format!(
+        "direction={} cid=0x{:04x} received={} expected={} fragments={}",
+        incomplete.direction,
+        incomplete.channel_id,
+        incomplete.received_payload_length,
+        incomplete.expected_payload_length,
+        incomplete.fragment_count
+    )
 }
 
 fn decode(args: DecodeArgs) -> Result<()> {
@@ -927,11 +977,23 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     };
     let frame_config = LeFrameConfig::data(args.access_address, args.crc_init)?;
     let mut decoder = Le1mPacketStreamDecoder::new(args.channel, frame_config, demod_config)?;
+    let mut l2cap_reassembler = match args.plaintext_l2cap_direction {
+        Some(direction) => Some((
+            direction,
+            L2capReassembler::new(args.maximum_l2cap_payload_length)?,
+        )),
+        None => None,
+    };
     let mut pcap = match &args.output_pcap {
         Some(path) => Some(PcapNgWriter::new(BufWriter::new(File::create(path)?))?),
         None => None,
     };
     let mut packet_count = 0usize;
+    let mut l2cap_pdu_count = 0usize;
+    let mut l2cap_duplicate_count = 0usize;
+    let mut l2cap_orphan_count = 0usize;
+    let mut l2cap_discarded_count = 0usize;
+    let mut l2cap_error_count = 0usize;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -945,9 +1007,64 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
                 "sample discontinuity: expected {}, observed {}",
                 discontinuity.expected_first_sample, discontinuity.observed_first_sample
             );
+            if let Some((direction, reassembler)) = &mut l2cap_reassembler
+                && let Some(incomplete) = reassembler.reset(*direction)
+            {
+                l2cap_discarded_count += 1;
+                eprintln!(
+                    "discarded incomplete plaintext L2CAP PDU after sample discontinuity: {}",
+                    describe_incomplete_l2cap(incomplete)
+                );
+            }
         }
         for packet in &batch.packets {
-            print_data_packet(packet);
+            let data = DataChannelPdu::from(packet.pdu.clone());
+            print_data_packet(packet, &data);
+            if let Some((direction, reassembler)) = &mut l2cap_reassembler {
+                match reassembler.push(*direction, &data) {
+                    Ok(update) => {
+                        if let Some(replaced) = update.replaced {
+                            l2cap_discarded_count += 1;
+                            eprintln!(
+                                "replaced incomplete plaintext L2CAP PDU: {}",
+                                describe_incomplete_l2cap(replaced)
+                            );
+                        }
+                        match update.outcome {
+                            L2capReassemblyOutcome::Ignored
+                            | L2capReassemblyOutcome::InProgress(_) => {}
+                            L2capReassemblyOutcome::Duplicate => {
+                                l2cap_duplicate_count += 1;
+                            }
+                            L2capReassemblyOutcome::OrphanedContinuation { fragment_octets } => {
+                                l2cap_orphan_count += 1;
+                                eprintln!(
+                                    "orphaned plaintext L2CAP continuation: direction={} fragment_octets={fragment_octets}",
+                                    direction
+                                );
+                            }
+                            L2capReassemblyOutcome::Complete(sdu) => {
+                                l2cap_pdu_count += 1;
+                                println!(
+                                    "l2cap_pdu direction={} cid=0x{:04x} length={} fragments={} payload={}",
+                                    sdu.direction,
+                                    sdu.channel_id,
+                                    sdu.payload.len(),
+                                    sdu.fragment_count,
+                                    print_hex(&sdu.payload)
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        l2cap_error_count += 1;
+                        eprintln!(
+                            "plaintext L2CAP reassembly error: direction={} error={error}",
+                            direction
+                        );
+                    }
+                }
+            }
             if let Some(writer) = &mut pcap {
                 let timestamp = sample_timestamp_ns(
                     args.capture_start_ns,
@@ -960,12 +1077,27 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
         packet_count += batch.packets.len();
     }
 
+    if let Some((direction, reassembler)) = &mut l2cap_reassembler
+        && let Some(incomplete) = reassembler.reset(*direction)
+    {
+        l2cap_discarded_count += 1;
+        eprintln!(
+            "discarded incomplete plaintext L2CAP PDU at end of input: {}",
+            describe_incomplete_l2cap(incomplete)
+        );
+    }
+
     if let Some(writer) = pcap {
         writer.into_inner().flush()?;
     }
     eprintln!(
         "decoded {packet_count} CRC-valid data-channel packet(s) from {sample_count} sample(s)"
     );
+    if l2cap_reassembler.is_some() {
+        eprintln!(
+            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count}"
+        );
+    }
     Ok(())
 }
 

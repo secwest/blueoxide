@@ -657,3 +657,46 @@ exercise acquisition, missed-event recovery, and re-anchoring without hardware.
 The remaining live problem is delivering data-channel observations at the
 required frequencies. That still requires validated wideband channelization or
 a backend contract with measurable timed retuning.
+
+## 2026-07-16: Reassemble L2CAP PDUs only across explicit plaintext directions
+
+### Layer boundary
+
+LLID `0b10` starts a complete or fragmented L2CAP PDU and carries its
+little-endian Length and CID header. Nonempty LLID `0b01` PDUs continue that
+same L2CAP PDU; a zero-length LLID `0b01` is an empty link-layer PDU and adds no
+fragment bytes.
+
+The result is named `L2capPdu`, not `L2capSdu`. Link-layer reassembly restores
+the L2CAP header's declared payload. Some L2CAP channel modes can apply their
+own segmentation above that boundary, so calling every reconstructed payload
+an SDU would overstate what has been decoded.
+
+### Direction and encryption contract
+
+Central-to-peripheral and peripheral-to-central traffic has independent
+fragmentation and sequence state. `L2capReassembler` therefore requires an
+explicit `LinkDirection` on every packet and stores independent state for both
+directions. It does not infer direction from timing or packet contents.
+
+The reassembler also cannot determine whether Length-counted bytes are
+plaintext, ciphertext, or include a MIC. Its API requires plaintext or
+already-decrypted packets. The `decode-data` integration is opt-in through
+`--plaintext-l2cap-direction`, making the caller assertion visible instead of
+silently interpreting every CRC-valid payload.
+
+### Loss and recovery policy
+
+The state machine enforces a configurable maximum no larger than the 16-bit
+L2CAP payload length, rejects start/continuation overflow, and reports
+orphaned continuations. A new valid start replaces and reports an incomplete
+PDU, allowing recovery at the next framing boundary. Exact consecutive
+retransmissions are suppressed using LLID, SN, CTEInfo, and payload while
+ignoring acknowledgement/header fields that can change on retransmission.
+
+Visible sample discontinuities reset reassembly and report the discarded
+partial PDU. Invisible packet loss cannot be repaired from a one-bit sequence
+number. In particular, a recording centered on one data channel is normally
+incomplete for a hopping connection. CLI reassembly is authoritative only when
+the caller knows the input contains every ordered packet in the asserted
+direction.

@@ -24,6 +24,9 @@ The repository now contains a dependency-free, buildable receive core with:
   PDUs, including AD structures and validated CONNECT_IND timing/channel data.
 - Data-channel header, CTEInfo, L2CAP-start, and LL control-PDU decoding while
   retaining unrecognized payload and MIC bytes losslessly.
+- Bounded, direction-explicit plaintext L2CAP PDU reassembly with independent
+  central/peripheral state, exact retransmission suppression, malformed-length
+  rejection, and discontinuity reset.
 - Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
   including CONNECT_IND ChSel selection and event-counter channel calculation.
 - Anchored connection-event tracking with wrap-safe instant handling, strict
@@ -122,6 +125,36 @@ payload. The payload field remains lossless and can include an encrypted MIC
 because decryption state is not yet tracked. Printed L2CAP and LL control
 interpretations are explicitly plaintext hints; encrypted payloads remain
 available as raw bytes but cannot yet be interpreted reliably.
+
+For a recording that is already known to contain a complete, ordered plaintext
+stream from one link direction, opt into L2CAP PDU reassembly:
+
+```text
+cargo run --release -- decode-data \
+  --input central-plaintext.cf32 \
+  --format f32le \
+  --channel 12 \
+  --sample-rate 4000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --plaintext-l2cap-direction central-to-peripheral \
+  --max-l2cap-payload 65535
+```
+
+This option is an assertion by the caller, not direction or encryption
+detection. Each emitted `l2cap_pdu` contains the direction, CID, declared
+payload length, fragment count, and complete payload bytes. Central and
+peripheral streams require separate direction state. Exact consecutive
+fragment retransmissions are suppressed; malformed lengths, orphaned
+continuations, replacement starts, and incomplete end-of-input state are
+reported without discarding the original CRC-valid packet output.
+
+An ordinary recording centered on one data channel is generally incomplete for
+a hopping connection because packets transmitted on other channels are absent.
+Do not use its reassembly output as authoritative unless the input is known to
+cover every packet in the asserted direction. The reassembler resets on sample
+discontinuities that are visible in the input, but it cannot detect packets
+that were never delivered to the decoder.
 
 Generate an offline event/channel/sample plan from an observed connection
 anchor:
@@ -289,13 +322,14 @@ firmware compatibility, and hardware tests make that practical.
 The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
-synchronization, and instant-based map/parameter updates are now present; the
-next receive stages are wideband channelization or timed retuning, automatic
-capture-driven observation delivery, and live BLE connection following. Full
-packet decode is a project requirement: extended advertising, complete LL
-control semantics, L2CAP reassembly, ATT/GATT, SMP, encryption, LE 2M/Coded
-PHY, and Bluetooth Classic BR/EDR layers will be added incrementally while
-retaining undecoded packet bytes losslessly.
+synchronization, instant-based map/parameter updates, and direction-explicit
+plaintext L2CAP PDU reassembly are now present; the next receive stages are
+wideband channelization or timed retuning, automatic capture-driven observation
+delivery, and live BLE connection following. Full packet decode is a project
+requirement: extended advertising, complete LL control semantics, L2CAP
+signaling, ATT/GATT, SMP, encryption, LE 2M/Coded PHY, and Bluetooth Classic
+BR/EDR layers will be added incrementally while retaining undecoded packet
+bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

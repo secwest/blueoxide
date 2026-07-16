@@ -1,4 +1,4 @@
-use blueoxide::ble::{BleChannel, bytes_to_bits_lsb, whiten_bits};
+use blueoxide::ble::{BleChannel, bytes_to_bits_lsb, crc24_bytes, whiten_bits};
 use std::f32::consts::TAU;
 use std::fs;
 use std::process::Command;
@@ -10,6 +10,33 @@ fn temporary_path(suffix: &str) -> std::path::PathBuf {
         .expect("system time must follow the Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("blueoxide-data-cli-{nonce}-{suffix}"))
+}
+
+fn append_packet_samples(
+    samples: &mut Vec<(f32, f32)>,
+    phase: &mut f32,
+    channel: BleChannel,
+    access_address: u32,
+    crc_init: u32,
+    header: [u8; 2],
+    payload: &[u8],
+) {
+    let mut pdu = Vec::from(header);
+    pdu.extend_from_slice(payload);
+    pdu.extend_from_slice(&crc24_bytes(&pdu, crc_init));
+    let mut body = bytes_to_bits_lsb(&pdu);
+    whiten_bits(&mut body, channel);
+    let mut bits = bytes_to_bits_lsb(&[0xaa]);
+    bits.extend(bytes_to_bits_lsb(&access_address.to_le_bytes()));
+    bits.extend(body);
+    for bit in bits {
+        let frequency_hz = if bit { 250_000.0 } else { -250_000.0 } - 30_000.0;
+        let step = TAU * frequency_hz / 4_000_000.0;
+        for _ in 0..4 {
+            *phase += step;
+            samples.push((phase.cos(), phase.sin()));
+        }
+    }
 }
 
 #[test]
@@ -141,4 +168,106 @@ fn cli_rejects_advertising_channel_and_wide_crc_init() {
         .expect("run blueoxide");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds 24 bits"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--max-l2cap-payload",
+            "64",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--max-l2cap-payload requires --plaintext-l2cap-direction")
+    );
+}
+
+#[test]
+fn cli_reassembles_asserted_plaintext_l2cap_fragments() {
+    let channel = BleChannel::new(12).expect("valid channel");
+    let access_address = 0x1234_5678u32;
+    let crc_init = 0x00ab_cdef;
+    let mut phase = 0.0f32;
+    let mut samples = vec![(1.0f32, 0.0f32); 11];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x02, 6],
+        &[5, 0, 4, 0, 0x0a, 1],
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x09, 3],
+        &[0, 2, 0],
+    );
+    let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
+    for (i, q) in samples {
+        iq_bytes.extend_from_slice(&i.to_le_bytes());
+        iq_bytes.extend_from_slice(&q.to_le_bytes());
+    }
+
+    let iq_path = temporary_path("fragmented.cf32");
+    fs::write(&iq_path, iq_bytes).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "89",
+            "--aa-errors",
+            "0",
+            "--plaintext-l2cap-direction",
+            "central-to-peripheral",
+            "--max-l2cap-payload",
+            "64",
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "l2cap_pdu direction=central-to-peripheral cid=0x0004 length=5 fragments=2 payload=0a01000200"
+    ));
+    assert!(stderr.contains("decoded 2 CRC-valid data-channel packet(s)"));
+    assert!(stderr.contains(
+        "reassembled 1 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0"
+    ));
 }

@@ -59,11 +59,17 @@
   transmission; packet direction is not inferred.
 - Missed-event observation matching by channel and sample window with bounded
   search, timing-error reporting, and successful-observation re-anchoring.
+- Bounded plaintext L2CAP PDU reassembly with explicit link direction,
+  independent central/peripheral state, exact consecutive retransmission
+  suppression, length/invariant validation, replacement/orphan reporting, and
+  discontinuity reset.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
 - `blueoxide channels`, `blueoxide decode`, configurable
   `blueoxide decode-data`, and offline `blueoxide connection-plan`,
   `blueoxide connection-acquire`, and `blueoxide connection-sync` commands.
+- Opt-in `decode-data --plaintext-l2cap-direction` output for complete,
+  direction-asserted plaintext streams.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
 - An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.
@@ -125,5 +131,5 @@
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
-  decryption and higher protocol reassembly, Bluetooth Classic, LE 2M, and LE
-  Coded PHY remain to be implemented.
+  decryption, L2CAP signaling and upper-layer decoding, Bluetooth Classic, LE
+  2M, and LE Coded PHY remain to be implemented.

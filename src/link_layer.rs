@@ -194,6 +194,336 @@ pub struct L2capStart<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkDirection {
+    CentralToPeripheral,
+    PeripheralToCentral,
+}
+
+impl Display for LinkDirection {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CentralToPeripheral => formatter.write_str("central-to-peripheral"),
+            Self::PeripheralToCentral => formatter.write_str("peripheral-to-central"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2capPdu {
+    pub direction: LinkDirection,
+    pub channel_id: u16,
+    pub payload: Vec<u8>,
+    pub fragment_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncompleteL2capPdu {
+    pub direction: LinkDirection,
+    pub channel_id: u16,
+    pub expected_payload_length: usize,
+    pub received_payload_length: usize,
+    pub fragment_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum L2capReassemblyOutcome {
+    Ignored,
+    Duplicate,
+    OrphanedContinuation { fragment_octets: usize },
+    InProgress(IncompleteL2capPdu),
+    Complete(L2capPdu),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2capReassemblyUpdate {
+    pub replaced: Option<IncompleteL2capPdu>,
+    pub outcome: L2capReassemblyOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct L2capFragmentFingerprint {
+    llid: LogicalLinkId,
+    sequence_number: bool,
+    cte_info: Option<u8>,
+    payload: Vec<u8>,
+}
+
+impl L2capFragmentFingerprint {
+    fn from_packet(packet: &DataChannelPdu) -> Self {
+        Self {
+            llid: packet.llid(),
+            sequence_number: packet.sequence_number(),
+            cte_info: packet.cte_info,
+            payload: packet.payload.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingL2capPdu {
+    channel_id: u16,
+    expected_payload_length: usize,
+    payload: Vec<u8>,
+    fragment_count: u32,
+}
+
+impl PendingL2capPdu {
+    fn incomplete(&self, direction: LinkDirection) -> IncompleteL2capPdu {
+        IncompleteL2capPdu {
+            direction,
+            channel_id: self.channel_id,
+            expected_payload_length: self.expected_payload_length,
+            received_payload_length: self.payload.len(),
+            fragment_count: self.fragment_count,
+        }
+    }
+
+    fn complete(self, direction: LinkDirection) -> L2capPdu {
+        L2capPdu {
+            direction,
+            channel_id: self.channel_id,
+            payload: self.payload,
+            fragment_count: self.fragment_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DirectionalL2capState {
+    pending: Option<PendingL2capPdu>,
+    last_fragment: Option<L2capFragmentFingerprint>,
+}
+
+/// Reassembles plaintext LE-U L2CAP PDUs from direction-tagged link-layer PDUs.
+///
+/// Packet direction and encryption state cannot be inferred from an isolated
+/// data-channel PDU. Callers must supply the actual transmitter direction and
+/// must only feed plaintext or already-decrypted packets. A capture gap must be
+/// reported through [`Self::reset`] or [`Self::reset_all`] before more packets
+/// are supplied.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct L2capReassembler {
+    maximum_payload_length: usize,
+    central_to_peripheral: DirectionalL2capState,
+    peripheral_to_central: DirectionalL2capState,
+}
+
+impl Default for L2capReassembler {
+    fn default() -> Self {
+        Self {
+            maximum_payload_length: usize::from(u16::MAX),
+            central_to_peripheral: DirectionalL2capState::default(),
+            peripheral_to_central: DirectionalL2capState::default(),
+        }
+    }
+}
+
+impl L2capReassembler {
+    pub fn new(maximum_payload_length: usize) -> Result<Self> {
+        if maximum_payload_length > usize::from(u16::MAX) {
+            return Err(Error::InvalidConfiguration(format!(
+                "maximum L2CAP payload length {maximum_payload_length} exceeds 65535"
+            )));
+        }
+        Ok(Self {
+            maximum_payload_length,
+            ..Self::default()
+        })
+    }
+
+    pub const fn maximum_payload_length(&self) -> usize {
+        self.maximum_payload_length
+    }
+
+    pub fn pending(&self, direction: LinkDirection) -> Option<IncompleteL2capPdu> {
+        self.state(direction)
+            .pending
+            .as_ref()
+            .map(|pending| pending.incomplete(direction))
+    }
+
+    pub fn reset(&mut self, direction: LinkDirection) -> Option<IncompleteL2capPdu> {
+        let state = self.state_mut(direction);
+        state.last_fragment = None;
+        state
+            .pending
+            .take()
+            .map(|pending| pending.incomplete(direction))
+    }
+
+    pub fn reset_all(&mut self) -> Vec<IncompleteL2capPdu> {
+        [
+            LinkDirection::CentralToPeripheral,
+            LinkDirection::PeripheralToCentral,
+        ]
+        .into_iter()
+        .filter_map(|direction| self.reset(direction))
+        .collect()
+    }
+
+    /// Adds one ordered link-layer PDU.
+    ///
+    /// A malformed data-header invariant or L2CAP fragment length discards the
+    /// pending PDU for that direction before returning an error.
+    pub fn push(
+        &mut self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> Result<L2capReassemblyUpdate> {
+        if usize::from(packet.declared_payload_length()) != packet.payload.len() {
+            self.reset(direction);
+            return Err(Error::InvalidInput(format!(
+                "data PDU declares {} payload octets but carries {}",
+                packet.declared_payload_length(),
+                packet.payload.len()
+            )));
+        }
+        if packet.constant_tone_extension_present() != packet.cte_info.is_some() {
+            self.reset(direction);
+            return Err(Error::InvalidInput(
+                "data PDU CP bit and CTEInfo presence disagree".to_owned(),
+            ));
+        }
+        match packet.llid() {
+            LogicalLinkId::Control | LogicalLinkId::Reserved => {
+                self.state_mut(direction).last_fragment = None;
+                return Ok(L2capReassemblyUpdate {
+                    replaced: None,
+                    outcome: L2capReassemblyOutcome::Ignored,
+                });
+            }
+            LogicalLinkId::ContinuationOrEmpty if packet.payload.is_empty() => {
+                self.state_mut(direction).last_fragment = None;
+                return Ok(L2capReassemblyUpdate {
+                    replaced: None,
+                    outcome: L2capReassemblyOutcome::Ignored,
+                });
+            }
+            LogicalLinkId::ContinuationOrEmpty | LogicalLinkId::StartOrComplete => {}
+        }
+
+        let fingerprint = L2capFragmentFingerprint::from_packet(packet);
+        let state = self.state_mut(direction);
+        if state.last_fragment.as_ref() == Some(&fingerprint) {
+            return Ok(L2capReassemblyUpdate {
+                replaced: None,
+                outcome: L2capReassemblyOutcome::Duplicate,
+            });
+        }
+        state.last_fragment = Some(fingerprint);
+
+        match packet.llid() {
+            LogicalLinkId::StartOrComplete => self.push_start(direction, packet),
+            LogicalLinkId::ContinuationOrEmpty => self.push_continuation(direction, packet),
+            LogicalLinkId::Control | LogicalLinkId::Reserved => unreachable!(),
+        }
+    }
+
+    fn push_start(
+        &mut self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> Result<L2capReassemblyUpdate> {
+        let start = match packet.l2cap_start() {
+            Ok(Some(start)) => start,
+            Ok(None) => unreachable!(),
+            Err(error) => {
+                self.state_mut(direction).pending = None;
+                return Err(error);
+            }
+        };
+        let expected_payload_length = usize::from(start.payload_length);
+        if expected_payload_length > self.maximum_payload_length {
+            self.state_mut(direction).pending = None;
+            return Err(Error::InvalidInput(format!(
+                "L2CAP payload length {expected_payload_length} exceeds configured maximum {}",
+                self.maximum_payload_length
+            )));
+        }
+        if start.fragment.len() > expected_payload_length {
+            self.state_mut(direction).pending = None;
+            return Err(Error::InvalidInput(format!(
+                "L2CAP start contains {} payload octets, exceeding declared length {expected_payload_length}",
+                start.fragment.len()
+            )));
+        }
+
+        let state = self.state_mut(direction);
+        let replaced = state
+            .pending
+            .take()
+            .map(|pending| pending.incomplete(direction));
+        let pending = PendingL2capPdu {
+            channel_id: start.channel_id,
+            expected_payload_length,
+            payload: start.fragment.to_vec(),
+            fragment_count: 1,
+        };
+        let outcome = if pending.payload.len() == pending.expected_payload_length {
+            L2capReassemblyOutcome::Complete(pending.complete(direction))
+        } else {
+            let progress = pending.incomplete(direction);
+            state.pending = Some(pending);
+            L2capReassemblyOutcome::InProgress(progress)
+        };
+        Ok(L2capReassemblyUpdate { replaced, outcome })
+    }
+
+    fn push_continuation(
+        &mut self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> Result<L2capReassemblyUpdate> {
+        let state = self.state_mut(direction);
+        let Some(mut pending) = state.pending.take() else {
+            return Ok(L2capReassemblyUpdate {
+                replaced: None,
+                outcome: L2capReassemblyOutcome::OrphanedContinuation {
+                    fragment_octets: packet.payload.len(),
+                },
+            });
+        };
+        let remaining = pending.expected_payload_length - pending.payload.len();
+        if packet.payload.len() > remaining {
+            return Err(Error::InvalidInput(format!(
+                "L2CAP continuation contains {} octets with only {remaining} remaining",
+                packet.payload.len()
+            )));
+        }
+        pending.payload.extend_from_slice(&packet.payload);
+        pending.fragment_count = pending
+            .fragment_count
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidState("L2CAP fragment count overflow".to_owned()))?;
+        let outcome = if pending.payload.len() == pending.expected_payload_length {
+            L2capReassemblyOutcome::Complete(pending.complete(direction))
+        } else {
+            let progress = pending.incomplete(direction);
+            state.pending = Some(pending);
+            L2capReassemblyOutcome::InProgress(progress)
+        };
+        Ok(L2capReassemblyUpdate {
+            replaced: None,
+            outcome,
+        })
+    }
+
+    fn state(&self, direction: LinkDirection) -> &DirectionalL2capState {
+        match direction {
+            LinkDirection::CentralToPeripheral => &self.central_to_peripheral,
+            LinkDirection::PeripheralToCentral => &self.peripheral_to_central,
+        }
+    }
+
+    fn state_mut(&mut self, direction: LinkDirection) -> &mut DirectionalL2capState {
+        match direction {
+            LinkDirection::CentralToPeripheral => &mut self.central_to_peripheral,
+            LinkDirection::PeripheralToCentral => &mut self.peripheral_to_central,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlPdu<'a> {
     pub opcode: u8,
     pub parameters: &'a [u8],
@@ -1143,6 +1473,20 @@ mod tests {
         }
     }
 
+    fn data_packet(header: u8, payload: &[u8]) -> DataChannelPdu {
+        DataChannelPdu {
+            channel: BleChannel::new(7).unwrap(),
+            access_address: 0x1234_5678,
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [header, payload.len() as u8],
+            cte_info: None,
+            payload: payload.to_vec(),
+            crc: [0; 3],
+        }
+    }
+
     #[test]
     fn parses_data_header_l2cap_and_control_fields() {
         let l2cap = DataChannelPdu {
@@ -1212,6 +1556,235 @@ mod tests {
         assert_eq!(packets[0].cte_info, None);
         assert_eq!(packets[0].payload, payload);
         assert_eq!(packets[0].llid(), LogicalLinkId::StartOrComplete);
+    }
+
+    #[test]
+    fn l2cap_reassembler_completes_single_and_fragmented_pdus() {
+        let direction = LinkDirection::CentralToPeripheral;
+        let mut reassembler = L2capReassembler::default();
+        let single = reassembler
+            .push(direction, &data_packet(0x02, &[3, 0, 4, 0, 1, 2, 3]))
+            .unwrap();
+        assert_eq!(
+            single.outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction,
+                channel_id: 4,
+                payload: vec![1, 2, 3],
+                fragment_count: 1,
+            })
+        );
+
+        let start_packet = data_packet(0x02, &[5, 0, 4, 0, 0x0a, 1]);
+        let started = reassembler.push(direction, &start_packet).unwrap();
+        assert_eq!(
+            started.outcome,
+            L2capReassemblyOutcome::InProgress(IncompleteL2capPdu {
+                direction,
+                channel_id: 4,
+                expected_payload_length: 5,
+                received_payload_length: 2,
+                fragment_count: 1,
+            })
+        );
+        assert_eq!(
+            reassembler.push(direction, &start_packet).unwrap().outcome,
+            L2capReassemblyOutcome::Duplicate
+        );
+        let complete = reassembler
+            .push(direction, &data_packet(0x09, &[0, 2, 0]))
+            .unwrap();
+        assert_eq!(
+            complete.outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction,
+                channel_id: 4,
+                payload: vec![0x0a, 1, 0, 2, 0],
+                fragment_count: 2,
+            })
+        );
+        assert_eq!(reassembler.pending(direction), None);
+    }
+
+    #[test]
+    fn l2cap_reassembler_keeps_directions_independent() {
+        let mut reassembler = L2capReassembler::default();
+        let central = LinkDirection::CentralToPeripheral;
+        let peripheral = LinkDirection::PeripheralToCentral;
+        reassembler
+            .push(central, &data_packet(0x02, &[3, 0, 4, 0, 1]))
+            .unwrap();
+        reassembler
+            .push(peripheral, &data_packet(0x0a, &[2, 0, 6, 0, 7]))
+            .unwrap();
+
+        let peripheral_complete = reassembler
+            .push(peripheral, &data_packet(0x01, &[8]))
+            .unwrap();
+        assert_eq!(
+            peripheral_complete.outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction: peripheral,
+                channel_id: 6,
+                payload: vec![7, 8],
+                fragment_count: 2,
+            })
+        );
+        let central_complete = reassembler
+            .push(central, &data_packet(0x09, &[2, 3]))
+            .unwrap();
+        assert_eq!(
+            central_complete.outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction: central,
+                channel_id: 4,
+                payload: vec![1, 2, 3],
+                fragment_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn l2cap_reassembler_reports_replacement_orphan_and_reset() {
+        let direction = LinkDirection::CentralToPeripheral;
+        let mut reassembler = L2capReassembler::default();
+        assert_eq!(
+            reassembler
+                .push(direction, &data_packet(0x01, &[9, 8]))
+                .unwrap()
+                .outcome,
+            L2capReassemblyOutcome::OrphanedContinuation { fragment_octets: 2 }
+        );
+        reassembler
+            .push(direction, &data_packet(0x02, &[4, 0, 4, 0, 1]))
+            .unwrap();
+        let replacement = reassembler
+            .push(direction, &data_packet(0x0a, &[2, 0, 6, 0, 7]))
+            .unwrap();
+        assert_eq!(
+            replacement.replaced,
+            Some(IncompleteL2capPdu {
+                direction,
+                channel_id: 4,
+                expected_payload_length: 4,
+                received_payload_length: 1,
+                fragment_count: 1,
+            })
+        );
+        assert_eq!(
+            reassembler.reset(direction),
+            Some(IncompleteL2capPdu {
+                direction,
+                channel_id: 6,
+                expected_payload_length: 2,
+                received_payload_length: 1,
+                fragment_count: 1,
+            })
+        );
+        assert_eq!(reassembler.pending(direction), None);
+    }
+
+    #[test]
+    fn l2cap_reassembler_rejects_malformed_lengths_and_recovers() {
+        let direction = LinkDirection::CentralToPeripheral;
+        let mut reassembler = L2capReassembler::new(5).unwrap();
+        assert!(
+            reassembler
+                .push(direction, &data_packet(0x02, &[6, 0, 4, 0]))
+                .is_err()
+        );
+        assert!(
+            reassembler
+                .push(direction, &data_packet(0x0a, &[1, 0, 4, 0, 1, 2]))
+                .is_err()
+        );
+        reassembler
+            .push(direction, &data_packet(0x02, &[3, 0, 4, 0, 1]))
+            .unwrap();
+        assert!(
+            reassembler
+                .push(direction, &data_packet(0x09, &[2, 3, 4]))
+                .is_err()
+        );
+        assert_eq!(reassembler.pending(direction), None);
+        assert!(
+            reassembler
+                .push(direction, &data_packet(0x02, &[3, 0, 4]))
+                .is_err()
+        );
+        assert_eq!(
+            reassembler
+                .push(direction, &data_packet(0x0a, &[1, 0, 4, 0, 9]))
+                .unwrap()
+                .outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction,
+                channel_id: 4,
+                payload: vec![9],
+                fragment_count: 1,
+            })
+        );
+        assert!(L2capReassembler::new(65_536).is_err());
+    }
+
+    #[test]
+    fn l2cap_reassembler_ignores_control_and_empty_pdus() {
+        let direction = LinkDirection::PeripheralToCentral;
+        let mut reassembler = L2capReassembler::default();
+        for packet in [data_packet(0x03, &[0x14]), data_packet(0x01, &[])] {
+            assert_eq!(
+                reassembler.push(direction, &packet).unwrap().outcome,
+                L2capReassemblyOutcome::Ignored
+            );
+        }
+        assert!(reassembler.reset_all().is_empty());
+        assert_eq!(
+            LinkDirection::CentralToPeripheral.to_string(),
+            "central-to-peripheral"
+        );
+    }
+
+    #[test]
+    fn l2cap_reassembler_validates_public_data_pdu_invariants() {
+        let direction = LinkDirection::CentralToPeripheral;
+        let mut reassembler = L2capReassembler::default();
+        let mut packet = data_packet(0x02, &[1, 0, 4, 0, 9]);
+        packet.header[1] = 4;
+        assert!(reassembler.push(direction, &packet).is_err());
+
+        packet.header[1] = 5;
+        packet.header[0] |= 0x20;
+        assert!(reassembler.push(direction, &packet).is_err());
+        packet.cte_info = Some(0x85);
+        assert_eq!(
+            reassembler.push(direction, &packet).unwrap().outcome,
+            L2capReassemblyOutcome::Complete(L2capPdu {
+                direction,
+                channel_id: 4,
+                payload: vec![9],
+                fragment_count: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn l2cap_reassembler_handles_arbitrary_bounded_data_pdus_without_panicking() {
+        let mut reassembler = L2capReassembler::default();
+        for header in 0u8..=u8::MAX {
+            for payload_length in [0usize, 1, 2, 3, 4, 5, 31, 255] {
+                let direction = if header & 1 == 0 {
+                    LinkDirection::CentralToPeripheral
+                } else {
+                    LinkDirection::PeripheralToCentral
+                };
+                let mut packet = data_packet(header, &vec![header; payload_length]);
+                if packet.constant_tone_extension_present() {
+                    packet.cte_info = Some(0x85);
+                }
+                let _ = reassembler.push(direction, &packet);
+                reassembler.reset(direction);
+            }
+        }
     }
 
     #[test]

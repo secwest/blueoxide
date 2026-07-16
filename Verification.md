@@ -283,12 +283,52 @@ sample 481,050 with only one interval of widening. Searches that fail channel
 or time checks, or reach an unknown connection-update anchor, leave the tracker
 unchanged.
 
+## L2CAP PDU reassembly verification
+
+Primary host/controller reference:
+
+- Project: Zephyr
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/controller/hci/hci.c`
+  - `subsys/bluetooth/host/conn.c`
+
+Zephyr maps controller LLID start/continue values to HCI ACL start/continuation
+flags. Its LE host reassembler drops old pending state when a new start arrives,
+ignores empty continuations, waits for the little-endian L2CAP Length plus the
+four-octet header, and rejects LE input longer than that exact total. Blueoxide
+uses the same framing, replacement, and exact-length rules while reporting the
+discarded passive-capture PDU explicitly.
+
+Independent parser reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth4LE.py`
+
+Scapy binds LLID 2 to `L2CAP_Hdr`, leaves LLID 1 data as continuation bytes, and
+binds zero-length LLID 1 to its empty-PDU type. Its parser independently reports
+the fixed fragments as:
+
+```text
+0206050004000a01 -> LLID=2 len=6 L2CAP length=5 cid=4 payload=0a01
+0903000200       -> LLID=1 len=3 continuation=000200
+0100             -> LLID=1 len=0 empty
+```
+
+The resulting Blueoxide PDU is CID `0x0004`, payload `0a01000200`, and two
+link-layer fragments. Tests additionally cover complete one-fragment PDUs,
+independent bidirectional state, exact duplicate suppression, replacement
+starts, orphaned continuations, explicit gap reset, malformed public PDU
+invariants, configured length limits, start overflow, and continuation
+overflow.
+
 Final local gate for this increment:
 
 ```text
-97 library tests
+104 library tests
 4 connection planning/acquisition/synchronization CLI integration tests
-2 data-channel CLI integration tests
+3 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test
 7 live/backend CLI integration tests
 cargo fmt -- --check
