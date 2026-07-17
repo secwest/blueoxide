@@ -700,3 +700,39 @@ number. In particular, a recording centered on one data channel is normally
 incomplete for a hopping connection. CLI reassembly is authoritative only when
 the caller knows the input contains every ordered packet in the asserted
 direction.
+
+## 2026-07-17: Decode one strict command per LE signaling PDU
+
+### Signaling envelope
+
+LE fixed channel CID `0x0005` carries one signaling command in each L2CAP PDU.
+The decoder requires the complete four-octet Code, Identifier, and Length
+header, rejects identifier zero, and requires Length to equal every remaining
+payload octet. It does not scan for concatenated commands or accept trailing
+bytes. This follows the LE signaling receive path rather than the more general
+BR/EDR signaling model.
+
+The borrowed `L2capSignalingCommand` always retains raw code, identifier, and
+parameters. Unknown command codes therefore decode to an explicit raw variant
+instead of failing or discarding bytes. Known commands use exact fixed sizes or
+bounded variable layouts before exposing typed fields.
+
+### Enhanced Credit Based lists
+
+Enhanced Credit Based Connection and Reconfigure requests require one through
+five source/channel IDs, an even parameter length, and nonzero IDs. Responses
+also require one through five destination-ID entries, but zero is preserved:
+`0x0000` means that the corresponding requested channel was not established.
+Rejecting zero response entries would discard valid partial-refusal responses.
+
+Connection Parameter Update Requests reuse the existing Core interval,
+latency, supervision-timeout, and timeout-relationship validation, with an
+additional minimum-interval versus maximum-interval ordering check.
+
+### Output boundary
+
+`decode-data` attempts signaling decode only after the caller has enabled
+direction-explicit plaintext L2CAP reassembly and a complete CID `0x0005` PDU
+has been reconstructed. It prints the lossless `l2cap_pdu` first, then a
+separate `l2cap_signal` line. Envelope or known-command errors are counted and
+reported independently; they cannot remove packet or PDU output.

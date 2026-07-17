@@ -13,9 +13,9 @@ use blueoxide::demod::{
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
     ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
-    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu, IncompleteL2capPdu,
-    L2capReassembler, L2capReassemblyOutcome, LinkDirection, LogicalLinkId, SampleTimingError,
-    SleepClockAccuracy,
+    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu,
+    DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
+    L2capSignalingCommand, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
@@ -898,6 +898,95 @@ fn describe_incomplete_l2cap(incomplete: IncompleteL2capPdu) -> String {
     )
 }
 
+fn print_l2cap_channel_ids(channel_ids: &[u16]) -> String {
+    channel_ids
+        .iter()
+        .map(|channel_id| format!("0x{channel_id:04x}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn describe_l2cap_signaling(command: L2capSignalingCommand<'_>) -> Result<String> {
+    let prefix = format!(
+        "code=0x{:02x} name={} identifier={}",
+        command.code,
+        command.code_name(),
+        command.identifier
+    );
+    let details = match command.decode()? {
+        DecodedL2capSignalingCommand::CommandReject(reject) => {
+            format!(
+                "reason=0x{:04x} data={}",
+                reject.reason,
+                print_hex(reject.data)
+            )
+        }
+        DecodedL2capSignalingCommand::DisconnectionRequest(disconnection)
+        | DecodedL2capSignalingCommand::DisconnectionResponse(disconnection) => format!(
+            "destination_cid=0x{:04x} source_cid=0x{:04x}",
+            disconnection.destination_channel_id, disconnection.source_channel_id
+        ),
+        DecodedL2capSignalingCommand::ConnectionParameterUpdateRequest(request) => format!(
+            "minimum_interval={} maximum_interval={} latency={} supervision_timeout={}",
+            request.minimum_interval,
+            request.maximum_interval,
+            request.latency,
+            request.supervision_timeout
+        ),
+        DecodedL2capSignalingCommand::ConnectionParameterUpdateResponse(response) => {
+            format!("result=0x{:04x}", response.result)
+        }
+        DecodedL2capSignalingCommand::LeCreditBasedConnectionRequest(request) => format!(
+            "spsm=0x{:04x} source_cid=0x{:04x} mtu={} mps={} initial_credits={}",
+            request.spsm,
+            request.source_channel_id,
+            request.mtu,
+            request.mps,
+            request.initial_credits
+        ),
+        DecodedL2capSignalingCommand::LeCreditBasedConnectionResponse(response) => format!(
+            "destination_cid=0x{:04x} mtu={} mps={} initial_credits={} result=0x{:04x}",
+            response.destination_channel_id,
+            response.mtu,
+            response.mps,
+            response.initial_credits,
+            response.result
+        ),
+        DecodedL2capSignalingCommand::FlowControlCredit(credit) => {
+            format!("cid=0x{:04x} credits={}", credit.channel_id, credit.credits)
+        }
+        DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionRequest(request) => format!(
+            "spsm=0x{:04x} mtu={} mps={} initial_credits={} source_cids={}",
+            request.spsm,
+            request.mtu,
+            request.mps,
+            request.initial_credits,
+            print_l2cap_channel_ids(request.source_channel_ids.as_slice())
+        ),
+        DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionResponse(response) => format!(
+            "mtu={} mps={} initial_credits={} result=0x{:04x} destination_cids={}",
+            response.mtu,
+            response.mps,
+            response.initial_credits,
+            response.result,
+            print_l2cap_channel_ids(response.destination_channel_ids.as_slice())
+        ),
+        DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureRequest(request) => format!(
+            "mtu={} mps={} cids={}",
+            request.mtu,
+            request.mps,
+            print_l2cap_channel_ids(request.channel_ids.as_slice())
+        ),
+        DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureResponse(response) => {
+            format!("result=0x{:04x}", response.result)
+        }
+        DecodedL2capSignalingCommand::Unknown { parameters, .. } => {
+            format!("parameters={}", print_hex(parameters))
+        }
+    };
+    Ok(format!("{prefix} {details}"))
+}
+
 fn decode(args: DecodeArgs) -> Result<()> {
     if args.block_samples == 0 {
         return Err(Error::InvalidConfiguration(
@@ -994,6 +1083,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     let mut l2cap_orphan_count = 0usize;
     let mut l2cap_discarded_count = 0usize;
     let mut l2cap_error_count = 0usize;
+    let mut l2cap_signaling_error_count = 0usize;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -1043,16 +1133,39 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
                                     direction
                                 );
                             }
-                            L2capReassemblyOutcome::Complete(sdu) => {
+                            L2capReassemblyOutcome::Complete(pdu) => {
                                 l2cap_pdu_count += 1;
                                 println!(
                                     "l2cap_pdu direction={} cid=0x{:04x} length={} fragments={} payload={}",
-                                    sdu.direction,
-                                    sdu.channel_id,
-                                    sdu.payload.len(),
-                                    sdu.fragment_count,
-                                    print_hex(&sdu.payload)
+                                    pdu.direction,
+                                    pdu.channel_id,
+                                    pdu.payload.len(),
+                                    pdu.fragment_count,
+                                    print_hex(&pdu.payload)
                                 );
+                                match pdu.le_signaling_command() {
+                                    Ok(Some(command)) => match describe_l2cap_signaling(command) {
+                                        Ok(description) => println!(
+                                            "l2cap_signal direction={} {description}",
+                                            pdu.direction
+                                        ),
+                                        Err(error) => {
+                                            l2cap_signaling_error_count += 1;
+                                            eprintln!(
+                                                "plaintext L2CAP signaling command decode error: direction={} error={error}",
+                                                pdu.direction
+                                            );
+                                        }
+                                    },
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        l2cap_signaling_error_count += 1;
+                                        eprintln!(
+                                            "plaintext L2CAP signaling envelope decode error: direction={} error={error}",
+                                            pdu.direction
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1095,7 +1208,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     );
     if l2cap_reassembler.is_some() {
         eprintln!(
-            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count}"
+            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count}"
         );
     }
     Ok(())

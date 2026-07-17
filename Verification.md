@@ -6,7 +6,7 @@ dependency.
 
 ## Environment
 
-- Date: 2026-07-13 through 2026-07-15
+- Date: 2026-07-13 through 2026-07-17
 - Rust: 1.95.0
 - Python: 3.14.4
 - NumPy: 2.4.6
@@ -332,6 +332,73 @@ Final local gate for this increment:
 1 advertising decode/PCAPNG integration test
 7 live/backend CLI integration tests
 cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
+## LE L2CAP signaling verification
+
+Primary implementation reference:
+
+- Project: Zephyr
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/host/l2cap_internal.h`
+  - `subsys/bluetooth/host/l2cap.c`
+  - `include/zephyr/bluetooth/l2cap.h`
+
+Zephyr's LE signaling receive path pulls one four-octet command header, requires
+the command Length to equal the entire remaining L2CAP payload, and rejects
+identifier zero before dispatch. Its packed command structures fix the field
+order used by Blueoxide. Zephyr limits Enhanced Credit Based lists to five
+channels and explicitly uses destination CID `0x0000` in responses when a
+requested channel was not established.
+
+Independent byte-layout reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth.py`
+
+Using that source tree directly through `PYTHONPATH`, Scapy constructed each
+command with `L2CAP_CmdHdr`, serialized it, reparsed it, and reproduced the
+same bytes:
+
+```text
+12070800180028000000c800
+0602040041004000
+14030a0080004000000180000a00
+17040e008000000180000a00400041004200
+18050e00000180000a000900410000004300
+190608002c01960041004200
+```
+
+These are respectively Connection Parameter Update Request, Disconnection
+Request, LE Credit Based Connection Request, three-channel Enhanced Credit
+Based Connection Request, a three-entry Enhanced Credit Based Connection
+Response containing one refused-channel zero DCID, and a two-channel Enhanced
+Credit Based Reconfigure Request.
+
+Blueoxide tests cover non-signaling CIDs, truncated headers, zero identifiers,
+both command-Length mismatch directions, unknown-code preservation, every
+implemented fixed layout, invalid fixed sizes, one/five/six-entry Enhanced
+Credit lists, odd lists, missing lists, invalid request IDs, valid zero response
+DCIDs, Core connection-parameter ranges, and bounded arbitrary payloads. The
+CLI fixture additionally proves that a malformed known command still emits its
+complete raw `l2cap_pdu`.
+
+Final local gate for this increment:
+
+```text
+112 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+4 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo build --release
 cargo doc --no-deps

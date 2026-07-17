@@ -216,6 +216,495 @@ pub struct L2capPdu {
     pub fragment_count: u32,
 }
 
+pub const LE_SIGNALING_CHANNEL_ID: u16 = 0x0005;
+pub const L2CAP_ENHANCED_CREDIT_CHANNEL_LIMIT: usize = 5;
+
+impl L2capPdu {
+    /// Decodes the single command carried by an LE signaling-channel PDU.
+    ///
+    /// Returns `None` for every CID except the LE signaling fixed channel.
+    /// The command identifier must be nonzero and the command Length field
+    /// must account for every remaining payload octet.
+    pub fn le_signaling_command(&self) -> Result<Option<L2capSignalingCommand<'_>>> {
+        if self.channel_id != LE_SIGNALING_CHANNEL_ID {
+            return Ok(None);
+        }
+        if self.payload.len() < 4 {
+            return Err(Error::InvalidInput(format!(
+                "LE L2CAP signaling PDU requires a 4-octet command header, received {} octets",
+                self.payload.len()
+            )));
+        }
+
+        let identifier = self.payload[1];
+        if identifier == 0 {
+            return Err(Error::InvalidInput(
+                "LE L2CAP signaling command identifier must be nonzero".to_owned(),
+            ));
+        }
+
+        let declared_length = usize::from(u16::from_le_bytes([self.payload[2], self.payload[3]]));
+        let parameters = &self.payload[4..];
+        if declared_length != parameters.len() {
+            return Err(Error::InvalidInput(format!(
+                "LE L2CAP signaling command declares {declared_length} parameter octets but carries {}",
+                parameters.len()
+            )));
+        }
+
+        Ok(Some(L2capSignalingCommand {
+            code: self.payload[0],
+            identifier,
+            parameters,
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capSignalingCommand<'a> {
+    pub code: u8,
+    pub identifier: u8,
+    pub parameters: &'a [u8],
+}
+
+impl<'a> L2capSignalingCommand<'a> {
+    pub const fn code_name(self) -> &'static str {
+        match self.code {
+            0x01 => "command-reject",
+            0x06 => "disconnection-request",
+            0x07 => "disconnection-response",
+            0x12 => "connection-parameter-update-request",
+            0x13 => "connection-parameter-update-response",
+            0x14 => "le-credit-based-connection-request",
+            0x15 => "le-credit-based-connection-response",
+            0x16 => "flow-control-credit-indication",
+            0x17 => "enhanced-credit-based-connection-request",
+            0x18 => "enhanced-credit-based-connection-response",
+            0x19 => "enhanced-credit-based-reconfigure-request",
+            0x1a => "enhanced-credit-based-reconfigure-response",
+            _ => "unknown",
+        }
+    }
+
+    pub fn decode(self) -> Result<DecodedL2capSignalingCommand<'a>> {
+        match self.code {
+            0x01 => {
+                require_minimum_l2cap_parameter_length(self, 2)?;
+                Ok(DecodedL2capSignalingCommand::CommandReject(
+                    L2capCommandReject {
+                        reason: l2cap_parameter_u16(self, 0, "reason")?,
+                        data: &self.parameters[2..],
+                    },
+                ))
+            }
+            0x06 | 0x07 => {
+                require_l2cap_parameter_length(self, 4)?;
+                let disconnection = L2capDisconnection {
+                    destination_channel_id: l2cap_parameter_u16(self, 0, "destination channel ID")?,
+                    source_channel_id: l2cap_parameter_u16(self, 2, "source channel ID")?,
+                };
+                if self.code == 0x06 {
+                    Ok(DecodedL2capSignalingCommand::DisconnectionRequest(
+                        disconnection,
+                    ))
+                } else {
+                    Ok(DecodedL2capSignalingCommand::DisconnectionResponse(
+                        disconnection,
+                    ))
+                }
+            }
+            0x12 => {
+                require_l2cap_parameter_length(self, 8)?;
+                Ok(
+                    DecodedL2capSignalingCommand::ConnectionParameterUpdateRequest(
+                        L2capConnectionParameterUpdateRequest::new(
+                            l2cap_parameter_u16(self, 0, "minimum interval")?,
+                            l2cap_parameter_u16(self, 2, "maximum interval")?,
+                            l2cap_parameter_u16(self, 4, "latency")?,
+                            l2cap_parameter_u16(self, 6, "supervision timeout")?,
+                        )?,
+                    ),
+                )
+            }
+            0x13 => {
+                require_l2cap_parameter_length(self, 2)?;
+                Ok(
+                    DecodedL2capSignalingCommand::ConnectionParameterUpdateResponse(
+                        L2capConnectionParameterUpdateResponse {
+                            result: l2cap_parameter_u16(self, 0, "result")?,
+                        },
+                    ),
+                )
+            }
+            0x14 => {
+                require_l2cap_parameter_length(self, 10)?;
+                Ok(
+                    DecodedL2capSignalingCommand::LeCreditBasedConnectionRequest(
+                        L2capLeCreditBasedConnectionRequest {
+                            spsm: l2cap_parameter_u16(self, 0, "SPSM")?,
+                            source_channel_id: l2cap_parameter_u16(self, 2, "source channel ID")?,
+                            mtu: l2cap_parameter_u16(self, 4, "MTU")?,
+                            mps: l2cap_parameter_u16(self, 6, "MPS")?,
+                            initial_credits: l2cap_parameter_u16(self, 8, "initial credits")?,
+                        },
+                    ),
+                )
+            }
+            0x15 => {
+                require_l2cap_parameter_length(self, 10)?;
+                Ok(
+                    DecodedL2capSignalingCommand::LeCreditBasedConnectionResponse(
+                        L2capLeCreditBasedConnectionResponse {
+                            destination_channel_id: l2cap_parameter_u16(
+                                self,
+                                0,
+                                "destination channel ID",
+                            )?,
+                            mtu: l2cap_parameter_u16(self, 2, "MTU")?,
+                            mps: l2cap_parameter_u16(self, 4, "MPS")?,
+                            initial_credits: l2cap_parameter_u16(self, 6, "initial credits")?,
+                            result: l2cap_parameter_u16(self, 8, "result")?,
+                        },
+                    ),
+                )
+            }
+            0x16 => {
+                require_l2cap_parameter_length(self, 4)?;
+                Ok(DecodedL2capSignalingCommand::FlowControlCredit(
+                    L2capFlowControlCredit {
+                        channel_id: l2cap_parameter_u16(self, 0, "channel ID")?,
+                        credits: l2cap_parameter_u16(self, 2, "credits")?,
+                    },
+                ))
+            }
+            0x17 => {
+                require_minimum_l2cap_parameter_length(self, 10)?;
+                Ok(
+                    DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionRequest(
+                        L2capEnhancedCreditBasedConnectionRequest {
+                            spsm: l2cap_parameter_u16(self, 0, "SPSM")?,
+                            mtu: l2cap_parameter_u16(self, 2, "MTU")?,
+                            mps: l2cap_parameter_u16(self, 4, "MPS")?,
+                            initial_credits: l2cap_parameter_u16(self, 6, "initial credits")?,
+                            source_channel_ids: decode_l2cap_channel_id_list(
+                                self, 8, "source", false,
+                            )?,
+                        },
+                    ),
+                )
+            }
+            0x18 => {
+                require_minimum_l2cap_parameter_length(self, 10)?;
+                Ok(
+                    DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionResponse(
+                        L2capEnhancedCreditBasedConnectionResponse {
+                            mtu: l2cap_parameter_u16(self, 0, "MTU")?,
+                            mps: l2cap_parameter_u16(self, 2, "MPS")?,
+                            initial_credits: l2cap_parameter_u16(self, 4, "initial credits")?,
+                            result: l2cap_parameter_u16(self, 6, "result")?,
+                            destination_channel_ids: decode_l2cap_channel_id_list(
+                                self,
+                                8,
+                                "destination",
+                                true,
+                            )?,
+                        },
+                    ),
+                )
+            }
+            0x19 => {
+                require_minimum_l2cap_parameter_length(self, 6)?;
+                Ok(
+                    DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureRequest(
+                        L2capEnhancedCreditBasedReconfigureRequest {
+                            mtu: l2cap_parameter_u16(self, 0, "MTU")?,
+                            mps: l2cap_parameter_u16(self, 2, "MPS")?,
+                            channel_ids: decode_l2cap_channel_id_list(
+                                self,
+                                4,
+                                "reconfigure",
+                                false,
+                            )?,
+                        },
+                    ),
+                )
+            }
+            0x1a => {
+                require_l2cap_parameter_length(self, 2)?;
+                Ok(
+                    DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureResponse(
+                        L2capEnhancedCreditBasedReconfigureResponse {
+                            result: l2cap_parameter_u16(self, 0, "result")?,
+                        },
+                    ),
+                )
+            }
+            _ => Ok(DecodedL2capSignalingCommand::Unknown {
+                code: self.code,
+                parameters: self.parameters,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodedL2capSignalingCommand<'a> {
+    CommandReject(L2capCommandReject<'a>),
+    DisconnectionRequest(L2capDisconnection),
+    DisconnectionResponse(L2capDisconnection),
+    ConnectionParameterUpdateRequest(L2capConnectionParameterUpdateRequest),
+    ConnectionParameterUpdateResponse(L2capConnectionParameterUpdateResponse),
+    LeCreditBasedConnectionRequest(L2capLeCreditBasedConnectionRequest),
+    LeCreditBasedConnectionResponse(L2capLeCreditBasedConnectionResponse),
+    FlowControlCredit(L2capFlowControlCredit),
+    EnhancedCreditBasedConnectionRequest(L2capEnhancedCreditBasedConnectionRequest),
+    EnhancedCreditBasedConnectionResponse(L2capEnhancedCreditBasedConnectionResponse),
+    EnhancedCreditBasedReconfigureRequest(L2capEnhancedCreditBasedReconfigureRequest),
+    EnhancedCreditBasedReconfigureResponse(L2capEnhancedCreditBasedReconfigureResponse),
+    Unknown { code: u8, parameters: &'a [u8] },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capCommandReject<'a> {
+    pub reason: u16,
+    pub data: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capDisconnection {
+    pub destination_channel_id: u16,
+    pub source_channel_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capConnectionParameterUpdateRequest {
+    pub minimum_interval: u16,
+    pub maximum_interval: u16,
+    pub latency: u16,
+    pub supervision_timeout: u16,
+}
+
+impl L2capConnectionParameterUpdateRequest {
+    pub fn new(
+        minimum_interval: u16,
+        maximum_interval: u16,
+        latency: u16,
+        supervision_timeout: u16,
+    ) -> Result<Self> {
+        let request = Self {
+            minimum_interval,
+            maximum_interval,
+            latency,
+            supervision_timeout,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if !(6..=3_200).contains(&self.minimum_interval) {
+            return Err(Error::InvalidInput(format!(
+                "connection parameter minimum interval {} is outside 6..=3200",
+                self.minimum_interval
+            )));
+        }
+        if self.minimum_interval > self.maximum_interval {
+            return Err(Error::InvalidInput(format!(
+                "connection parameter minimum interval {} exceeds maximum interval {}",
+                self.minimum_interval, self.maximum_interval
+            )));
+        }
+        ConnectionParameters::new(
+            self.maximum_interval,
+            self.latency,
+            self.supervision_timeout,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capConnectionParameterUpdateResponse {
+    pub result: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capLeCreditBasedConnectionRequest {
+    pub spsm: u16,
+    pub source_channel_id: u16,
+    pub mtu: u16,
+    pub mps: u16,
+    pub initial_credits: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capLeCreditBasedConnectionResponse {
+    pub destination_channel_id: u16,
+    pub mtu: u16,
+    pub mps: u16,
+    pub initial_credits: u16,
+    pub result: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capFlowControlCredit {
+    pub channel_id: u16,
+    pub credits: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capChannelIdList {
+    channel_ids: [u16; L2CAP_ENHANCED_CREDIT_CHANNEL_LIMIT],
+    count: u8,
+}
+
+impl L2capChannelIdList {
+    pub fn as_slice(&self) -> &[u16] {
+        &self.channel_ids[..usize::from(self.count)]
+    }
+
+    pub const fn len(self) -> usize {
+        self.count as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.count == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capEnhancedCreditBasedConnectionRequest {
+    pub spsm: u16,
+    pub mtu: u16,
+    pub mps: u16,
+    pub initial_credits: u16,
+    pub source_channel_ids: L2capChannelIdList,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capEnhancedCreditBasedConnectionResponse {
+    pub mtu: u16,
+    pub mps: u16,
+    pub initial_credits: u16,
+    pub result: u16,
+    pub destination_channel_ids: L2capChannelIdList,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capEnhancedCreditBasedReconfigureRequest {
+    pub mtu: u16,
+    pub mps: u16,
+    pub channel_ids: L2capChannelIdList,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L2capEnhancedCreditBasedReconfigureResponse {
+    pub result: u16,
+}
+
+fn require_l2cap_parameter_length(
+    command: L2capSignalingCommand<'_>,
+    expected: usize,
+) -> Result<()> {
+    if command.parameters.len() != expected {
+        return Err(Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} (0x{:02x}) requires {expected} parameter octets, received {}",
+            command.code_name(),
+            command.code,
+            command.parameters.len()
+        )));
+    }
+    Ok(())
+}
+
+fn require_minimum_l2cap_parameter_length(
+    command: L2capSignalingCommand<'_>,
+    minimum: usize,
+) -> Result<()> {
+    if command.parameters.len() < minimum {
+        return Err(Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} (0x{:02x}) requires at least {minimum} parameter octets, received {}",
+            command.code_name(),
+            command.code,
+            command.parameters.len()
+        )));
+    }
+    Ok(())
+}
+
+fn l2cap_parameter_u16(
+    command: L2capSignalingCommand<'_>,
+    offset: usize,
+    field: &str,
+) -> Result<u16> {
+    let bytes = command
+        .parameters
+        .get(offset..offset.saturating_add(2))
+        .ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "LE L2CAP signaling command {} has a truncated {field}",
+                command.code_name()
+            ))
+        })?;
+    let bytes: [u8; 2] = bytes.try_into().map_err(|_| {
+        Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} has an invalid {field}",
+            command.code_name()
+        ))
+    })?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn decode_l2cap_channel_id_list(
+    command: L2capSignalingCommand<'_>,
+    offset: usize,
+    list_name: &str,
+    allow_zero: bool,
+) -> Result<L2capChannelIdList> {
+    let bytes = command.parameters.get(offset..).ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} is missing its {list_name} channel ID list",
+            command.code_name()
+        ))
+    })?;
+    if bytes.is_empty() {
+        return Err(Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} requires at least one {list_name} channel ID",
+            command.code_name()
+        )));
+    }
+    if bytes.len() % 2 != 0 {
+        return Err(Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} has an odd-length {list_name} channel ID list",
+            command.code_name()
+        )));
+    }
+    let count = bytes.len() / 2;
+    if count > L2CAP_ENHANCED_CREDIT_CHANNEL_LIMIT {
+        return Err(Error::InvalidInput(format!(
+            "LE L2CAP signaling command {} carries {count} {list_name} channel IDs; maximum is {L2CAP_ENHANCED_CREDIT_CHANNEL_LIMIT}",
+            command.code_name()
+        )));
+    }
+
+    let mut channel_ids = [0u16; L2CAP_ENHANCED_CREDIT_CHANNEL_LIMIT];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let channel_id = u16::from_le_bytes([pair[0], pair[1]]);
+        if channel_id == 0 && !allow_zero {
+            return Err(Error::InvalidInput(format!(
+                "LE L2CAP signaling command {} has a zero {list_name} channel ID at index {index}",
+                command.code_name()
+            )));
+        }
+        channel_ids[index] = channel_id;
+    }
+
+    Ok(L2capChannelIdList {
+        channel_ids,
+        count: count as u8,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IncompleteL2capPdu {
     pub direction: LinkDirection,
@@ -1487,6 +1976,37 @@ mod tests {
         }
     }
 
+    fn signaling_pdu(code: u8, identifier: u8, parameters: &[u8]) -> L2capPdu {
+        let mut payload = vec![code, identifier];
+        payload.extend_from_slice(&(parameters.len() as u16).to_le_bytes());
+        payload.extend_from_slice(parameters);
+        L2capPdu {
+            direction: LinkDirection::CentralToPeripheral,
+            channel_id: LE_SIGNALING_CHANNEL_ID,
+            payload,
+            fragment_count: 1,
+        }
+    }
+
+    fn u16_parameters(values: &[u16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn decode_signaling<'a>(
+        code: u8,
+        parameters: &'a [u8],
+    ) -> Result<DecodedL2capSignalingCommand<'a>> {
+        L2capSignalingCommand {
+            code,
+            identifier: 1,
+            parameters,
+        }
+        .decode()
+    }
+
     #[test]
     fn parses_data_header_l2cap_and_control_fields() {
         let l2cap = DataChannelPdu {
@@ -1556,6 +2076,243 @@ mod tests {
         assert_eq!(packets[0].cte_info, None);
         assert_eq!(packets[0].payload, payload);
         assert_eq!(packets[0].llid(), LogicalLinkId::StartOrComplete);
+    }
+
+    #[test]
+    fn l2cap_signaling_parser_requires_the_fixed_channel_and_exact_envelope() {
+        let mut pdu = signaling_pdu(0x13, 1, &[0, 0]);
+        pdu.channel_id = 4;
+        pdu.payload.clear();
+        assert_eq!(pdu.le_signaling_command().unwrap(), None);
+
+        pdu.channel_id = LE_SIGNALING_CHANNEL_ID;
+        for length in 0..4 {
+            pdu.payload = vec![0; length];
+            assert!(pdu.le_signaling_command().is_err());
+        }
+
+        pdu.payload = vec![0x13, 0, 2, 0, 0, 0];
+        assert!(pdu.le_signaling_command().is_err());
+        pdu.payload = vec![0x13, 1, 1, 0, 0, 0];
+        assert!(pdu.le_signaling_command().is_err());
+        pdu.payload = vec![0x13, 1, 3, 0, 0, 0];
+        assert!(pdu.le_signaling_command().is_err());
+    }
+
+    #[test]
+    fn l2cap_signaling_unknown_command_preserves_raw_parameters() {
+        let pdu = signaling_pdu(0xfe, 0x7a, &[1, 2, 3, 4]);
+        let command = pdu.le_signaling_command().unwrap().unwrap();
+        assert_eq!(command.code, 0xfe);
+        assert_eq!(command.identifier, 0x7a);
+        assert_eq!(command.parameters, [1, 2, 3, 4]);
+        assert_eq!(command.code_name(), "unknown");
+        assert_eq!(
+            command.decode().unwrap(),
+            DecodedL2capSignalingCommand::Unknown {
+                code: 0xfe,
+                parameters: &[1, 2, 3, 4],
+            }
+        );
+    }
+
+    #[test]
+    fn l2cap_signaling_decodes_fixed_command_layouts() {
+        assert_eq!(
+            decode_signaling(0x01, &u16_parameters(&[2, 0x0040, 0x0041])).unwrap(),
+            DecodedL2capSignalingCommand::CommandReject(L2capCommandReject {
+                reason: 2,
+                data: &[0x40, 0, 0x41, 0],
+            })
+        );
+        assert_eq!(
+            decode_signaling(0x06, &u16_parameters(&[0x0041, 0x0040])).unwrap(),
+            DecodedL2capSignalingCommand::DisconnectionRequest(L2capDisconnection {
+                destination_channel_id: 0x0041,
+                source_channel_id: 0x0040,
+            })
+        );
+        assert_eq!(
+            decode_signaling(0x07, &u16_parameters(&[0x0041, 0x0040])).unwrap(),
+            DecodedL2capSignalingCommand::DisconnectionResponse(L2capDisconnection {
+                destination_channel_id: 0x0041,
+                source_channel_id: 0x0040,
+            })
+        );
+        assert_eq!(
+            decode_signaling(0x12, &u16_parameters(&[24, 40, 0, 200])).unwrap(),
+            DecodedL2capSignalingCommand::ConnectionParameterUpdateRequest(
+                L2capConnectionParameterUpdateRequest {
+                    minimum_interval: 24,
+                    maximum_interval: 40,
+                    latency: 0,
+                    supervision_timeout: 200,
+                }
+            )
+        );
+        assert_eq!(
+            decode_signaling(0x13, &u16_parameters(&[1])).unwrap(),
+            DecodedL2capSignalingCommand::ConnectionParameterUpdateResponse(
+                L2capConnectionParameterUpdateResponse { result: 1 }
+            )
+        );
+        assert_eq!(
+            decode_signaling(0x14, &u16_parameters(&[0x0080, 0x0040, 256, 128, 10])).unwrap(),
+            DecodedL2capSignalingCommand::LeCreditBasedConnectionRequest(
+                L2capLeCreditBasedConnectionRequest {
+                    spsm: 0x0080,
+                    source_channel_id: 0x0040,
+                    mtu: 256,
+                    mps: 128,
+                    initial_credits: 10,
+                }
+            )
+        );
+        assert_eq!(
+            decode_signaling(0x15, &u16_parameters(&[0x0041, 256, 128, 11, 0])).unwrap(),
+            DecodedL2capSignalingCommand::LeCreditBasedConnectionResponse(
+                L2capLeCreditBasedConnectionResponse {
+                    destination_channel_id: 0x0041,
+                    mtu: 256,
+                    mps: 128,
+                    initial_credits: 11,
+                    result: 0,
+                }
+            )
+        );
+        assert_eq!(
+            decode_signaling(0x16, &u16_parameters(&[0x0041, 7])).unwrap(),
+            DecodedL2capSignalingCommand::FlowControlCredit(L2capFlowControlCredit {
+                channel_id: 0x0041,
+                credits: 7,
+            })
+        );
+        assert_eq!(
+            decode_signaling(0x1a, &u16_parameters(&[3])).unwrap(),
+            DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureResponse(
+                L2capEnhancedCreditBasedReconfigureResponse { result: 3 }
+            )
+        );
+    }
+
+    #[test]
+    fn l2cap_signaling_rejects_invalid_fixed_parameter_lengths() {
+        for (code, expected) in [
+            (0x06, 4),
+            (0x07, 4),
+            (0x12, 8),
+            (0x13, 2),
+            (0x14, 10),
+            (0x15, 10),
+            (0x16, 4),
+            (0x1a, 2),
+        ] {
+            assert!(decode_signaling(code, &vec![0; expected - 1]).is_err());
+            assert!(decode_signaling(code, &vec![0; expected + 1]).is_err());
+        }
+        assert!(decode_signaling(0x01, &[0]).is_err());
+    }
+
+    #[test]
+    fn l2cap_signaling_decodes_bounded_enhanced_credit_channel_lists() {
+        let one_request_parameters = u16_parameters(&[0x0080, 256, 128, 10, 0x0040]);
+        let one_request = decode_signaling(0x17, &one_request_parameters).unwrap();
+        let DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionRequest(request) =
+            one_request
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(request.source_channel_ids.as_slice(), [0x0040]);
+        assert_eq!(request.source_channel_ids.len(), 1);
+        assert!(!request.source_channel_ids.is_empty());
+
+        let five_request_parameters =
+            u16_parameters(&[0x0080, 256, 128, 10, 0x0040, 0x0041, 0x0042, 0x0043, 0x0044]);
+        let five_request = decode_signaling(0x17, &five_request_parameters).unwrap();
+        let DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionRequest(request) =
+            five_request
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            request.source_channel_ids.as_slice(),
+            [0x0040, 0x0041, 0x0042, 0x0043, 0x0044]
+        );
+
+        let response_parameters = u16_parameters(&[256, 128, 10, 9, 0x0041, 0, 0x0043]);
+        let response = decode_signaling(0x18, &response_parameters).unwrap();
+        let DecodedL2capSignalingCommand::EnhancedCreditBasedConnectionResponse(response) =
+            response
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            response.destination_channel_ids.as_slice(),
+            [0x0041, 0, 0x0043]
+        );
+
+        let reconfigure_parameters = u16_parameters(&[300, 150, 0x0041, 0x0042]);
+        let reconfigure = decode_signaling(0x19, &reconfigure_parameters).unwrap();
+        let DecodedL2capSignalingCommand::EnhancedCreditBasedReconfigureRequest(reconfigure) =
+            reconfigure
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(reconfigure.channel_ids.as_slice(), [0x0041, 0x0042]);
+    }
+
+    #[test]
+    fn l2cap_signaling_rejects_malformed_enhanced_credit_channel_lists() {
+        assert!(decode_signaling(0x17, &u16_parameters(&[0x0080, 256, 128, 10])).is_err());
+        let mut odd = u16_parameters(&[0x0080, 256, 128, 10, 0x0040]);
+        odd.push(0xff);
+        assert!(decode_signaling(0x17, &odd).is_err());
+        assert!(
+            decode_signaling(
+                0x17,
+                &u16_parameters(&[
+                    0x0080, 256, 128, 10, 0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045,
+                ])
+            )
+            .is_err()
+        );
+        assert!(decode_signaling(0x17, &u16_parameters(&[0x0080, 256, 128, 10, 0])).is_err());
+        assert!(decode_signaling(0x19, &u16_parameters(&[300, 150, 0])).is_err());
+        assert!(decode_signaling(0x18, &u16_parameters(&[256, 128, 10, 0])).is_err());
+    }
+
+    #[test]
+    fn l2cap_connection_parameter_update_reuses_core_range_validation() {
+        for values in [
+            [5, 40, 0, 200],
+            [41, 40, 0, 200],
+            [24, 3_201, 0, 200],
+            [24, 40, 500, 200],
+            [24, 40, 0, 9],
+            [24, 40, 499, 10],
+        ] {
+            assert!(decode_signaling(0x12, &u16_parameters(&values)).is_err());
+        }
+    }
+
+    #[test]
+    fn l2cap_signaling_parser_handles_arbitrary_bounded_payloads_without_panicking() {
+        for length in 0usize..=64 {
+            let mut pdu = L2capPdu {
+                direction: LinkDirection::PeripheralToCentral,
+                channel_id: LE_SIGNALING_CHANNEL_ID,
+                payload: (0..length).map(|index| index as u8).collect(),
+                fragment_count: 1,
+            };
+            if length >= 4 {
+                pdu.payload[1] = 1;
+                let parameter_length = (length - 4) as u16;
+                pdu.payload[2..4].copy_from_slice(&parameter_length.to_le_bytes());
+            }
+            if let Ok(Some(command)) = pdu.le_signaling_command() {
+                let _ = command.decode();
+            }
+        }
     }
 
     #[test]

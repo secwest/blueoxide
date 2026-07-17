@@ -149,6 +149,15 @@ fragment retransmissions are suppressed; malformed lengths, orphaned
 continuations, replacement starts, and incomplete end-of-input state are
 reported without discarding the original CRC-valid packet output.
 
+Completed plaintext PDUs on LE signaling CID `0x0005` are additionally decoded
+as one strict signaling command. The four-octet command header requires a
+nonzero identifier and a Length that exactly matches all remaining bytes.
+Known disconnection, connection-parameter, LE credit-based, flow-control
+credit, and Enhanced Credit Based commands receive typed `l2cap_signal`
+output. Unknown command codes retain their raw parameters. A malformed known
+command reports a signaling error after the complete raw `l2cap_pdu` line, so
+semantic decoding never suppresses reconstructed bytes.
+
 An ordinary recording centered on one data channel is generally incomplete for
 a hopping connection because packets transmitted on other channels are absent.
 Do not use its reassembly output as authoritative unless the input is known to

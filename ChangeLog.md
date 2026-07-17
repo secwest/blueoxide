@@ -63,6 +63,10 @@
   independent central/peripheral state, exact consecutive retransmission
   suppression, length/invariant validation, replacement/orphan reporting, and
   discontinuity reset.
+- Strict lossless LE L2CAP signaling decoding for CID `0x0005`, including
+  exact single-command envelopes, typed disconnection, connection-parameter,
+  and credit-based command views, bounded Enhanced Credit Based channel lists,
+  raw unknown-command preservation, and non-suppressing CLI error reporting.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
 - `blueoxide channels`, `blueoxide decode`, configurable
