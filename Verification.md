@@ -577,6 +577,100 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## LE Link Layer control PDU verification
+
+Normative reference:
+
+- Bluetooth Core Specification 6.1, Vol 6, Part B:
+  - Section 2.4.2 and Table 2.22 for the control envelope and opcode table.
+  - Sections 2.4.2.1 through 2.4.2.41 for opcodes `0x00..=0x2c`.
+  - Section 2.3.4.6 for the embedded 18-octet SyncInfo field.
+
+The official figures establish the exact Core 6.1 layouts that are absent or
+outdated in older implementation parsers:
+
+| PDU | Parameter octets | Core 6.1 detail |
+| --- | ---: | --- |
+| `LL_CIS_REQ` | 35 | 12-bit Max_SDU_C_To_P, 2 RFU bits, Framing_Mode, Framed |
+| `LL_PERIODIC_SYNC_IND` | 34 | 18-octet SyncInfo plus connection/advertiser metadata |
+| `LL_PERIODIC_SYNC_WR_IND` | 42 | 34-octet base, 4-octet RspAA, four timing octets |
+| `LL_FEATURE_EXT_REQ/RSP` | 26 | MaxPage, PageNumber, 24-octet FeaturePage |
+
+Primary implementation reference:
+
+- Project: Zephyr Bluetooth Controller
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- File: `subsys/bluetooth/controller/ll_sw/pdu.h`
+
+Zephyr's packed structures independently confirm field order and exact sizes
+through `LL_CIS_TERMINATE_IND` (`0x22`), including little-endian encryption,
+version, connection-parameter, length, PHY, periodic-sync, and CIS fields. Its
+pinned structure predates the Core 6.1 CIS Framing_Mode assignment, so the
+official Core figure takes precedence for those two former RFU bits.
+
+Independent packet reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth4LE.py`
+
+Scapy serialized and reparsed these representative control payloads, including
+the opcode:
+
+```text
+03000102030405060708090a0b0c0d0e0f101112131415
+0c0d34127856
+14fb0048081b004808
+1a8a
+2308ff7f
+2403fe7eff
+250f010102
+260200050009000100c800
+270500090009000400c800
+28010596
+```
+
+These are Encryption Request, Version Indication, Length Request, CTE Request,
+Power Control Request/Response, Power Change Indication, Subrate
+Request/Indication, and Channel Reporting Indication. The vectors are fixed in
+`src/ll_control.rs`.
+
+The pinned Scapy revision models commands only through
+`LL_CHANNEL_STATUS_IND` (`0x29`). It also uses big-endian generic short fields
+for some connection-parameter/instant classes and its `LL_CIS_REQ` class
+predates Framing_Mode. Blueoxide does not treat those known discrepancies as
+oracles; Zephyr's little-endian packed fields and the Core 6.1 figures govern
+those layouts. Opcodes `0x2a..=0x2c` are verified directly against the Core
+figures.
+
+Tests cover every known opcode's short and long forms, fixed cryptographic
+arrays, connection-offset ordering/uniqueness, length and PHY ranges, CTE and
+clock fields, SyncInfo bit packing, Core 6.1 CIS framing and ISO constraints,
+power-control sentinels, subrate relationships, channel reporting and all 37
+two-bit channel classifications, 24-octet feature pages, named raw preservation
+for `0x2d..=0x3c`, future opcodes, and bounded arbitrary input without panics.
+
+The waveform-backed CLI fixture emits a valid `LL_LENGTH_REQ`, then a malformed
+known `LL_CTE_REQ` with trailing CtrData. Both raw data-channel packets remain
+visible, the valid command receives typed output, and only the malformed packet
+increments `ll_control_errors`.
+
+Final local gate for this increment:
+
+```text
+142 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+6 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Internal audit matrix
 
 The checked-in test suite covers:
@@ -592,6 +686,8 @@ The checked-in test suite covers:
 - CRC corruption rejection.
 - CTEInfo frame boundaries, CRC coverage, raw-value preservation, and maximum
   data-PDU stream retention.
+- Exact LL control layouts through Feature Page Exchange, Core 6.1 opcode
+  naming, reserved-field validation, and non-suppressing malformed output.
 - Truncated Advertising Data structures.
 - Invalid CONNECT_IND timing and channel constraints.
 - Arbitrary bounded advertising PDU payloads without panics.

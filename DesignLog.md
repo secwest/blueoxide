@@ -833,3 +833,52 @@ cryptographic state.
 counted independently as `smp_errors` and cannot suppress raw reconstructed
 bytes. Since those bytes can contain long-term and identity keys, all SMP
 capture output is sensitive even when semantic decoding fails.
+
+## 2026-07-19: Type LL control syntax before adding procedure state
+
+### Framing boundary
+
+An LL control PDU is already bounded by a CRC-valid data-channel PDU with LLID
+`0b11`. Its first payload octet is the Opcode and every remaining octet is
+CtrData. Unlike ATT, signaling, and SMP, this decode does not depend on L2CAP
+reassembly. `ControlPdu::decode` therefore operates directly on the complete
+Length-counted link-layer payload while the original `DataChannelPdu` retains
+the opcode and CtrData bytes.
+
+Every pre-Channel-Sounding command from `0x00` through `0x2c` has an exact
+typed layout. Known commands reject both short and trailing CtrData. The Core
+6.1 opcode table is named through `LL_FRAME_SPACE_RSP` (`0x3c`); assigned
+Channel Sounding and Frame Space opcodes remain explicit raw payloads rather
+than being mislabeled as unknown or guessed from incomplete state.
+
+### Core 6.1 corrections
+
+Older implementation tables are not sufficient for the current layouts.
+Core 6.1 gives `LL_CIS_REQ` a Framing_Mode bit next to Framed, reducing that
+octet pair's RFU field from three bits to two. It defines
+`LL_PERIODIC_SYNC_WR_IND` as the 34-octet `LL_PERIODIC_SYNC_IND` CtrData plus
+RspAA and four PAwR timing octets, for 42 parameter octets total. Feature Page
+Exchange uses MaxPage, PageNumber, and a 24-octet FeaturePage, for 26 parameter
+octets rather than an eight-octet legacy feature mask.
+
+The syntax layer validates reserved bits and value relationships that do not
+require connection history: connection parameter ranges and ordered unique
+offsets; data-length limits; PHY masks; CTE length/type; SyncInfo map, interval,
+and offset flags; CIS framing, SDU/PDU, NSE, BN, FT, ISO interval, and offset
+bounds; power PHY/flag values; subrate factors, latency, and continuation
+numbers; channel-reporting timing; channel classifications; and feature-page
+numbers.
+
+### State and output boundary
+
+This parser does not infer link direction or role, decide whether a procedure
+is legal in the current state, apply PHY/subrate/CIS changes, compare instants
+to an observed event counter, construct session keys, or decrypt subsequent
+packets. Existing connection tracking continues to schedule only
+`LL_CONNECTION_UPDATE_IND` and `LL_CHANNEL_MAP_IND`.
+
+`decode-data` always prints the raw packet. A malformed known control command
+adds `decode_error` to its plaintext hint and increments
+`ll_control_errors`; it cannot suppress capture bytes. Encryption request and
+response descriptions expose Rand, EDIV, SKD, and IV fields, so LL control
+output is sensitive even before higher-layer keys are available.

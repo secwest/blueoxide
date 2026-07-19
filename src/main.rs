@@ -18,6 +18,7 @@ use blueoxide::link_layer::{
     DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
     L2capSignalingCommand, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
 };
+use blueoxide::ll_control::{ChannelClassification, DecodedControlPdu};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::smp::{DecodedSmpPdu, SmpAuthenticationRequirements, SmpKeyDistribution, SmpPdu};
@@ -788,8 +789,8 @@ fn print_packet(packet: &ReceivedAdvertisingPdu) {
 }
 
 fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
-    if let Some(update) = control.connection_update_ind()? {
-        return Ok(format!(
+    Ok(match control.decode()? {
+        DecodedControlPdu::ConnectionUpdateInd(update) => format!(
             "{} opcode=0x{:02x} window_offset={} window_size={} interval={} latency={} timeout={} instant={}",
             control.opcode_name(),
             control.opcode,
@@ -799,59 +800,374 @@ fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
             update.parameters.latency,
             update.parameters.supervision_timeout,
             update.instant
-        ));
-    }
-    if let Some(update) = control.channel_map_ind()? {
-        return Ok(format!(
+        ),
+        DecodedControlPdu::ChannelMapInd(update) => format!(
             "{} opcode=0x{:02x} channel_map={} channels={} instant={}",
             control.opcode_name(),
             control.opcode,
             print_hex(&update.channel_map.bytes()),
             update.channel_map.used_count(),
             update.instant
-        ));
-    }
-    Ok(format!(
-        "{} opcode=0x{:02x} parameter_octets={}",
-        control.opcode_name(),
-        control.opcode,
-        control.parameters.len()
-    ))
+        ),
+        DecodedControlPdu::TerminateInd(value) | DecodedControlPdu::RejectInd(value) => format!(
+            "{} opcode=0x{:02x} error_code=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.error_code
+        ),
+        DecodedControlPdu::EncryptionRequest(value) => format!(
+            "{} opcode=0x{:02x} rand={} ediv=0x{:04x} skd_c={} iv_c={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&value.random_number),
+            value.encrypted_diversifier,
+            print_hex(&value.central_session_key_diversifier),
+            print_hex(&value.central_initialization_vector)
+        ),
+        DecodedControlPdu::EncryptionResponse(value) => format!(
+            "{} opcode=0x{:02x} skd_p={} iv_p={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&value.peripheral_session_key_diversifier),
+            print_hex(&value.peripheral_initialization_vector)
+        ),
+        DecodedControlPdu::StartEncryptionRequest
+        | DecodedControlPdu::StartEncryptionResponse
+        | DecodedControlPdu::PauseEncryptionRequest
+        | DecodedControlPdu::PauseEncryptionResponse
+        | DecodedControlPdu::PingRequest
+        | DecodedControlPdu::PingResponse
+        | DecodedControlPdu::CteResponse => {
+            format!("{} opcode=0x{:02x}", control.opcode_name(), control.opcode)
+        }
+        DecodedControlPdu::UnknownResponse(value) => format!(
+            "{} opcode=0x{:02x} unknown_type=0x{:02x} unknown_name={}",
+            control.opcode_name(),
+            control.opcode,
+            value.unknown_type,
+            ControlPdu {
+                opcode: value.unknown_type,
+                parameters: &[]
+            }
+            .opcode_name()
+        ),
+        DecodedControlPdu::FeatureRequest(value)
+        | DecodedControlPdu::FeatureResponse(value)
+        | DecodedControlPdu::PeripheralFeatureRequest(value) => format!(
+            "{} opcode=0x{:02x} features={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&value.bytes)
+        ),
+        DecodedControlPdu::VersionInd(value) => format!(
+            "{} opcode=0x{:02x} version=0x{:02x} company=0x{:04x} subversion=0x{:04x}",
+            control.opcode_name(),
+            control.opcode,
+            value.version,
+            value.company_identifier,
+            value.subversion
+        ),
+        DecodedControlPdu::ConnectionParameterRequest(value)
+        | DecodedControlPdu::ConnectionParameterResponse(value) => format!(
+            "{} opcode=0x{:02x} interval_min={} interval_max={} latency={} timeout={} preferred_periodicity={} reference_event={} offsets={:04x},{:04x},{:04x},{:04x},{:04x},{:04x}",
+            control.opcode_name(),
+            control.opcode,
+            value.interval_min,
+            value.interval_max,
+            value.latency,
+            value.supervision_timeout,
+            value.preferred_periodicity,
+            value.reference_connection_event_count,
+            value.offsets[0],
+            value.offsets[1],
+            value.offsets[2],
+            value.offsets[3],
+            value.offsets[4],
+            value.offsets[5]
+        ),
+        DecodedControlPdu::RejectExtendedInd(value) => format!(
+            "{} opcode=0x{:02x} rejected_opcode=0x{:02x} rejected_name={} error_code=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.rejected_opcode,
+            ControlPdu {
+                opcode: value.rejected_opcode,
+                parameters: &[]
+            }
+            .opcode_name(),
+            value.error_code
+        ),
+        DecodedControlPdu::LengthRequest(value) | DecodedControlPdu::LengthResponse(value) => {
+            format!(
+                "{} opcode=0x{:02x} max_rx_octets={} max_rx_time_us={} max_tx_octets={} max_tx_time_us={}",
+                control.opcode_name(),
+                control.opcode,
+                value.maximum_receive_octets,
+                value.maximum_receive_time_us,
+                value.maximum_transmit_octets,
+                value.maximum_transmit_time_us
+            )
+        }
+        DecodedControlPdu::PhyRequest(value) | DecodedControlPdu::PhyResponse(value) => format!(
+            "{} opcode=0x{:02x} tx_phys=0x{:02x} rx_phys=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.transmit_phys,
+            value.receive_phys
+        ),
+        DecodedControlPdu::PhyUpdateInd(value) => format!(
+            "{} opcode=0x{:02x} central_to_peripheral_phy=0x{:02x} peripheral_to_central_phy=0x{:02x} instant={}",
+            control.opcode_name(),
+            control.opcode,
+            value.central_to_peripheral_phy,
+            value.peripheral_to_central_phy,
+            value.instant
+        ),
+        DecodedControlPdu::MinimumUsedChannelsInd(value) => format!(
+            "{} opcode=0x{:02x} phys=0x{:02x} minimum_used_channels={}",
+            control.opcode_name(),
+            control.opcode,
+            value.phys,
+            value.minimum_used_channels
+        ),
+        DecodedControlPdu::CteRequest(value) => format!(
+            "{} opcode=0x{:02x} minimum_cte_length={} minimum_cte_us={} cte_type={} cte_type_name={}",
+            control.opcode_name(),
+            control.opcode,
+            value.minimum_length_units,
+            value.minimum_duration_us(),
+            value.cte_type,
+            value.cte_type_name()
+        ),
+        DecodedControlPdu::PeriodicSyncInd(value) => format!(
+            "{} opcode=0x{:02x} id=0x{:04x} sync_offset_us={} interval={} channel_map={} access_address={:08x} crc_init={:06x} periodic_event={} connection_event={} last_periodic_event={} sid={} address_type={} sender_sca={} phy=0x{:02x} advertiser={} sync_connection_event={}",
+            control.opcode_name(),
+            control.opcode,
+            value.identifier,
+            value.sync_info.packet_window_offset_us(),
+            value.sync_info.interval,
+            print_hex(&value.sync_info.channel_map.bytes()),
+            value.sync_info.access_address,
+            value.sync_info.crc_init,
+            value.sync_info.periodic_event_counter,
+            value.connection_event_count,
+            value.last_periodic_event_counter,
+            value.advertising_sid,
+            if value.advertiser_address_random {
+                "random"
+            } else {
+                "public"
+            },
+            value.sender_sleep_clock_accuracy.raw(),
+            value.phy,
+            print_hex(&value.advertiser_address),
+            value.sync_connection_event_count
+        ),
+        DecodedControlPdu::ClockAccuracyRequest(value)
+        | DecodedControlPdu::ClockAccuracyResponse(value) => format!(
+            "{} opcode=0x{:02x} sca={} maximum_ppm={}",
+            control.opcode_name(),
+            control.opcode,
+            value.raw(),
+            value.maximum_ppm()
+        ),
+        DecodedControlPdu::CisRequest(value) => format!(
+            "{} opcode=0x{:02x} cig={} cis={} central_phy=0x{:02x} peripheral_phy=0x{:02x} central_max_sdu={} peripheral_max_sdu={} framed={} framing_mode={} central_sdu_interval_us={} peripheral_sdu_interval_us={} central_max_pdu={} peripheral_max_pdu={} nse={} sub_interval_us={} central_bn={} peripheral_bn={} central_ft={} peripheral_ft={} iso_interval={} offset_min_us={} offset_max_us={} connection_event={}",
+            control.opcode_name(),
+            control.opcode,
+            value.cig_identifier,
+            value.cis_identifier,
+            value.central_to_peripheral_phy,
+            value.peripheral_to_central_phy,
+            value.maximum_central_sdu,
+            value.maximum_peripheral_sdu,
+            value.framed,
+            if value.framing_mode_unsegmented {
+                "unsegmented"
+            } else {
+                "segmentable"
+            },
+            value.central_sdu_interval_us,
+            value.peripheral_sdu_interval_us,
+            value.maximum_central_pdu,
+            value.maximum_peripheral_pdu,
+            value.subevents,
+            value.subevent_interval_us,
+            value.central_burst_number,
+            value.peripheral_burst_number,
+            value.central_flush_timeout,
+            value.peripheral_flush_timeout,
+            value.iso_interval,
+            value.cis_offset_min_us,
+            value.cis_offset_max_us,
+            value.connection_event_count
+        ),
+        DecodedControlPdu::CisResponse(value) => format!(
+            "{} opcode=0x{:02x} offset_min_us={} offset_max_us={} connection_event={}",
+            control.opcode_name(),
+            control.opcode,
+            value.cis_offset_min_us,
+            value.cis_offset_max_us,
+            value.connection_event_count
+        ),
+        DecodedControlPdu::CisInd(value) => format!(
+            "{} opcode=0x{:02x} access_address={:08x} cis_offset_us={} cig_sync_delay_us={} cis_sync_delay_us={} connection_event={}",
+            control.opcode_name(),
+            control.opcode,
+            value.access_address,
+            value.cis_offset_us,
+            value.cig_sync_delay_us,
+            value.cis_sync_delay_us,
+            value.connection_event_count
+        ),
+        DecodedControlPdu::CisTerminateInd(value) => format!(
+            "{} opcode=0x{:02x} cig={} cis={} error_code=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.cig_identifier,
+            value.cis_identifier,
+            value.error_code
+        ),
+        DecodedControlPdu::PowerControlRequest(value) => format!(
+            "{} opcode=0x{:02x} phy=0x{:02x} delta_db={} tx_power_dbm={}",
+            control.opcode_name(),
+            control.opcode,
+            value.phy,
+            value.delta_db,
+            value.transmit_power_dbm
+        ),
+        DecodedControlPdu::PowerControlResponse(value) => format!(
+            "{} opcode=0x{:02x} minimum={} maximum={} delta_db={} tx_power_dbm={} acceptable_reduction_db={}",
+            control.opcode_name(),
+            control.opcode,
+            value.at_minimum,
+            value.at_maximum,
+            value.delta_db,
+            value.transmit_power_dbm,
+            value.acceptable_power_reduction_db
+        ),
+        DecodedControlPdu::PowerChangeInd(value) => format!(
+            "{} opcode=0x{:02x} phys=0x{:02x} minimum={} maximum={} delta_db={} tx_power_dbm={}",
+            control.opcode_name(),
+            control.opcode,
+            value.phys,
+            value.at_minimum,
+            value.at_maximum,
+            value.delta_db,
+            value.transmit_power_dbm
+        ),
+        DecodedControlPdu::SubrateRequest(value) => format!(
+            "{} opcode=0x{:02x} factor_min={} factor_max={} maximum_latency={} continuation_number={} timeout={}",
+            control.opcode_name(),
+            control.opcode,
+            value.factor_min,
+            value.factor_max,
+            value.maximum_latency,
+            value.continuation_number,
+            value.supervision_timeout
+        ),
+        DecodedControlPdu::SubrateInd(value) => format!(
+            "{} opcode=0x{:02x} factor={} base_event={} latency={} continuation_number={} timeout={}",
+            control.opcode_name(),
+            control.opcode,
+            value.factor,
+            value.base_event,
+            value.latency,
+            value.continuation_number,
+            value.supervision_timeout
+        ),
+        DecodedControlPdu::ChannelReportingInd(value) => format!(
+            "{} opcode=0x{:02x} enabled={} minimum_spacing={} maximum_delay={}",
+            control.opcode_name(),
+            control.opcode,
+            value.enabled,
+            value.minimum_spacing,
+            value.maximum_delay
+        ),
+        DecodedControlPdu::ChannelStatusInd(value) => {
+            let good = value
+                .classifications
+                .iter()
+                .filter(|classification| **classification == ChannelClassification::Good)
+                .count();
+            let bad = value
+                .classifications
+                .iter()
+                .filter(|classification| **classification == ChannelClassification::Bad)
+                .count();
+            format!(
+                "{} opcode=0x{:02x} good_channels={} bad_channels={} unknown_channels={}",
+                control.opcode_name(),
+                control.opcode,
+                good,
+                bad,
+                value.classifications.len() - good - bad
+            )
+        }
+        DecodedControlPdu::PeriodicSyncWrInd(value) => format!(
+            "{} opcode=0x{:02x} id=0x{:04x} sync_offset_us={} interval={} channel_map={} periodic_access_address={:08x} response_access_address={:08x} subevents={} subevent_interval={} response_slot_delay={} response_slot_spacing={}",
+            control.opcode_name(),
+            control.opcode,
+            value.periodic_sync.identifier,
+            value.periodic_sync.sync_info.packet_window_offset_us(),
+            value.periodic_sync.sync_info.interval,
+            print_hex(&value.periodic_sync.sync_info.channel_map.bytes()),
+            value.periodic_sync.sync_info.access_address,
+            value.response_access_address,
+            value.subevent_count,
+            value.subevent_interval,
+            value.response_slot_delay,
+            value.response_slot_spacing
+        ),
+        DecodedControlPdu::FeatureExtendedRequest(value)
+        | DecodedControlPdu::FeatureExtendedResponse(value) => format!(
+            "{} opcode=0x{:02x} maximum_page={} page={} features={}",
+            control.opcode_name(),
+            control.opcode,
+            value.maximum_page,
+            value.page_number,
+            print_hex(&value.feature_page)
+        ),
+        DecodedControlPdu::Raw { parameters, .. } => format!(
+            "{} opcode=0x{:02x} raw_parameters={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(parameters)
+        ),
+    })
 }
 
-fn describe_data_pdu(packet: &DataChannelPdu) -> String {
+fn describe_data_pdu(packet: &DataChannelPdu) -> Result<String> {
     match packet.llid() {
-        LogicalLinkId::StartOrComplete => packet
-            .l2cap_start()
-            .map(|start| match start {
-                Some(start) => format!(
-                    "L2CAP length={} cid=0x{:04x} fragment_octets={}",
-                    start.payload_length,
-                    start.channel_id,
-                    start.fragment.len()
-                ),
-                None => unreachable!(),
-            })
-            .unwrap_or_else(|error| format!("decode_error={error}")),
-        LogicalLinkId::Control => packet
-            .control()
-            .map(|control| match control {
-                Some(control) => describe_control_pdu(control)
-                    .unwrap_or_else(|error| format!("decode_error={error}")),
-                None => unreachable!(),
-            })
-            .unwrap_or_else(|error| format!("decode_error={error}")),
-        LogicalLinkId::ContinuationOrEmpty if packet.payload.is_empty() => "empty".to_owned(),
-        LogicalLinkId::ContinuationOrEmpty => {
-            format!("L2CAP continuation_octets={}", packet.payload.len())
+        LogicalLinkId::StartOrComplete => {
+            let start = packet
+                .l2cap_start()?
+                .expect("LLID checked before L2CAP start decode");
+            Ok(format!(
+                "L2CAP length={} cid=0x{:04x} fragment_octets={}",
+                start.payload_length,
+                start.channel_id,
+                start.fragment.len()
+            ))
         }
-        LogicalLinkId::Reserved => {
-            format!("reserved_llid payload_octets={}", packet.payload.len())
-        }
+        LogicalLinkId::Control => describe_control_pdu(
+            packet
+                .control()?
+                .expect("LLID checked before LL control decode"),
+        ),
+        LogicalLinkId::ContinuationOrEmpty if packet.payload.is_empty() => Ok("empty".to_owned()),
+        LogicalLinkId::ContinuationOrEmpty => Ok(format!(
+            "L2CAP continuation_octets={}",
+            packet.payload.len()
+        )),
+        LogicalLinkId::Reserved => Ok(format!(
+            "reserved_llid payload_octets={}",
+            packet.payload.len()
+        )),
     }
 }
 
-fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) {
+fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) -> Result<()> {
     let cte = data
         .constant_tone_extension_info()
         .map(|info| {
@@ -865,6 +1181,11 @@ fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) {
             )
         })
         .unwrap_or_else(|| "none".to_owned());
+    let description = describe_data_pdu(data);
+    let plaintext_hint = match &description {
+        Ok(description) => description.clone(),
+        Err(error) => format!("decode_error={error}"),
+    };
     println!(
         "channel={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} llid={} nesn={} sn={} md={} cp={} cte={} rfu={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} plaintext_hint=\"{}\"",
         data.channel.index(),
@@ -885,8 +1206,9 @@ fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) {
         print_hex(&data.header),
         print_hex(&data.payload),
         print_hex(&data.crc),
-        describe_data_pdu(data).replace('"', "'"),
+        plaintext_hint.replace('"', "'"),
     );
+    description.map(|_| ())
 }
 
 fn describe_incomplete_l2cap(incomplete: IncompleteL2capPdu) -> String {
@@ -1348,6 +1670,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     let mut l2cap_signaling_error_count = 0usize;
     let mut att_error_count = 0usize;
     let mut smp_error_count = 0usize;
+    let mut ll_control_error_count = 0usize;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -1373,7 +1696,18 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
         }
         for packet in &batch.packets {
             let data = DataChannelPdu::from(packet.pdu.clone());
-            print_data_packet(packet, &data);
+            if let Err(error) = print_data_packet(packet, &data)
+                && data.llid() == LogicalLinkId::Control
+            {
+                ll_control_error_count += 1;
+                eprintln!(
+                    "LL control PDU decode error: opcode={} error={error}",
+                    data.payload
+                        .first()
+                        .map(|opcode| format!("0x{opcode:02x}"))
+                        .unwrap_or_else(|| "missing".to_owned())
+                );
+            }
             if let Some((direction, reassembler)) = &mut l2cap_reassembler {
                 match reassembler.push(*direction, &data) {
                     Ok(update) => {
@@ -1514,7 +1848,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
         writer.into_inner().flush()?;
     }
     eprintln!(
-        "decoded {packet_count} CRC-valid data-channel packet(s) from {sample_count} sample(s)"
+        "decoded {packet_count} CRC-valid data-channel packet(s) from {sample_count} sample(s); ll_control_errors={ll_control_error_count}"
     );
     if l2cap_reassembler.is_some() {
         eprintln!(

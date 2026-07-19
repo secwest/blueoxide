@@ -22,8 +22,9 @@ The repository now contains a dependency-free, buildable receive core with:
   deviation estimates, and discontinuity reset/reporting.
 - Typed decoding for legacy advertising, scan, direct, and connection-request
   PDUs, including AD structures and validated CONNECT_IND timing/channel data.
-- Data-channel header, CTEInfo, L2CAP-start, and LL control-PDU decoding while
-  retaining unrecognized payload and MIC bytes losslessly.
+- Data-channel header, CTEInfo, and L2CAP-start decoding plus strict, lossless
+  LL control-PDU syntax through Feature Page Exchange, with every Core 6.1
+  opcode named and newer procedure payloads retained raw.
 - Bounded, direction-explicit plaintext L2CAP PDU reassembly with independent
   central/peripheral state, exact retransmission suppression, malformed-length
   rejection, and discontinuity reset.
@@ -131,6 +132,26 @@ payload. The payload field remains lossless and can include an encrypted MIC
 because decryption state is not yet tracked. Printed L2CAP and LL control
 interpretations are explicitly plaintext hints; encrypted payloads remain
 available as raw bytes but cannot yet be interpreted reliably.
+
+LLID `0b11` packets receive strict typed LL control decoding without requiring
+L2CAP reassembly. Blueoxide validates exact parameter sizes for every opcode
+from `LL_CONNECTION_UPDATE_IND` (`0x00`) through `LL_FEATURE_EXT_RSP`
+(`0x2c`), including encryption setup, feature/version exchange, connection
+parameters, data length and PHY updates, CTE requests, periodic synchronization,
+CIS establishment, power control, connection subrating, channel classification,
+PAwR synchronization transfer, and 24-octet feature pages. It also checks Core
+field ranges, reserved bits, PHY masks, offset ordering, data-length limits,
+SyncInfo structure, Core 6.1 CIS Framing_Mode packing, subrate relationships,
+and channel classifications.
+
+The Core 6.1 opcode names through `LL_FRAME_SPACE_RSP` (`0x3c`) are recognized.
+Channel Sounding and Frame Space payloads (`0x2d` through `0x3c`) remain named,
+lossless raw parameters pending their dedicated typed layer. A malformed known
+PDU remains visible in the complete packet line and increments
+`ll_control_errors`. Encryption control output can contain Rand, EDIV, session
+key diversifier, and initialization-vector material and must be handled as
+sensitive capture data. The parser does not enforce procedure order, role,
+instant timing relative to the observed event, or encryption state.
 
 For a recording that is already known to contain a complete, ordered plaintext
 stream from one link direction, opt into L2CAP PDU reassembly:

@@ -473,3 +473,80 @@ fn cli_decodes_plaintext_smp_without_hiding_raw_pdus() {
         "reassembled 2 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0 signaling_errors=0 att_errors=0 smp_errors=1"
     ));
 }
+
+#[test]
+fn cli_decodes_ll_control_pdus_without_hiding_malformed_packets() {
+    let channel = BleChannel::new(12).expect("valid channel");
+    let access_address = 0x1234_5678u32;
+    let crc_init = 0x00ab_cdef;
+    let mut phase = 0.0f32;
+    let mut samples = vec![(1.0f32, 0.0f32); 11];
+    let length_request = [0x14, 251, 0, 0x48, 0x08, 27, 0, 0x48, 0x08];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x03, length_request.len() as u8],
+        &length_request,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    let malformed_cte_request = [0x1a, 0x8a, 0xff];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x0b, malformed_cte_request.len() as u8],
+        &malformed_cte_request,
+    );
+
+    let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
+    for (i, q) in samples {
+        iq_bytes.extend_from_slice(&i.to_le_bytes());
+        iq_bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    let iq_path = temporary_path("ll-control.cf32");
+    fs::write(&iq_path, iq_bytes).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "71",
+            "--aa-errors",
+            "0",
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains("payload=14fb0048081b004808"));
+    assert!(stdout.contains(
+        "plaintext_hint=\"LL_LENGTH_REQ opcode=0x14 max_rx_octets=251 max_rx_time_us=2120 max_tx_octets=27 max_tx_time_us=2120\""
+    ));
+    assert!(stdout.contains("payload=1a8aff"));
+    assert!(stdout.contains("plaintext_hint=\"decode_error="));
+    assert!(stderr.contains("LL control PDU decode error: opcode=0x1a"));
+    assert!(stderr.contains("ll_control_errors=1"));
+}
