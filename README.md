@@ -27,6 +27,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Bounded, direction-explicit plaintext L2CAP PDU reassembly with independent
   central/peripheral state, exact retransmission suppression, malformed-length
   rejection, and discontinuity reset.
+- Strict, lossless ATT PDU decoding on fixed CID `0x0004`, covering every
+  assigned Core 6.1 opcode, fixed and variable record validation, raw unknown
+  opcode preservation, and non-suppressing semantic error reporting.
 - Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
   including CONNECT_IND ChSel selection and event-counter channel calculation.
 - Anchored connection-event tracking with wrap-safe instant handling, strict
@@ -157,6 +160,23 @@ credit, and Enhanced Credit Based commands receive typed `l2cap_signal`
 output. Unknown command codes retain their raw parameters. A malformed known
 command reports a signaling error after the complete raw `l2cap_pdu` line, so
 semantic decoding never suppresses reconstructed bytes.
+
+Completed plaintext PDUs on the fixed ATT channel CID `0x0004` receive a
+separate `att_pdu` description. The decoder covers requests, responses,
+commands, notifications, indications, and confirmations through the Core 6.1
+opcode set, including 16-bit and 128-bit UUID forms, fixed-record discovery
+responses, queued writes, signed writes, variable-length multiple reads, and
+multiple-handle notifications. It validates exact fixed sizes, nonzero handles,
+ordered ranges, record divisibility, complete tuple headers, and the permitted
+final-value truncation in a Read Multiple Variable Length Response. Unknown
+opcodes retain all parameter bytes. A malformed known PDU increments
+`att_errors` only after the complete raw `l2cap_pdu` has been printed.
+
+This layer is stateless ATT syntax. It does not infer attribute types, rebuild a
+GATT database, track negotiated MTUs, verify signed-write authentication, or
+identify Enhanced ATT on dynamically allocated L2CAP channels. EATT decoding
+requires credit-based channel state and its assigned PSM, so dynamic CIDs are
+not guessed from payload bytes.
 
 An ordinary recording centered on one data channel is generally incomplete for
 a hopping connection because packets transmitted on other channels are absent.
@@ -336,9 +356,9 @@ plaintext L2CAP PDU reassembly are now present; the next receive stages are
 wideband channelization or timed retuning, automatic capture-driven observation
 delivery, and live BLE connection following. Full packet decode is a project
 requirement: extended advertising, complete LL control semantics, L2CAP
-signaling, ATT/GATT, SMP, encryption, LE 2M/Coded PHY, and Bluetooth Classic
-BR/EDR layers will be added incrementally while retaining undecoded packet
-bytes losslessly.
+channel state, stateful GATT reconstruction, SMP, encryption, LE 2M/Coded PHY,
+and Bluetooth Classic BR/EDR layers will be added incrementally while retaining
+undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

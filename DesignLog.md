@@ -736,3 +736,53 @@ direction-explicit plaintext L2CAP reassembly and a complete CID `0x0005` PDU
 has been reconstructed. It prints the lossless `l2cap_pdu` first, then a
 separate `l2cap_signal` line. Envelope or known-command errors are counted and
 reported independently; they cannot remove packet or PDU output.
+
+## 2026-07-17: Decode ATT syntax without inventing GATT or EATT state
+
+### Fixed-channel boundary
+
+The fixed ATT bearer uses L2CAP CID `0x0004`. `AttPdu` borrows the opcode and
+all remaining parameter bytes from a completed `L2capPdu`; unknown opcodes
+remain explicit raw variants. ATT interpretation occurs only after the caller
+has opted into direction-explicit plaintext reassembly. Encrypted bytes are not
+probed for plausible opcodes.
+
+Enhanced ATT uses dynamically allocated LE credit-based channels. Recognizing
+those channels requires connection state that associates an established CID
+with the EATT PSM. Payload shape alone is insufficient, so `att_pdu()` only
+recognizes fixed CID `0x0004` and does not guess EATT.
+
+### Strict syntax and truncation
+
+Every assigned Core 6.1 ATT opcode has a typed layout. Exact-size PDUs reject
+both truncation and trailing bytes. Variable layouts enforce nonzero handles,
+ordered handle ranges, 2- or 16-octet UUIDs, complete fixed records, at least
+two handles for both multiple-read requests, valid Execute Write flags, and a
+complete 12-octet signed-write authentication signature.
+
+Two superficially similar tuple lists require different handling. A Multiple
+Handle Value Notification contains two or more complete handle/length/value
+tuples and may not truncate a tuple. A Read Multiple Variable Length Response
+may truncate only the final tuple's value; if the MTU boundary would split its
+two-octet Value Length, the entire tuple is omitted. The typed value therefore
+retains both the declared length and the bytes actually present, with an
+explicit truncation flag.
+
+Exchange MTU fields are 16-bit receive capacities. Core 6.1 requires values of
+at least the default ATT MTU of 23 but does not impose 517 as a syntax maximum.
+The often-used value 517 follows from a 512-octet GATT attribute plus ATT
+overhead; it is not the maximum encodable receive MTU. The stateless parser
+accepts all values from 23 through `0xffff` and does not enforce a previously
+negotiated bearer MTU.
+
+### Output and state limits
+
+`decode-data` prints a complete raw `l2cap_pdu` before attempting ATT decode,
+then emits a separate `att_pdu` line with opcode name, method type, and typed
+fields. Empty fixed-channel payloads and malformed known PDUs increment a
+separate ATT error counter without suppressing bytes.
+
+This increment does not perform GATT service discovery, infer characteristic
+semantics, maintain request/response transactions, track negotiated MTU, or
+verify signed-write authentication. Those require state above the lossless ATT
+syntax layer established here.

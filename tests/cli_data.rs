@@ -46,12 +46,12 @@ fn cli_decodes_data_channel_l2cap_and_writes_pcapng() {
     let payload = [
         5, 0, // L2CAP payload length
         4, 0, // ATT fixed channel
-        0x0a, 1, 0, 2, 0, // ATT Read Request fragment
+        0x0c, 1, 0, 2, 0, // ATT Read Blob Request
     ];
     let cte_info = 0x85;
     let mut pdu = vec![0x3e, payload.len() as u8, cte_info];
     pdu.extend_from_slice(&payload);
-    pdu.extend_from_slice(&[0x42, 0x18, 0x93]);
+    pdu.extend_from_slice(&[0xd4, 0x82, 0xc9]);
     let expected_packet = [access_address.to_le_bytes().as_slice(), pdu.as_slice()].concat();
 
     let mut body = bytes_to_bits_lsb(&pdu);
@@ -208,7 +208,7 @@ fn cli_reassembles_asserted_plaintext_l2cap_fragments() {
         access_address,
         crc_init,
         [0x02, 6],
-        &[5, 0, 4, 0, 0x0a, 1],
+        &[5, 0, 4, 0, 0x0c, 1],
     );
     samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
     append_packet_samples(
@@ -219,6 +219,16 @@ fn cli_reassembles_asserted_plaintext_l2cap_fragments() {
         crc_init,
         [0x09, 3],
         &[0, 2, 0],
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x02, 9],
+        &[5, 0, 4, 0, 0x0a, 1, 0, 2, 0],
     );
     let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
     for (i, q) in samples {
@@ -264,11 +274,18 @@ fn cli_reassembles_asserted_plaintext_l2cap_fragments() {
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stdout.contains(
-        "l2cap_pdu direction=central-to-peripheral cid=0x0004 length=5 fragments=2 payload=0a01000200"
+        "l2cap_pdu direction=central-to-peripheral cid=0x0004 length=5 fragments=2 payload=0c01000200"
     ));
-    assert!(stderr.contains("decoded 2 CRC-valid data-channel packet(s)"));
+    assert!(stdout.contains(
+        "att_pdu direction=central-to-peripheral opcode=0x0c name=read-blob-request type=request handle=0x0001 offset=2"
+    ));
+    assert!(stdout.contains(
+        "l2cap_pdu direction=central-to-peripheral cid=0x0004 length=5 fragments=1 payload=0a01000200"
+    ));
+    assert!(stderr.contains("plaintext ATT PDU decode error: direction=central-to-peripheral"));
+    assert!(stderr.contains("decoded 3 CRC-valid data-channel packet(s)"));
     assert!(stderr.contains(
-        "reassembled 1 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0"
+        "reassembled 2 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0 signaling_errors=0 att_errors=1"
     ));
 }
 

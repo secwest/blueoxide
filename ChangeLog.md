@@ -67,6 +67,10 @@
   exact single-command envelopes, typed disconnection, connection-parameter,
   and credit-based command views, bounded Enhanced Credit Based channel lists,
   raw unknown-command preservation, and non-suppressing CLI error reporting.
+- Strict lossless ATT decoding for fixed CID `0x0004`, including every Core 6.1
+  opcode, typed request/response/command/notification/indication views, exact
+  and variable-record validation, legal final-value truncation, raw unknown
+  opcode preservation, and non-suppressing `att_pdu` CLI output.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
 - `blueoxide channels`, `blueoxide decode`, configurable
@@ -135,5 +139,5 @@
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
-  decryption, L2CAP signaling and upper-layer decoding, Bluetooth Classic, LE
-  2M, and LE Coded PHY remain to be implemented.
+  decryption, stateful L2CAP channels, GATT/EATT, SMP, Bluetooth Classic, LE 2M,
+  and LE Coded PHY remain to be implemented.

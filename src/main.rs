@@ -1,4 +1,5 @@
 use blueoxide::advertising::{ConnectRequest, FirstCentralTransmission, decode_advertising_pdu};
+use blueoxide::att::{AttPdu, AttUuid, DecodedAttPdu};
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
 use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
 use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
@@ -987,6 +988,171 @@ fn describe_l2cap_signaling(command: L2capSignalingCommand<'_>) -> Result<String
     Ok(format!("{prefix} {details}"))
 }
 
+fn describe_att_uuid(uuid: AttUuid) -> String {
+    match uuid {
+        AttUuid::Uuid16(uuid) => format!("0x{uuid:04x}"),
+        AttUuid::Uuid128(uuid) => print_hex(&uuid),
+    }
+}
+
+fn describe_att_pdu(pdu: AttPdu<'_>) -> Result<String> {
+    let prefix = format!(
+        "opcode=0x{:02x} name={} type={}",
+        pdu.opcode,
+        pdu.opcode_name(),
+        pdu.pdu_type()
+    );
+    let details = match pdu.decode()? {
+        DecodedAttPdu::ErrorResponse(response) => format!(
+            "request_opcode=0x{:02x} handle=0x{:04x} error=0x{:02x} error_name={}",
+            response.request_opcode,
+            response.handle,
+            response.error_code,
+            response.error_name()
+        ),
+        DecodedAttPdu::ExchangeMtuRequest(exchange)
+        | DecodedAttPdu::ExchangeMtuResponse(exchange) => {
+            format!("mtu={}", exchange.mtu)
+        }
+        DecodedAttPdu::FindInformationRequest(range) => format!(
+            "start_handle=0x{:04x} end_handle=0x{:04x}",
+            range.start_handle, range.end_handle
+        ),
+        DecodedAttPdu::FindInformationResponse(response) => {
+            let entries = response
+                .entries
+                .iter()
+                .map(|entry| format!("0x{:04x}:{}", entry.handle, describe_att_uuid(entry.uuid)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("uuid_width={} entries={entries}", response.uuid_width())
+        }
+        DecodedAttPdu::FindByTypeValueRequest(request) => format!(
+            "start_handle=0x{:04x} end_handle=0x{:04x} attribute_type=0x{:04x} value={}",
+            request.range.start_handle,
+            request.range.end_handle,
+            request.attribute_type,
+            print_hex(request.value)
+        ),
+        DecodedAttPdu::FindByTypeValueResponse(ranges) => {
+            let ranges = ranges
+                .iter()
+                .map(|range| format!("0x{:04x}-0x{:04x}", range.start_handle, range.end_handle))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("ranges={ranges}")
+        }
+        DecodedAttPdu::ReadByTypeRequest(request)
+        | DecodedAttPdu::ReadByGroupTypeRequest(request) => format!(
+            "start_handle=0x{:04x} end_handle=0x{:04x} attribute_type={}",
+            request.range.start_handle,
+            request.range.end_handle,
+            describe_att_uuid(request.attribute_type)
+        ),
+        DecodedAttPdu::ReadByTypeResponse(response) => {
+            let entries = response
+                .entries
+                .iter()
+                .map(|entry| format!("0x{:04x}:{}", entry.handle, print_hex(entry.value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("entry_length={} entries={entries}", response.entry_length)
+        }
+        DecodedAttPdu::ReadRequest(request) => {
+            format!("handle=0x{:04x}", request.handle)
+        }
+        DecodedAttPdu::ReadResponse(value)
+        | DecodedAttPdu::ReadBlobResponse(value)
+        | DecodedAttPdu::ReadMultipleResponse(value) => {
+            format!("value={}", print_hex(value))
+        }
+        DecodedAttPdu::ReadBlobRequest(request) => {
+            format!("handle=0x{:04x} offset={}", request.handle, request.offset)
+        }
+        DecodedAttPdu::ReadMultipleRequest(handles)
+        | DecodedAttPdu::ReadMultipleVariableRequest(handles) => {
+            let handles = handles
+                .iter()
+                .map(|handle| format!("0x{handle:04x}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("handles={handles}")
+        }
+        DecodedAttPdu::ReadByGroupTypeResponse(response) => {
+            let entries = response
+                .entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "0x{:04x}-0x{:04x}:{}",
+                        entry.range.start_handle,
+                        entry.range.end_handle,
+                        print_hex(entry.value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("entry_length={} entries={entries}", response.entry_length)
+        }
+        DecodedAttPdu::WriteRequest(write)
+        | DecodedAttPdu::HandleValueNotification(write)
+        | DecodedAttPdu::HandleValueIndication(write)
+        | DecodedAttPdu::WriteCommand(write) => {
+            format!(
+                "handle=0x{:04x} value={}",
+                write.handle,
+                print_hex(write.value)
+            )
+        }
+        DecodedAttPdu::WriteResponse
+        | DecodedAttPdu::ExecuteWriteResponse
+        | DecodedAttPdu::HandleValueConfirmation => "parameters=none".to_owned(),
+        DecodedAttPdu::PrepareWriteRequest(write) | DecodedAttPdu::PrepareWriteResponse(write) => {
+            format!(
+                "handle=0x{:04x} offset={} value={}",
+                write.handle,
+                write.offset,
+                print_hex(write.value)
+            )
+        }
+        DecodedAttPdu::ExecuteWriteRequest(flags) => format!("flags={flags}"),
+        DecodedAttPdu::ReadMultipleVariableResponse(list) => {
+            let values = list
+                .values
+                .iter()
+                .map(|value| {
+                    format!(
+                        "{}:{}:{}",
+                        value.declared_length,
+                        print_hex(value.value),
+                        value.truncated
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("values={values}")
+        }
+        DecodedAttPdu::MultipleHandleValueNotification(values) => {
+            let values = values
+                .iter()
+                .map(|value| format!("0x{:04x}:{}", value.handle, print_hex(value.value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("values={values}")
+        }
+        DecodedAttPdu::SignedWriteCommand(write) => format!(
+            "handle=0x{:04x} value={} signature={}",
+            write.handle,
+            print_hex(write.value),
+            print_hex(&write.signature)
+        ),
+        DecodedAttPdu::Unknown { parameters, .. } => {
+            format!("parameters={}", print_hex(parameters))
+        }
+    };
+    Ok(format!("{prefix} {details}"))
+}
+
 fn decode(args: DecodeArgs) -> Result<()> {
     if args.block_samples == 0 {
         return Err(Error::InvalidConfiguration(
@@ -1084,6 +1250,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     let mut l2cap_discarded_count = 0usize;
     let mut l2cap_error_count = 0usize;
     let mut l2cap_signaling_error_count = 0usize;
+    let mut att_error_count = 0usize;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -1166,6 +1333,29 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
                                         );
                                     }
                                 }
+                                match pdu.att_pdu() {
+                                    Ok(Some(att)) => match describe_att_pdu(att) {
+                                        Ok(description) => println!(
+                                            "att_pdu direction={} {description}",
+                                            pdu.direction
+                                        ),
+                                        Err(error) => {
+                                            att_error_count += 1;
+                                            eprintln!(
+                                                "plaintext ATT PDU decode error: direction={} error={error}",
+                                                pdu.direction
+                                            );
+                                        }
+                                    },
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        att_error_count += 1;
+                                        eprintln!(
+                                            "plaintext ATT PDU envelope decode error: direction={} error={error}",
+                                            pdu.direction
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1208,7 +1398,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     );
     if l2cap_reassembler.is_some() {
         eprintln!(
-            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count}"
+            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count} att_errors={att_error_count}"
         );
     }
     Ok(())

@@ -5,6 +5,7 @@
 //! core remains testable without attached hardware.
 
 pub mod advertising;
+pub mod att;
 pub mod backends;
 pub mod ble;
 pub mod capture;

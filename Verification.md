@@ -165,7 +165,7 @@ are:
 | --- | --- | --- |
 | `220385112233` | `abcdef` | `27e2cf` |
 | `210042` | `123456` | `7fd46c` |
-| `3e0985050004000a01000200` | `abcdef` | `421893` |
+| `3e0985050004000c01000200` | `abcdef` | `d482c9` |
 
 These vectors prove that Blueoxide includes CTEInfo in CRC coverage while
 excluding it from the Length-counted payload. The final vector also passes
@@ -311,12 +311,12 @@ binds zero-length LLID 1 to its empty-PDU type. Its parser independently reports
 the fixed fragments as:
 
 ```text
-0206050004000a01 -> LLID=2 len=6 L2CAP length=5 cid=4 payload=0a01
+0206050004000c01 -> LLID=2 len=6 L2CAP length=5 cid=4 payload=0c01
 0903000200       -> LLID=1 len=3 continuation=000200
 0100             -> LLID=1 len=0 empty
 ```
 
-The resulting Blueoxide PDU is CID `0x0004`, payload `0a01000200`, and two
+The resulting Blueoxide PDU is CID `0x0004`, payload `0c01000200`, and two
 link-layer fragments. Tests additionally cover complete one-fragment PDUs,
 independent bidirectional state, exact duplicate suppression, replacement
 starts, orphaned continuations, explicit gap reset, malformed public PDU
@@ -393,6 +393,94 @@ Final local gate for this increment:
 
 ```text
 112 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+4 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
+## ATT PDU verification
+
+Normative reference:
+
+- Bluetooth Core Specification 6.1, Vol 3, Part F, Sections 3.2.8 and
+  3.4.1 through 3.4.8.
+
+The Core tables establish fixed CID `0x0004` ATT framing, all currently assigned
+opcodes, exact fixed fields, 2- or 16-octet UUID requests, and fixed-record
+response layouts. The MTU exchange fields are unsigned 16-bit receive sizes
+whose only value constraint is a minimum of the default ATT MTU, 23. The Core
+also distinguishes the two variable tuple rules: Read Multiple Variable Length
+Response may truncate only its final value, while Multiple Handle Value
+Notification requires two or more complete tuples.
+
+Primary implementation reference:
+
+- Project: Zephyr
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/host/att_internal.h`
+  - `subsys/bluetooth/host/att.c`
+  - `include/zephyr/bluetooth/att.h`
+
+Zephyr's packed ATT structures independently confirm every field order and
+assigned opcode through `ATT_MULTIPLE_HANDLE_VALUE_NTF` and
+`ATT_SIGNED_WRITE_CMD`. Its receive handlers require an opcode before
+dispatch, reject invalid handle ranges, accept only 16- or 128-bit UUID request
+forms, require at least two handles in multiple-read requests, and use the same
+12-octet signed-write suffix. Blueoxide is intentionally stricter at the
+capture syntax boundary where the Core requires complete fixed records.
+
+Independent byte-layout reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth.py`
+
+Using that source tree directly through `PYTHONPATH`, Scapy serialized each
+common ATT class, wrapped it in `L2CAP_Hdr(cid=4)`, reparsed it through the CID
+binding, and reproduced these ATT bytes:
+
+```text
+024000
+040100ffff
+060100ffff00280f18
+080100ffff0328
+0c01000200
+0e010002000300
+120300aabb
+1604000200cc
+1801
+1b0500aabb
+52060011
+```
+
+These are Exchange MTU, Find Information, Find By Type Value, Read By Type,
+Read Blob, Read Multiple, Write, Prepare Write, Execute Write, Handle Value
+Notification, and Write Command PDUs. Scapy does not model all newer ATT
+opcodes, so the Core and Zephyr checks cover Read Multiple Variable Length,
+Multiple Handle Value Notification, confirmation, and signed write.
+
+Blueoxide tests cover fixed-channel selection, empty and unknown PDUs, every
+assigned opcode family, both UUID widths, fixed-record divisibility, zero
+handles, reversed ranges, exact fixed sizes, invalid Execute Write flags,
+multiple-read handle counts, complete and final-value-truncated variable-read
+responses, two-or-more complete multiple-notification tuples, signed-write
+suffixes, and bounded arbitrary inputs. The CLI fixture reconstructs a valid
+fragmented Read Blob Request and then a malformed known Read Request, proving
+that both raw L2CAP payloads remain visible while only the malformed PDU
+increments `att_errors`.
+
+Final local gate for this increment:
+
+```text
+122 library tests
 4 connection planning/acquisition/synchronization CLI integration tests
 4 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test
@@ -620,5 +708,6 @@ cargo doc --no-deps
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
-- Differential tests for extended advertising, data-channel following, L2CAP,
-  ATT/GATT, SMP, LE Coded PHY, and Bluetooth Classic as those layers are added.
+- Differential tests for extended advertising, data-channel following,
+  stateful GATT, EATT, SMP, LE Coded PHY, and Bluetooth Classic as those layers
+  are added.
