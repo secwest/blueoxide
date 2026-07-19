@@ -71,6 +71,10 @@
   opcode, typed request/response/command/notification/indication views, exact
   and variable-record validation, legal final-value truncation, raw unknown
   opcode preservation, and non-suppressing `att_pdu` CLI output.
+- Strict lossless LE Security Manager Protocol decoding for fixed CID `0x0006`,
+  including all Core 6.1 pairing and key-distribution commands, exact
+  cryptographic layouts, pairing-feature and identity-address validation,
+  future-command preservation, and non-suppressing `smp_pdu` CLI output.
 - Dependency-free PCAPNG output with nanosecond timestamps and
   `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`.
 - `blueoxide channels`, `blueoxide decode`, configurable
@@ -139,5 +143,5 @@
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
-  decryption, stateful L2CAP channels, GATT/EATT, SMP, Bluetooth Classic, LE 2M,
-  and LE Coded PHY remain to be implemented.
+  decryption, stateful L2CAP channels, GATT/EATT and pairing state, Bluetooth
+  Classic, LE 2M, and LE Coded PHY remain to be implemented.

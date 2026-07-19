@@ -786,3 +786,50 @@ This increment does not perform GATT service discovery, infer characteristic
 semantics, maintain request/response transactions, track negotiated MTU, or
 verify signed-write authentication. Those require state above the lossless ATT
 syntax layer established here.
+
+## 2026-07-19: Decode LE SMP commands without claiming pairing state
+
+### Transport boundary
+
+LE carries the Security Manager Protocol on fixed L2CAP CID `0x0006`.
+`SmpPdu` borrows the one-octet command code and all remaining parameters from a
+completed plaintext `L2capPdu`. Reserved future command codes remain raw
+variants. The separate BR/EDR Security Manager channel is not inferred or
+decoded by this fixed-LE helper.
+
+As with ATT, interpretation occurs only after direction-explicit plaintext
+reassembly. SMP payloads may become encrypted after pairing starts, and the
+decoder does not probe ciphertext for plausible command codes.
+
+### Syntax validation
+
+All 14 commands assigned through Core 6.1 have exact typed layouts. Pairing
+Request and Response validate IO Capability, OOB presence, the two-bit bonding
+field, reserved AuthReq bits, the 7-through-16-octet key-size range, and
+four-bit key-distribution masks. Pairing fields allow CT2 in AuthReq; Security
+Request uses the same security flags but reserves CT2.
+
+Fixed cryptographic fields retain their exact byte order and widths: 128-bit
+confirm/random/key/check values, 16-bit EDIV plus 64-bit Rand, and 256-bit X and
+Y public-key coordinates. Identity Address Information accepts only public or
+static-random address types and verifies the static-random marker and
+nondegenerate random portion.
+
+Core 6.1 extends Pairing Failed reasons beyond older parser tables with `0x0f`
+Key Rejected and `0x10` Busy. Both are named. Other reserved reasons and
+keypress values are rejected, while an entirely unknown command code remains
+lossless for forward compatibility.
+
+### Deliberate state boundary
+
+The syntax layer does not decide whether a command is legal for the observed
+role or pairing phase. It does not correlate request/response feature masks,
+enforce key-distribution order, run the 30-second Security Manager timer,
+derive keys, verify confirm/DHKey values, or authenticate distributed identity
+material. Those operations require a connection-scoped pairing transcript and
+cryptographic state.
+
+`decode-data` prints `l2cap_pdu` before `smp_pdu`. Known-command failures are
+counted independently as `smp_errors` and cannot suppress raw reconstructed
+bytes. Since those bytes can contain long-term and identity keys, all SMP
+capture output is sensitive even when semantic decoding fails.

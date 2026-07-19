@@ -30,6 +30,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Strict, lossless ATT PDU decoding on fixed CID `0x0004`, covering every
   assigned Core 6.1 opcode, fixed and variable record validation, raw unknown
   opcode preservation, and non-suppressing semantic error reporting.
+- Strict, lossless LE Security Manager Protocol decoding on fixed CID `0x0006`,
+  covering all assigned pairing and key-distribution commands, Core field
+  validation, future-command preservation, and non-suppressing errors.
 - Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
   including CONNECT_IND ChSel selection and event-counter channel calculation.
 - Anchored connection-event tracking with wrap-safe instant handling, strict
@@ -177,6 +180,23 @@ GATT database, track negotiated MTUs, verify signed-write authentication, or
 identify Enhanced ATT on dynamically allocated L2CAP channels. EATT decoding
 requires credit-based channel state and its assigned PSM, so dynamic CIDs are
 not guessed from payload bytes.
+
+Completed plaintext PDUs on the LE Security Manager fixed channel CID `0x0006`
+receive a separate `smp_pdu` description. The decoder covers Pairing Request
+and Response, Confirm, Random, Failed, all legacy key-distribution messages,
+Security Request, Secure Connections public keys and DHKey checks, and keypress
+notifications. It validates exact command lengths, IO and OOB values, bonding
+and reserved AuthReq bits, 7-through-16-octet encryption key sizes, key
+distribution masks, Pairing Failed reasons through Core 6.1 `Busy`, identity
+address type/static-random structure, and keypress types. Reserved future
+command codes retain every parameter byte.
+
+SMP output is passive syntax, not a pairing engine. It does not enforce command
+sequence or role, correlate Pairing Request and Response masks, derive STK/LTK
+or MacKey, verify confirms or DHKey checks, or decrypt the link. Raw and typed
+SMP output can contain LTK, IRK, CSRK, random, and public-key material and must
+be handled as sensitive capture data. Malformed known commands increment
+`smp_errors` only after the complete raw `l2cap_pdu` has been printed.
 
 An ordinary recording centered on one data channel is generally incomplete for
 a hopping connection because packets transmitted on other channels are absent.
@@ -356,9 +376,9 @@ plaintext L2CAP PDU reassembly are now present; the next receive stages are
 wideband channelization or timed retuning, automatic capture-driven observation
 delivery, and live BLE connection following. Full packet decode is a project
 requirement: extended advertising, complete LL control semantics, L2CAP
-channel state, stateful GATT reconstruction, SMP, encryption, LE 2M/Coded PHY,
-and Bluetooth Classic BR/EDR layers will be added incrementally while retaining
-undecoded packet bytes losslessly.
+channel state, stateful GATT reconstruction and pairing, encryption, LE
+2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added incrementally
+while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

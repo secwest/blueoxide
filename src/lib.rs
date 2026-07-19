@@ -17,5 +17,6 @@ pub mod link_layer;
 pub mod native;
 pub mod pcapng;
 pub mod sdr;
+pub mod smp;
 
 pub use error::{Error, Result};

@@ -381,3 +381,95 @@ fn cli_decodes_plaintext_le_l2cap_signaling_without_hiding_raw_pdus() {
     ));
     assert!(stderr.contains("signaling_errors=1"));
 }
+
+#[test]
+fn cli_decodes_plaintext_smp_without_hiding_raw_pdus() {
+    let channel = BleChannel::new(12).expect("valid channel");
+    let access_address = 0x1234_5678u32;
+    let crc_init = 0x00ab_cdef;
+    let mut phase = 0.0f32;
+    let mut samples = vec![(1.0f32, 0.0f32); 11];
+    let pairing_request = [
+        7, 0, // L2CAP payload length
+        6, 0, // LE Security Manager fixed channel
+        0x01, 0x03, 0x00, 0x0d, 16, 0x07, 0x06,
+    ];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x02, pairing_request.len() as u8],
+        &pairing_request,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    let malformed_security_request = [
+        3, 0, // L2CAP payload length
+        6, 0, // LE Security Manager fixed channel
+        0x0b, 0x01, 0xff, // known command with one trailing octet
+    ];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x0a, malformed_security_request.len() as u8],
+        &malformed_security_request,
+    );
+
+    let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
+    for (i, q) in samples {
+        iq_bytes.extend_from_slice(&i.to_le_bytes());
+        iq_bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    let iq_path = temporary_path("smp.cf32");
+    fs::write(&iq_path, iq_bytes).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "79",
+            "--aa-errors",
+            "0",
+            "--plaintext-l2cap-direction",
+            "central-to-peripheral",
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "l2cap_pdu direction=central-to-peripheral cid=0x0006 length=7 fragments=1 payload=0103000d100706"
+    ));
+    assert!(stdout.contains(
+        "smp_pdu direction=central-to-peripheral code=0x01 name=pairing-request io_capability=no-input-no-output oob=false auth=0x0d bonding=true mitm=true secure_connections=true keypress=false ct2=false maximum_key_size=16"
+    ));
+    assert!(stdout.contains(
+        "l2cap_pdu direction=central-to-peripheral cid=0x0006 length=3 fragments=1 payload=0b01ff"
+    ));
+    assert!(stderr.contains("plaintext SMP PDU decode error: direction=central-to-peripheral"));
+    assert!(stderr.contains(
+        "reassembled 2 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0 signaling_errors=0 att_errors=0 smp_errors=1"
+    ));
+}

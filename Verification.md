@@ -493,6 +493,90 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## LE Security Manager Protocol verification
+
+Normative reference:
+
+- Bluetooth Core Specification 6.1, Vol 3, Part H, Sections 3.3, 3.5, and 3.6.
+
+The Core defines one command per LE Security Manager L2CAP PDU on fixed CID
+`0x0006`, with command codes `0x01` through `0x0e`. Its field tables establish
+the five IO capabilities, two OOB values, AuthReq bonding and security flags,
+7-through-16-octet maximum key size, four key-distribution flags, exact
+cryptographic field widths, public/static-random identity addresses, and five
+keypress values. Core 6.1 Pairing Failed reasons include `0x0f` Key Rejected
+and `0x10` Busy.
+
+Primary implementation reference:
+
+- Project: Zephyr
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/host/smp.h`
+  - `subsys/bluetooth/host/smp.c`
+
+Zephyr's packed structures and 14-entry receive-handler table independently
+confirm every command length and field order. Its receiver requires an exact
+handler-specific parameter length, rejects unsupported/reserved command codes,
+checks encryption key size, and validates Identity Address Information as an
+identity address. The pinned revision names Pairing Failed through Key
+Rejected; the newer Busy reason comes from the Core 6.1 table.
+
+Independent byte-layout reference:
+
+- Project: Scapy
+- Commit: `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+- File: `scapy/layers/bluetooth.py`
+
+Using that source tree directly through `PYTHONPATH`, Scapy built every SMP
+class, wrapped it in `L2CAP_Hdr(cid=6)`, reparsed through `SM_Hdr`, and
+reproduced these command bytes:
+
+```text
+0103000d100706
+0204013d0c0304
+03000102030405060708090a0b0c0d0e0f
+04101112131415161718191a1b1c1d1e1f
+0510
+06000102030405060708090a0b0c0d0e0f
+0734120001020304050607
+08000102030405060708090a0b0c0d0e0f
+09010102030405c6
+0a000102030405060708090a0b0c0d0e0f
+0b0d
+0c000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+0d000102030405060708090a0b0c0d0e0f
+0e04
+```
+
+These cover all assigned Pairing, key-distribution, Security Request, Secure
+Connections, and keypress commands. Blueoxide tests additionally reject every
+known command's short and long forms, reserved IO/OOB/AuthReq/key-distribution
+values, invalid key sizes, reserved failure and keypress values, invalid
+identity address types, malformed static-random identities, and bounded
+arbitrary inputs.
+
+The CLI fixture emits a valid Pairing Request as typed `smp_pdu` output, then
+reconstructs a malformed known Security Request. Both complete raw CID
+`0x0006` payloads remain visible and only the malformed command increments
+`smp_errors`.
+
+Final local gate for this increment:
+
+```text
+132 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+5 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Internal audit matrix
 
 The checked-in test suite covers:
@@ -709,5 +793,5 @@ cargo doc --no-deps
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
 - Differential tests for extended advertising, data-channel following,
-  stateful GATT, EATT, SMP, LE Coded PHY, and Bluetooth Classic as those layers
-  are added.
+  stateful GATT, EATT, pairing/encryption state, LE Coded PHY, and Bluetooth
+  Classic as those layers are added.

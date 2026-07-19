@@ -20,6 +20,7 @@ use blueoxide::link_layer::{
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
+use blueoxide::smp::{DecodedSmpPdu, SmpAuthenticationRequirements, SmpKeyDistribution, SmpPdu};
 use blueoxide::{Error, Result};
 use std::env;
 use std::fs::File;
@@ -1153,6 +1154,101 @@ fn describe_att_pdu(pdu: AttPdu<'_>) -> Result<String> {
     Ok(format!("{prefix} {details}"))
 }
 
+fn describe_smp_authentication(authentication: SmpAuthenticationRequirements) -> String {
+    format!(
+        "auth=0x{:02x} bonding={} mitm={} secure_connections={} keypress={} ct2={}",
+        authentication.raw,
+        authentication.bonding(),
+        authentication.mitm(),
+        authentication.secure_connections(),
+        authentication.keypress(),
+        authentication.ct2()
+    )
+}
+
+fn describe_smp_key_distribution(distribution: SmpKeyDistribution) -> String {
+    format!(
+        "0x{:02x}:enc={}:id={}:sign={}:link={}",
+        distribution.raw,
+        distribution.encryption_key(),
+        distribution.identity_key(),
+        distribution.signing_key(),
+        distribution.link_key()
+    )
+}
+
+fn print_device_address(address: [u8; 6]) -> String {
+    address
+        .iter()
+        .rev()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn describe_smp_pdu(pdu: SmpPdu<'_>) -> Result<String> {
+    let prefix = format!("code=0x{:02x} name={}", pdu.code, pdu.code_name());
+    let details = match pdu.decode()? {
+        DecodedSmpPdu::PairingRequest(features) | DecodedSmpPdu::PairingResponse(features) => {
+            format!(
+                "io_capability={} oob={} {} maximum_key_size={} initiator_keys={} responder_keys={}",
+                features.io_capability,
+                features.oob_data_present,
+                describe_smp_authentication(features.authentication),
+                features.maximum_encryption_key_size,
+                describe_smp_key_distribution(features.initiator_key_distribution),
+                describe_smp_key_distribution(features.responder_key_distribution)
+            )
+        }
+        DecodedSmpPdu::PairingConfirm(value) => {
+            format!("confirm={}", print_hex(&value))
+        }
+        DecodedSmpPdu::PairingRandom(value) => {
+            format!("random={}", print_hex(&value))
+        }
+        DecodedSmpPdu::PairingFailed(failure) => format!(
+            "reason=0x{:02x} reason_name={}",
+            failure.reason,
+            failure.reason_name()
+        ),
+        DecodedSmpPdu::EncryptionInformation(key) => {
+            format!("ltk={}", print_hex(&key))
+        }
+        DecodedSmpPdu::CentralIdentification(identification) => format!(
+            "ediv=0x{:04x} random={}",
+            identification.encrypted_diversifier,
+            print_hex(&identification.random)
+        ),
+        DecodedSmpPdu::IdentityInformation(key) => {
+            format!("irk={}", print_hex(&key))
+        }
+        DecodedSmpPdu::IdentityAddressInformation(identity) => format!(
+            "address_type={} address={}",
+            identity.address_type,
+            print_device_address(identity.address)
+        ),
+        DecodedSmpPdu::SigningInformation(key) => {
+            format!("csrk={}", print_hex(&key))
+        }
+        DecodedSmpPdu::SecurityRequest(authentication) => {
+            describe_smp_authentication(authentication)
+        }
+        DecodedSmpPdu::PairingPublicKey(key) => {
+            format!("x={} y={}", print_hex(&key.x), print_hex(&key.y))
+        }
+        DecodedSmpPdu::PairingDhKeyCheck(value) => {
+            format!("dhkey_check={}", print_hex(&value))
+        }
+        DecodedSmpPdu::KeypressNotification(notification_type) => {
+            format!("notification_type={notification_type}")
+        }
+        DecodedSmpPdu::Unknown { parameters, .. } => {
+            format!("parameters={}", print_hex(parameters))
+        }
+    };
+    Ok(format!("{prefix} {details}"))
+}
+
 fn decode(args: DecodeArgs) -> Result<()> {
     if args.block_samples == 0 {
         return Err(Error::InvalidConfiguration(
@@ -1251,6 +1347,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     let mut l2cap_error_count = 0usize;
     let mut l2cap_signaling_error_count = 0usize;
     let mut att_error_count = 0usize;
+    let mut smp_error_count = 0usize;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -1356,6 +1453,29 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
                                         );
                                     }
                                 }
+                                match pdu.smp_pdu() {
+                                    Ok(Some(smp)) => match describe_smp_pdu(smp) {
+                                        Ok(description) => println!(
+                                            "smp_pdu direction={} {description}",
+                                            pdu.direction
+                                        ),
+                                        Err(error) => {
+                                            smp_error_count += 1;
+                                            eprintln!(
+                                                "plaintext SMP PDU decode error: direction={} error={error}",
+                                                pdu.direction
+                                            );
+                                        }
+                                    },
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        smp_error_count += 1;
+                                        eprintln!(
+                                            "plaintext SMP PDU envelope decode error: direction={} error={error}",
+                                            pdu.direction
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -1398,7 +1518,7 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     );
     if l2cap_reassembler.is_some() {
         eprintln!(
-            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count} att_errors={att_error_count}"
+            "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count} att_errors={att_error_count} smp_errors={smp_error_count}"
         );
     }
     Ok(())
