@@ -6,7 +6,7 @@ dependency.
 
 ## Environment
 
-- Date: 2026-07-13 through 2026-07-17
+- Date: 2026-07-13 through 2026-07-19
 - Rust: 1.95.0
 - Python: 3.14.4
 - NumPy: 2.4.6
@@ -643,22 +643,73 @@ oracles; Zephyr's little-endian packed fields and the Core 6.1 figures govern
 those layouts. Opcodes `0x2a..=0x2c` are verified directly against the Core
 figures.
 
-Tests cover every known opcode's short and long forms, fixed cryptographic
-arrays, connection-offset ordering/uniqueness, length and PHY ranges, CTE and
-clock fields, SyncInfo bit packing, Core 6.1 CIS framing and ISO constraints,
-power-control sentinels, subrate relationships, channel reporting and all 37
-two-bit channel classifications, 24-octet feature pages, named raw preservation
-for `0x2d..=0x3c`, future opcodes, and bounded arbitrary input without panics.
+Channel Sounding and Frame Space normative references:
 
-The waveform-backed CLI fixture emits a valid `LL_LENGTH_REQ`, then a malformed
-known `LL_CTE_REQ` with trailing CtrData. Both raw data-channel packets remain
-visible, the valid command receives typed output, and only the malformed packet
-increments `ll_control_errors`.
+- Bluetooth Core Specification 6.1, Vol 6, Part B:
+  - Sections 2.4.2.42 through 2.4.2.55 for the sixteen CtrData layouts.
+  - Section 4.5.18.1 for CS step/subevent limits.
+  - Sections 5.1.23 through 5.1.27 for the CS procedure relationships.
+  - Section 5.1.30 for Frame Space Update response constraints.
+- Bluetooth Core Specification 6.1, Vol 6, Part H:
+  - Sections 4.1, 4.3, 4.4, and 4.7 for channel selection, timing indices,
+    mode sequencing, and antenna switching.
+- Bluetooth Core Specification 6.1, Vol 6, Part A:
+  - Sections 3.1.3 and 5.3 for SNR output indices and ACI.
+
+The official figures establish these exact parameter lengths:
+
+| Opcode group | Parameter octets |
+| --- | ---: |
+| `LL_CS_SEC_REQ/RSP` | 20 |
+| `LL_CS_CAPABILITIES_REQ/RSP` | 25 |
+| `LL_CS_CONFIG_REQ`, `LL_CS_CONFIG_RSP` | 27, 1 |
+| `LL_CS_REQ`, `LL_CS_RSP`, `LL_CS_IND` | 28, 21, 18 |
+| `LL_CS_TERMINATE_REQ/RSP` | 4 |
+| `LL_CS_FAE_REQ`, `LL_CS_FAE_RSP` | 0, 72 |
+| `LL_CS_CHANNEL_MAP_IND` | 12 |
+| `LL_FRAME_SPACE_REQ/RSP` | 7, 5 |
+
+Independent Channel Sounding references:
+
+- Google RootCanal, commit
+  `39d127f60747402c1fc07a067fcadabd1232b793`,
+  `packets/link_layer_packets.pdl` and LL/CS conformance vectors.
+- Texas Instruments BLE controller, commit
+  `68ca021502383f367d0bf2a5517fdd0dcb0ef909`,
+  `ll_cs_ctrl_pkt_internal.h`.
+- Zephyr, commit `6072d4880d2d8deeadb506929adca4dba44c8220`,
+  `include/zephyr/bluetooth/{conn.h,cs.h,hci_types.h}`.
+- Google Bumble, commit
+  `35d35c7ea43728faac83d02457ff1c30fe4528ab`,
+  `bumble/ll.py`.
+
+RootCanal independently confirms CS field ordering and bit packing, but uses
+private high-value emulation opcodes and adds status fields to some internal
+packets. TI confirms request/response/indication ordering but omits the Core
+6.1 trailing RFU octets from response and indication structures. The official
+Core figures therefore take precedence for public opcodes and exact lengths.
+Zephyr independently confirms the optional T_IP1/T_IP2, T_FCS, T_PM, and
+TX-SNR capability masks. Bumble confirms the public `0x2d..=0x3c` opcode table.
+
+Tests cover every assigned opcode's short and long forms and every
+`0x2d..=0x3c` valid typed layout. Focused cases exercise capability
+cross-fields, antenna/role ranges, CS map exclusions and minimum channel count,
+configuration create/remove behavior, legal mode pairs, timing indices,
+algorithm #3c limits, request/response/indication offsets and RFU bytes, ACI,
+PHY and SNR values, all 72 signed FAE entries, Frame Space masks/ranges, future
+raw opcode preservation, and bounded arbitrary input through 80 parameter
+octets. Fixed vectors derive from RootCanal configuration and TI packed request
+layouts.
+
+The waveform-backed CLI fixture emits a valid `LL_LENGTH_REQ`, a valid typed
+`LL_FRAME_SPACE_REQ`, and a malformed known `LL_CS_CONFIG_RSP` with trailing
+CtrData. All raw data-channel packets remain visible, valid commands receive
+typed output, and only the malformed packet increments `ll_control_errors`.
 
 Final local gate for this increment:
 
 ```text
-142 library tests
+151 library tests
 4 connection planning/acquisition/synchronization CLI integration tests
 6 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test

@@ -18,7 +18,7 @@ use blueoxide::link_layer::{
     DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
     L2capSignalingCommand, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
 };
-use blueoxide::ll_control::{ChannelClassification, DecodedControlPdu};
+use blueoxide::ll_control::{ChannelClassification, CsConfigAction, DecodedControlPdu};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::smp::{DecodedSmpPdu, SmpAuthenticationRequirements, SmpKeyDistribution, SmpPdu};
@@ -767,6 +767,15 @@ fn print_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn print_signed_hex(bytes: &[i8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(output, "{:02x}", *byte as u8);
+    }
+    output
+}
+
 fn print_packet(packet: &ReceivedAdvertisingPdu) {
     let semantic = decode_advertising_pdu(&packet.pdu)
         .map(|decoded| decoded.to_string())
@@ -837,7 +846,8 @@ fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
         | DecodedControlPdu::PauseEncryptionResponse
         | DecodedControlPdu::PingRequest
         | DecodedControlPdu::PingResponse
-        | DecodedControlPdu::CteResponse => {
+        | DecodedControlPdu::CteResponse
+        | DecodedControlPdu::CsFaeRequest => {
             format!("{} opcode=0x{:02x}", control.opcode_name(), control.opcode)
         }
         DecodedControlPdu::UnknownResponse(value) => format!(
@@ -1127,6 +1137,175 @@ fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
             value.maximum_page,
             value.page_number,
             print_hex(&value.feature_page)
+        ),
+        DecodedControlPdu::CsSecurityRequest(value)
+        | DecodedControlPdu::CsSecurityResponse(value) => format!(
+            "{} opcode=0x{:02x} iv={} nonce={} personalization_vector={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&value.initialization_vector),
+            print_hex(&value.nonce),
+            print_hex(&value.personalization_vector)
+        ),
+        DecodedControlPdu::CsCapabilitiesRequest(value)
+        | DecodedControlPdu::CsCapabilitiesResponse(value) => format!(
+            "{} opcode=0x{:02x} mode_types=0x{:02x} rtt_capability=0x{:02x} rtt_aa_only_n={} rtt_sounding_n={} rtt_random_sequence_n={} nadm_sounding=0x{:04x} nadm_random=0x{:04x} cs_sync_phys=0x{:02x} antennas={} maximum_antenna_paths={} roles=0x{:02x} no_fae={} channel_selection_3c={} sounding_pct_estimate={} configurations={} maximum_procedures={} t_sw_us={} t_ip1_capability=0x{:04x} t_ip2_capability=0x{:04x} t_fcs_capability=0x{:04x} t_pm_capability=0x{:04x} tx_snr_capability=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.mode_types,
+            value.rtt_capability,
+            value.rtt_aa_only_n,
+            value.rtt_sounding_n,
+            value.rtt_random_sequence_n,
+            value.nadm_sounding_capability,
+            value.nadm_random_capability,
+            value.cs_sync_phy_capability,
+            value.antenna_count,
+            value.maximum_antenna_paths,
+            value.roles,
+            value.no_fae,
+            value.channel_selection_3c,
+            value.sounding_pct_estimate,
+            value.configuration_count,
+            value.maximum_procedures_supported,
+            value.antenna_switch_time_us,
+            value.t_ip1_capability,
+            value.t_ip2_capability,
+            value.t_fcs_capability,
+            value.t_pm_capability,
+            value.tx_snr_capability
+        ),
+        DecodedControlPdu::CsConfigRequest(value) => format!(
+            "{} opcode=0x{:02x} config={} action={} channel_map={} channels={} channel_map_repetition={} main_mode={} sub_mode={} main_mode_min_steps={} main_mode_max_steps={} main_mode_repetition={} mode_0_steps={} cs_sync_phy=0x{:02x} rtt_type={} role={} channel_selection={} channel_selection_3c_shape={} channel_selection_3c_jump={} t_ip1={} t_ip2={} t_fcs={} t_pm={}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id,
+            match value.action {
+                CsConfigAction::Remove => "remove",
+                CsConfigAction::Create => "create",
+            },
+            print_hex(&value.channel_map.bytes()),
+            value.channel_map.used_count(),
+            value.channel_map_repetition,
+            value.main_mode,
+            value.sub_mode,
+            value.main_mode_min_steps,
+            value.main_mode_max_steps,
+            value.main_mode_repetition,
+            value.mode_0_steps,
+            value.cs_sync_phy,
+            value.rtt_type,
+            value.role,
+            value.channel_selection,
+            value.channel_selection_3c_shape,
+            value.channel_selection_3c_jump,
+            value.t_ip1,
+            value.t_ip2,
+            value.t_fcs,
+            value.t_pm
+        ),
+        DecodedControlPdu::CsConfigResponse(value) => format!(
+            "{} opcode=0x{:02x} config={}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id
+        ),
+        DecodedControlPdu::CsProcedureRequest(value) => format!(
+            "{} opcode=0x{:02x} config={} connection_event={} offset_min_us={} offset_max_us={} maximum_procedure_length_units={} maximum_procedure_length_us={} event_interval={} subevents_per_event={} subevent_interval_units={} subevent_interval_us={} subevent_length_us={} procedure_interval={} procedure_count={} aci={} preferred_peer_antennas=0x{:02x} phy=0x{:02x} power_delta_db={} initiator_snr_index={} reflector_snr_index={}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id,
+            value.connection_event_count,
+            value.offset_min_us,
+            value.offset_max_us,
+            value.maximum_procedure_length_units,
+            value.maximum_procedure_length_us(),
+            value.event_interval_connection_events,
+            value.subevents_per_event,
+            value.subevent_interval_units,
+            value.subevent_interval_us(),
+            value.subevent_length_us,
+            value.procedure_interval_connection_events,
+            value.procedure_count,
+            value.antenna_configuration_index,
+            value.preferred_peer_antennas,
+            value.phy,
+            value.power_delta_db,
+            value.initiator_snr_index,
+            value.reflector_snr_index
+        ),
+        DecodedControlPdu::CsProcedureResponse(value) => format!(
+            "{} opcode=0x{:02x} config={} connection_event={} offset_min_us={} offset_max_us={} event_interval={} subevents_per_event={} subevent_interval_units={} subevent_interval_us={} subevent_length_us={} aci={} phy=0x{:02x} power_delta_db={}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id,
+            value.connection_event_count,
+            value.offset_min_us,
+            value.offset_max_us,
+            value.event_interval_connection_events,
+            value.subevents_per_event,
+            value.subevent_interval_units,
+            value.subevent_interval_us(),
+            value.subevent_length_us,
+            value.antenna_configuration_index,
+            value.phy,
+            value.power_delta_db
+        ),
+        DecodedControlPdu::CsProcedureIndication(value) => format!(
+            "{} opcode=0x{:02x} config={} connection_event={} offset_us={} event_interval={} subevents_per_event={} subevent_interval_units={} subevent_interval_us={} subevent_length_us={} aci={} phy=0x{:02x} power_delta_db={}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id,
+            value.connection_event_count,
+            value.offset_us,
+            value.event_interval_connection_events,
+            value.subevents_per_event,
+            value.subevent_interval_units,
+            value.subevent_interval_us(),
+            value.subevent_length_us,
+            value.antenna_configuration_index,
+            value.phy,
+            value.power_delta_db
+        ),
+        DecodedControlPdu::CsTerminateRequest(value)
+        | DecodedControlPdu::CsTerminateResponse(value) => format!(
+            "{} opcode=0x{:02x} config={} procedure_count={} error_code=0x{:02x}",
+            control.opcode_name(),
+            control.opcode,
+            value.config_id,
+            value.procedure_count,
+            value.error_code
+        ),
+        DecodedControlPdu::CsFaeResponse(value) => format!(
+            "{} opcode=0x{:02x} fae={}",
+            control.opcode_name(),
+            control.opcode,
+            print_signed_hex(&value.values)
+        ),
+        DecodedControlPdu::CsChannelMapInd(value) => format!(
+            "{} opcode=0x{:02x} channel_map={} channels={} instant={}",
+            control.opcode_name(),
+            control.opcode,
+            print_hex(&value.channel_map.bytes()),
+            value.channel_map.used_count(),
+            value.instant
+        ),
+        DecodedControlPdu::FrameSpaceRequest(value) => format!(
+            "{} opcode=0x{:02x} minimum_us={} maximum_us={} phys=0x{:02x} spacing_types=0x{:04x}",
+            control.opcode_name(),
+            control.opcode,
+            value.minimum_us,
+            value.maximum_us,
+            value.phys,
+            value.spacing_types
+        ),
+        DecodedControlPdu::FrameSpaceResponse(value) => format!(
+            "{} opcode=0x{:02x} frame_space_us={} phys=0x{:02x} spacing_types=0x{:04x}",
+            control.opcode_name(),
+            control.opcode,
+            value.frame_space_us,
+            value.phys,
+            value.spacing_types
         ),
         DecodedControlPdu::Raw { parameters, .. } => format!(
             "{} opcode=0x{:02x} raw_parameters={}",

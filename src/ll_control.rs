@@ -4,6 +4,9 @@ use crate::link_layer::{
 };
 use crate::{Error, Result};
 
+mod cs;
+pub use cs::*;
+
 pub const LE_FEATURE_PAGE_OCTETS: usize = 24;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +56,22 @@ pub enum DecodedControlPdu<'a> {
     PeriodicSyncWrInd(PeriodicSyncWrInd),
     FeatureExtendedRequest(FeaturePagePdu),
     FeatureExtendedResponse(FeaturePagePdu),
+    CsSecurityResponse(CsSecurityParameters),
+    CsCapabilitiesRequest(CsCapabilities),
+    CsCapabilitiesResponse(CsCapabilities),
+    CsConfigRequest(CsConfigRequest),
+    CsConfigResponse(CsConfigResponse),
+    CsProcedureRequest(CsProcedureRequest),
+    CsProcedureResponse(CsProcedureResponse),
+    CsProcedureIndication(CsProcedureIndication),
+    CsTerminateRequest(CsTermination),
+    CsFaeRequest,
+    CsFaeResponse(CsFaeTable),
+    CsChannelMapInd(CsChannelMapInd),
+    CsSecurityRequest(CsSecurityParameters),
+    CsTerminateResponse(CsTermination),
+    FrameSpaceRequest(FrameSpaceRequest),
+    FrameSpaceResponse(FrameSpaceResponse),
     Raw { opcode: u8, parameters: &'a [u8] },
 }
 
@@ -467,6 +486,55 @@ impl<'a> ControlPdu<'a> {
             )),
             0x2c => Ok(DecodedControlPdu::FeatureExtendedResponse(
                 parse_feature_page(self)?,
+            )),
+            0x2d => Ok(DecodedControlPdu::CsSecurityResponse(
+                cs::parse_cs_security(self)?,
+            )),
+            0x2e => Ok(DecodedControlPdu::CsCapabilitiesRequest(
+                cs::parse_cs_capabilities(self)?,
+            )),
+            0x2f => Ok(DecodedControlPdu::CsCapabilitiesResponse(
+                cs::parse_cs_capabilities(self)?,
+            )),
+            0x30 => Ok(DecodedControlPdu::CsConfigRequest(
+                cs::parse_cs_config_request(self)?,
+            )),
+            0x31 => Ok(DecodedControlPdu::CsConfigResponse(
+                cs::parse_cs_config_response(self)?,
+            )),
+            0x32 => Ok(DecodedControlPdu::CsProcedureRequest(
+                cs::parse_cs_procedure_request(self)?,
+            )),
+            0x33 => Ok(DecodedControlPdu::CsProcedureResponse(
+                cs::parse_cs_procedure_response(self)?,
+            )),
+            0x34 => Ok(DecodedControlPdu::CsProcedureIndication(
+                cs::parse_cs_procedure_indication(self)?,
+            )),
+            0x35 => Ok(DecodedControlPdu::CsTerminateRequest(
+                cs::parse_cs_termination(self)?,
+            )),
+            0x36 => {
+                require_length(self, 0)?;
+                Ok(DecodedControlPdu::CsFaeRequest)
+            }
+            0x37 => Ok(DecodedControlPdu::CsFaeResponse(cs::parse_cs_fae_response(
+                self,
+            )?)),
+            0x38 => Ok(DecodedControlPdu::CsChannelMapInd(
+                cs::parse_cs_channel_map_ind(self)?,
+            )),
+            0x39 => Ok(DecodedControlPdu::CsSecurityRequest(cs::parse_cs_security(
+                self,
+            )?)),
+            0x3a => Ok(DecodedControlPdu::CsTerminateResponse(
+                cs::parse_cs_termination(self)?,
+            )),
+            0x3b => Ok(DecodedControlPdu::FrameSpaceRequest(
+                cs::parse_frame_space_request(self)?,
+            )),
+            0x3c => Ok(DecodedControlPdu::FrameSpaceResponse(
+                cs::parse_frame_space_response(self)?,
             )),
             _ => Ok(DecodedControlPdu::Raw {
                 opcode: self.opcode,
@@ -1409,9 +1477,10 @@ mod tests {
     fn rejects_every_known_short_and_long_parameter_layout() {
         let lengths = [
             11, 7, 1, 22, 12, 0, 0, 1, 8, 8, 0, 0, 5, 1, 8, 23, 23, 2, 0, 0, 8, 8, 2, 2, 4, 2, 1,
-            0, 34, 1, 1, 35, 8, 15, 3, 3, 4, 4, 10, 10, 3, 10, 42, 26, 26,
+            0, 34, 1, 1, 35, 8, 15, 3, 3, 4, 4, 10, 10, 3, 10, 42, 26, 26, 20, 25, 25, 27, 1, 28,
+            21, 18, 4, 0, 72, 12, 20, 4, 7, 5,
         ];
-        for (opcode, expected) in (0u8..=0x2c).zip(lengths) {
+        for (opcode, expected) in (0u8..=0x3c).zip(lengths) {
             if expected > 0 {
                 assert!(
                     control(opcode, &vec![0; expected - 1]).decode().is_err(),
@@ -1426,17 +1495,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_newer_assigned_and_future_opcodes_losslessly() {
+    fn decodes_newly_assigned_and_preserves_future_opcodes_losslessly() {
         assert_eq!(control(0x2d, &[]).opcode_name(), "LL_CS_SEC_RSP");
         assert_eq!(control(0x39, &[]).opcode_name(), "LL_CS_SEC_REQ");
         assert_eq!(control(0x3c, &[]).opcode_name(), "LL_FRAME_SPACE_RSP");
-        assert_eq!(
-            control(0x2d, &[1, 2, 3]).decode().unwrap(),
-            DecodedControlPdu::Raw {
-                opcode: 0x2d,
-                parameters: &[1, 2, 3],
-            }
-        );
+        assert!(matches!(
+            control(0x36, &[]).decode().unwrap(),
+            DecodedControlPdu::CsFaeRequest
+        ));
         assert_eq!(
             control(0xee, &[4, 5]).decode().unwrap(),
             DecodedControlPdu::Raw {
@@ -1449,7 +1515,7 @@ mod tests {
     #[test]
     fn bounded_arbitrary_inputs_never_panic() {
         for opcode in 0u8..=u8::MAX {
-            for length in 0..=48 {
+            for length in 0..=80 {
                 let parameters: Vec<u8> = (0..length)
                     .map(|index| opcode.wrapping_add(index as u8))
                     .collect();

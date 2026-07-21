@@ -23,8 +23,8 @@ The repository now contains a dependency-free, buildable receive core with:
 - Typed decoding for legacy advertising, scan, direct, and connection-request
   PDUs, including AD structures and validated CONNECT_IND timing/channel data.
 - Data-channel header, CTEInfo, and L2CAP-start decoding plus strict, lossless
-  LL control-PDU syntax through Feature Page Exchange, with every Core 6.1
-  opcode named and newer procedure payloads retained raw.
+  LL control-PDU syntax through Core 6.1 Channel Sounding and Frame Space
+  Update, with future opcode payloads retained raw.
 - Bounded, direction-explicit plaintext L2CAP PDU reassembly with independent
   central/peripheral state, exact retransmission suppression, malformed-length
   rejection, and discontinuity reset.
@@ -134,24 +134,30 @@ interpretations are explicitly plaintext hints; encrypted payloads remain
 available as raw bytes but cannot yet be interpreted reliably.
 
 LLID `0b11` packets receive strict typed LL control decoding without requiring
-L2CAP reassembly. Blueoxide validates exact parameter sizes for every opcode
-from `LL_CONNECTION_UPDATE_IND` (`0x00`) through `LL_FEATURE_EXT_RSP`
-(`0x2c`), including encryption setup, feature/version exchange, connection
-parameters, data length and PHY updates, CTE requests, periodic synchronization,
-CIS establishment, power control, connection subrating, channel classification,
-PAwR synchronization transfer, and 24-octet feature pages. It also checks Core
-field ranges, reserved bits, PHY masks, offset ordering, data-length limits,
-SyncInfo structure, Core 6.1 CIS Framing_Mode packing, subrate relationships,
-and channel classifications.
+L2CAP reassembly. Blueoxide validates exact parameter sizes for every assigned
+Core 6.1 opcode from `LL_CONNECTION_UPDATE_IND` (`0x00`) through
+`LL_FRAME_SPACE_RSP` (`0x3c`). Coverage includes encryption setup,
+feature/version exchange, connection parameters, data length and PHY updates,
+CTE requests, periodic synchronization, CIS establishment, power control,
+connection subrating, channel classification, PAwR synchronization transfer,
+24-octet feature pages, Channel Sounding security/capability/configuration/start
+PDUs, FAE tables and CS channel maps, termination, and Frame Space Update.
 
-The Core 6.1 opcode names through `LL_FRAME_SPACE_RSP` (`0x3c`) are recognized.
-Channel Sounding and Frame Space payloads (`0x2d` through `0x3c`) remain named,
-lossless raw parameters pending their dedicated typed layer. A malformed known
-PDU remains visible in the complete packet line and increments
-`ll_control_errors`. Encryption control output can contain Rand, EDIV, session
-key diversifier, and initialization-vector material and must be handled as
-sensitive capture data. The parser does not enforce procedure order, role,
-instant timing relative to the observed event, or encryption state.
+The parser checks Core field ranges and cross-field relationships that are
+provable from one PDU: reserved bits, PHY masks, offset ordering, data-length
+limits, SyncInfo structure, Core 6.1 CIS Framing_Mode packing, subrate
+relationships, Channel Sounding capability masks, antenna and role ranges,
+excluded/minimum CS channels, mode combinations, algorithm #3c jump/repetition
+limits, CS timing and SNR indices, and Frame Space masks/ranges. Future opcodes
+retain every parameter octet as raw data.
+
+A malformed known PDU remains visible in the complete packet line and
+increments `ll_control_errors`. Encryption and Channel Sounding security output
+can contain Rand, EDIV, session-key diversifiers, initialization vectors,
+nonces, and personalization vectors and must be handled as sensitive capture
+data. The parser does not enforce procedure order, role legality relative to
+connection history, capability negotiation, instant timing relative to an
+observed event, application of CS or Frame Space changes, or encryption state.
 
 For a recording that is already known to contain a complete, ordered plaintext
 stream from one link direction, opt into L2CAP PDU reassembly:

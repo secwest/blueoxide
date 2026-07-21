@@ -882,3 +882,59 @@ adds `decode_error` to its plaintext hint and increments
 `ll_control_errors`; it cannot suppress capture bytes. Encryption request and
 response descriptions expose Rand, EDIV, SKD, and IV fields, so LL control
 output is sensitive even before higher-layer keys are available.
+
+## 2026-07-19: Type Channel Sounding and Frame Space syntax statelessly
+
+### Layout and ownership
+
+Core 6.1 assigns sixteen more LL control opcodes from `LL_CS_SEC_RSP` (`0x2d`)
+through `LL_FRAME_SPACE_RSP` (`0x3c`). Their parameter layouts range from the
+zero-octet FAE request to the 72-octet signed per-channel FAE response. They are
+now typed in `src/ll_control/cs.rs`, while `src/ll_control.rs` remains the
+public dispatch point. Only future opcodes remain `Raw`.
+
+The CS types retain every valid wire field, including the 20-octet security
+triplet, capability masks, ten-octet CS channel map, packed configuration
+fields, 24-bit offsets and subevent lengths, signed power delta and FAE values,
+termination reason, and Frame Space masks. CLI descriptions expose all of
+these values. Security IV, nonce, and personalization-vector output is
+sensitive capture material.
+
+### Strict single-PDU validation
+
+The decoder rejects short or trailing layouts, RFU bits, reserved capability
+masks and values, impossible antenna/role counts, invalid CS channel maps,
+unsupported mode pairings, malformed timing-index selections, invalid
+algorithm #3c shape/jump/repetition combinations, bad offsets/subevent fields,
+reserved ACI/PHY/SNR values, and invalid Frame Space ranges or masks.
+`LL_CS_CONFIG_REQ` removal requires all fields that become RFU to be zero.
+
+Some mandatory timing values are implicit rather than represented in the
+capability masks: T_IP1/T_IP2 index 7, T_FCS index 9, and T_PM index 2.
+Accordingly, capability masks validate only the optional indices while
+configuration PDUs accept the complete index ranges. The wire
+TX_SNR_Capability field has an RFU least-significant bit; the typed value shifts
+that bit out so bit zero denotes SNR output index zero.
+
+`LL_CS_RSP` inherits the request's 500 microsecond minimum and ordered offset
+rules. `LL_CS_IND.Offset` does not have that minimum and may be zero. Checks
+that depend on the active connection interval, current event counter,
+previously exchanged capabilities, or a selected antenna configuration are
+left to future connection-scoped procedure state.
+
+### Independent checks and state boundary
+
+The field order was compared with pinned Google RootCanal PDL and Texas
+Instruments packed CS structures. RootCanal's private emulation opcodes and
+synthetic status fields are not over-the-air fields. TI omits the Core 6.1
+trailing RFU octets from CS response/indication structures, so the official
+Core figures govern those lengths. Pinned Zephyr capability definitions
+independently confirm optional timing and TX-SNR masks, and Bumble confirms the
+assigned public opcode table.
+
+This increment does not implement the Channel Sounding procedures. It does not
+decide whether the sender may initiate a PDU, correlate request/response
+values, choose an ACI, apply a CS channel map or Frame Space value, validate an
+instant against the observed event, derive CS security state, or schedule CS
+subevents. Those operations require connection history and negotiated local
+and remote capabilities.

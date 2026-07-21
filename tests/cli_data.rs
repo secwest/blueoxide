@@ -492,15 +492,26 @@ fn cli_decodes_ll_control_pdus_without_hiding_malformed_packets() {
         &length_request,
     );
     samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
-    let malformed_cte_request = [0x1a, 0x8a, 0xff];
+    let frame_space_request = [0x3b, 100, 0, 200, 0, 3, 5, 0];
     append_packet_samples(
         &mut samples,
         &mut phase,
         channel,
         access_address,
         crc_init,
-        [0x0b, malformed_cte_request.len() as u8],
-        &malformed_cte_request,
+        [0x0b, frame_space_request.len() as u8],
+        &frame_space_request,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    let malformed_cs_config_response = [0x31, 0x02, 0xff];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x03, malformed_cs_config_response.len() as u8],
+        &malformed_cs_config_response,
     );
 
     let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
@@ -545,8 +556,12 @@ fn cli_decodes_ll_control_pdus_without_hiding_malformed_packets() {
     assert!(stdout.contains(
         "plaintext_hint=\"LL_LENGTH_REQ opcode=0x14 max_rx_octets=251 max_rx_time_us=2120 max_tx_octets=27 max_tx_time_us=2120\""
     ));
-    assert!(stdout.contains("payload=1a8aff"));
+    assert!(stdout.contains("payload=3b6400c800030500"));
+    assert!(stdout.contains(
+        "plaintext_hint=\"LL_FRAME_SPACE_REQ opcode=0x3b minimum_us=100 maximum_us=200 phys=0x03 spacing_types=0x0005\""
+    ));
+    assert!(stdout.contains("payload=3102ff"));
     assert!(stdout.contains("plaintext_hint=\"decode_error="));
-    assert!(stderr.contains("LL control PDU decode error: opcode=0x1a"));
+    assert!(stderr.contains("LL control PDU decode error: opcode=0x31"));
     assert!(stderr.contains("ll_control_errors=1"));
 }

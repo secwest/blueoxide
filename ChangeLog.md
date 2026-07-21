@@ -39,12 +39,13 @@
   CTEInfo octet included in CRC and capture bytes but excluded from the
   Length-counted payload.
 - L2CAP start-header views that retain unimplemented payload unchanged.
-- Strict lossless LL control-PDU decoding through Feature Page Exchange
-  (`0x00..=0x2c`), including exact layouts and Core field validation for
-  encryption, feature/version, connection parameters, data length, PHY, CTE,
-  periodic synchronization, CIS, power control, subrating, channel reporting,
-  PAwR transfer, and 24-octet feature pages; all Core 6.1 opcodes through
-  `0x3c` are named and later procedure payloads remain raw.
+- Strict lossless LL control-PDU decoding for every assigned Core 6.1 opcode
+  (`0x00..=0x3c`), including exact layouts and field validation for encryption,
+  feature/version, connection parameters, data length, PHY, CTE, periodic
+  synchronization, CIS, power control, subrating, channel reporting, PAwR
+  transfer, 24-octet feature pages, Channel Sounding security/capabilities/
+  configuration/start/termination, signed FAE tables, CS channel maps, and
+  Frame Space Update; future opcode payloads remain raw.
 - Validated LE data-channel maps and Channel Selection Algorithms #1 and #2,
   including Core remapping vectors and 16-bit event-counter wrap behavior.
 - CONNECT_IND ChSel handling, first transmit-window bounds, anchor-relative
