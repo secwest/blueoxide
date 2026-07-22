@@ -737,6 +737,10 @@ The checked-in test suite covers:
 - CRC corruption rejection.
 - CTEInfo frame boundaries, CRC coverage, raw-value preservation, and maximum
   data-PDU stream retention.
+- AES-128 FIPS cipher vector, Bluetooth Core LE CCM vectors in both
+  directions, first encrypted control PDU, masked-header behavior, MIC failure,
+  retransmission counter reuse, zero-length bypass, bounded counter search, and
+  arbitrary bounded encrypted PDU inputs.
 - Exact LL control layouts through Feature Page Exchange, Core 6.1 opcode
   naming, reserved-field validation, and non-suppressing malformed output.
 - Truncated Advertising Data structures.
@@ -919,6 +923,93 @@ capture complete: samples=3136 packets=0 overruns=1 dropped=8 discontinuities=1
 This verifies symbol loading and the actual C ABI on the development host, but
 does not substitute for a physical-radio test.
 
+## LE ACL encryption verification
+
+Normative references:
+
+- Bluetooth Core Specification, Vol 6, Part E, Sections 1 and 2 for LE
+  encryption, nonce construction, packet counters, direction, authenticated
+  header masking, MIC generation, and encrypted payload framing.
+- Bluetooth Core Specification, Vol 6, Part C, Section 1 for the published
+  encryption sample data and intermediate B/X/A/S values.
+- FIPS 197 for the AES-128 block-cipher example.
+
+Blueoxide fixes the Core sample session material as:
+
+```text
+AES session key: 99ad1b5226a37e3e058e3b8e27c2c666
+LL IV octets:    24abdcbabebaafde
+```
+
+The library decrypts and authenticates all four published encrypted Link Layer
+examples:
+
+| Direction | Counter | Header | Ciphertext and MIC | Plaintext |
+| --- | ---: | --- | --- | --- |
+| Central to peripheral | 0 | `0f05` | `9fcda7f448` | `06` |
+| Peripheral to central | 0 | `0705` | `a34c13a415` | `06` |
+| Central to peripheral | 1 | `0e1f` | `7a70d664...f75a6d33` | 27-octet Core DATA1 payload |
+| Peripheral to central | 1 | `061f` | `f38881e7...89b96088` | 27-octet Core DATA2 payload |
+
+The first header octet is authenticated after masking with `0xe3`. Tests modify
+NESN, SN, and MD while preserving a valid MIC, then modify LLID and require MIC
+failure. Separate cases verify that a failed MIC does not change the next
+counter, a retransmission reuses its prior counter, a zero-length PDU consumes
+none, and a stale counter can recover only within the configured bounded
+search. Arbitrary payload lengths from zero through 255 are exercised without
+panics.
+
+Independent implementation reference:
+
+- Project: Zephyr Bluetooth Controller
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/controller/ll_sw/ull_llcp_enc.c`
+  - `subsys/bluetooth/controller/ll_sw/openisa/lll/lll_conn.c`
+  - `subsys/bluetooth/controller/ll_sw/openisa/hal/RV32M1/radio/radio.c`
+  - `subsys/bluetooth/controller/ll_sw/nordic/hal/nrf5/radio/radio.c`
+
+The pinned controller independently confirms counter reset at encryption
+setup, central-to-peripheral direction bit one, peripheral-to-central bit zero,
+little-endian counter plus IV nonce placement, the `0xe3` ACL header mask,
+counter advancement only for accepted nonempty encrypted packets, and
+transmit-counter advancement only after acknowledgement rather than on
+retransmission.
+
+The waveform-backed CLI fixture uses .NET `System.Security.Cryptography.AesCcm`
+to generate two valid ATT-bearing ciphertext vectors independently of
+Blueoxide:
+
+```text
+counter 7 plaintext 050004000c01000200 -> 152f221fb90d46ca3613dc4779
+counter 8 plaintext 030004000a0100     -> 550a0e8bb155e2a7db0a85
+```
+
+The fixture starts Blueoxide at counter five with a two-counter search, verifies
+the authenticated skip to seven, repeats the first packet with changed
+NESN/MD, decrypts the next packet at eight, reconstructs both L2CAP/ATT PDUs,
+and corrupts one later ciphertext octet. The raw corrupted packet remains in
+output, no plaintext is emitted for it, its MIC failure is counted, and
+cryptographic state does not advance. CLI validation also covers malformed key
+width, conflicting asserted directions, excessive skip bounds, and a packet
+counter outside 39 bits.
+
+Final local gate for this increment:
+
+```text
+157 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+7 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 Commands:
 
 ```text
@@ -940,5 +1031,6 @@ cargo doc --no-deps
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
 - Differential tests for extended advertising, data-channel following,
-  stateful GATT, EATT, pairing/encryption state, LE Coded PHY, and Bluetooth
-  Classic as those layers are added.
+  stateful GATT, EATT, pairing/session-key derivation, automatic bidirectional
+  encryption state, LE Coded PHY, and Bluetooth Classic as those layers are
+  added.

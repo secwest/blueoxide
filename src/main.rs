@@ -16,7 +16,8 @@ use blueoxide::link_layer::{
     ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
     ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu,
     DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
-    L2capSignalingCommand, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
+    L2capSignalingCommand, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryption, LeAclDecryptionStatus,
+    LeAclDecryptor, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
 };
 use blueoxide::ll_control::{ChannelClassification, CsConfigAction, DecodedControlPdu};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
@@ -45,7 +46,6 @@ struct DecodeArgs {
     capture_start_ns: u64,
 }
 
-#[derive(Debug)]
 struct DecodeDataArgs {
     input: PathBuf,
     format: IqFormat,
@@ -60,6 +60,15 @@ struct DecodeDataArgs {
     capture_start_ns: u64,
     plaintext_l2cap_direction: Option<LinkDirection>,
     maximum_l2cap_payload_length: usize,
+    decryption: Option<DecodeDataDecryptionArgs>,
+}
+
+struct DecodeDataDecryptionArgs {
+    session_key: [u8; 16],
+    initialization_vector: [u8; 8],
+    direction: LinkDirection,
+    initial_packet_counter: u64,
+    maximum_counter_skip: u64,
 }
 
 #[derive(Debug)]
@@ -140,6 +149,12 @@ DECODE-DATA OPTIONS:
   --plaintext-l2cap-direction central-to-peripheral|peripheral-to-central
                           Reassemble an asserted single-direction plaintext stream
   --max-l2cap-payload N   Maximum reassembled payload length (default: 65535)
+  --session-key HEX       16 AES session-key octets, left to right
+  --iv HEX                Eight combined LL initialization-vector octets
+  --decrypt-direction central-to-peripheral|peripheral-to-central
+                          Assert the transmitter direction for AES-CCM
+  --packet-counter N      Initial 39-bit direction-specific packet counter
+  --max-counter-skip N    MIC-search skipped counters, 0..=65535 (default: 0)
 
 CONNECTION-PLAN OPTIONS:
   --channel-map HEX       Five map octets in over-the-air order
@@ -198,6 +213,44 @@ fn parse_u32(value: &str, option: &str) -> Result<u32> {
         .map(|hex| u32::from_str_radix(hex, 16))
         .unwrap_or_else(|| value.parse());
     parsed.map_err(|_| Error::InvalidConfiguration(format!("invalid value {value:?} for {option}")))
+}
+
+fn parse_u64(value: &str, option: &str) -> Result<u64> {
+    let parsed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u64::from_str_radix(hex, 16))
+        .unwrap_or_else(|| value.parse());
+    parsed.map_err(|_| Error::InvalidConfiguration(format!("invalid value {value:?} for {option}")))
+}
+
+fn parse_fixed_hex<const OCTETS: usize>(value: &str, option: &str) -> Result<[u8; OCTETS]> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if hex.len() != OCTETS * 2 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected {OCTETS} hexadecimal octets"
+        )));
+    }
+    let mut bytes = [0u8; OCTETS];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| {
+            Error::InvalidConfiguration(format!("invalid value {value:?} for {option}"))
+        })?;
+    }
+    Ok(bytes)
+}
+
+fn parse_link_direction(value: &str, option: &str) -> Result<LinkDirection> {
+    match value {
+        "central-to-peripheral" | "central" | "c2p" => Ok(LinkDirection::CentralToPeripheral),
+        "peripheral-to-central" | "peripheral" | "p2c" => Ok(LinkDirection::PeripheralToCentral),
+        _ => Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected central-to-peripheral or peripheral-to-central"
+        ))),
+    }
 }
 
 fn parse_channel_map(value: &str) -> Result<DataChannelMap> {
@@ -503,6 +556,12 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     let mut plaintext_l2cap_direction = None;
     let mut maximum_l2cap_payload_length = usize::from(u16::MAX);
     let mut maximum_l2cap_payload_length_supplied = false;
+    let mut session_key = None;
+    let mut initialization_vector = None;
+    let mut decryption_direction = None;
+    let mut initial_packet_counter = None;
+    let mut maximum_counter_skip = 0u64;
+    let mut maximum_counter_skip_supplied = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -550,24 +609,34 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
             }
             "--plaintext-l2cap-direction" => {
                 let value = value_after(args, &mut index, "--plaintext-l2cap-direction")?;
-                plaintext_l2cap_direction = Some(match value.as_str() {
-                    "central-to-peripheral" | "central" | "c2p" => {
-                        LinkDirection::CentralToPeripheral
-                    }
-                    "peripheral-to-central" | "peripheral" | "p2c" => {
-                        LinkDirection::PeripheralToCentral
-                    }
-                    _ => {
-                        return Err(Error::InvalidConfiguration(format!(
-                            "invalid value {value:?} for --plaintext-l2cap-direction; expected central-to-peripheral or peripheral-to-central"
-                        )));
-                    }
-                });
+                plaintext_l2cap_direction =
+                    Some(parse_link_direction(&value, "--plaintext-l2cap-direction")?);
             }
             "--max-l2cap-payload" => {
                 let value = value_after(args, &mut index, "--max-l2cap-payload")?;
                 maximum_l2cap_payload_length = parse_number(&value, "--max-l2cap-payload")?;
                 maximum_l2cap_payload_length_supplied = true;
+            }
+            "--session-key" => {
+                let value = value_after(args, &mut index, "--session-key")?;
+                session_key = Some(parse_fixed_hex(&value, "--session-key")?);
+            }
+            "--iv" => {
+                let value = value_after(args, &mut index, "--iv")?;
+                initialization_vector = Some(parse_fixed_hex(&value, "--iv")?);
+            }
+            "--decrypt-direction" => {
+                let value = value_after(args, &mut index, "--decrypt-direction")?;
+                decryption_direction = Some(parse_link_direction(&value, "--decrypt-direction")?);
+            }
+            "--packet-counter" => {
+                let value = value_after(args, &mut index, "--packet-counter")?;
+                initial_packet_counter = Some(parse_u64(&value, "--packet-counter")?);
+            }
+            "--max-counter-skip" => {
+                let value = value_after(args, &mut index, "--max-counter-skip")?;
+                maximum_counter_skip = parse_u64(&value, "--max-counter-skip")?;
+                maximum_counter_skip_supplied = true;
             }
             "-h" | "--help" => {
                 print!("{}", usage());
@@ -605,6 +674,63 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     if plaintext_l2cap_direction.is_some() {
         L2capReassembler::new(maximum_l2cap_payload_length)?;
     }
+    if maximum_counter_skip > LE_ACL_MAXIMUM_COUNTER_SKIP {
+        return Err(Error::InvalidConfiguration(format!(
+            "--max-counter-skip must be in 0..={LE_ACL_MAXIMUM_COUNTER_SKIP}"
+        )));
+    }
+    let decryption_option_count = [
+        session_key.is_some(),
+        initialization_vector.is_some(),
+        decryption_direction.is_some(),
+        initial_packet_counter.is_some(),
+    ]
+    .into_iter()
+    .filter(|supplied| *supplied)
+    .count();
+    if decryption_option_count != 0 && decryption_option_count != 4 {
+        return Err(Error::InvalidConfiguration(
+            "--session-key, --iv, --decrypt-direction, and --packet-counter must be supplied together"
+                .to_owned(),
+        ));
+    }
+    if maximum_counter_skip_supplied && decryption_option_count == 0 {
+        return Err(Error::InvalidConfiguration(
+            "--max-counter-skip requires the complete decryption option set".to_owned(),
+        ));
+    }
+    if let (Some(plaintext), Some(decryption)) = (plaintext_l2cap_direction, decryption_direction)
+        && plaintext != decryption
+    {
+        return Err(Error::InvalidConfiguration(
+            "--plaintext-l2cap-direction must match --decrypt-direction".to_owned(),
+        ));
+    }
+    let decryption = match (
+        session_key,
+        initialization_vector,
+        decryption_direction,
+        initial_packet_counter,
+    ) {
+        (Some(session_key), Some(initialization_vector), Some(direction), Some(packet_counter)) => {
+            LeAclDecryptor::new(
+                session_key,
+                initialization_vector,
+                direction,
+                packet_counter,
+                maximum_counter_skip,
+            )?;
+            Some(DecodeDataDecryptionArgs {
+                session_key,
+                initialization_vector,
+                direction,
+                initial_packet_counter: packet_counter,
+                maximum_counter_skip,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => unreachable!("partial decryption options rejected above"),
+    };
 
     Ok(DecodeDataArgs {
         input: input.ok_or_else(|| {
@@ -624,6 +750,7 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
         capture_start_ns,
         plaintext_l2cap_direction,
         maximum_l2cap_payload_length,
+        decryption,
     })
 }
 
@@ -1346,7 +1473,11 @@ fn describe_data_pdu(packet: &DataChannelPdu) -> Result<String> {
     }
 }
 
-fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) -> Result<()> {
+fn print_data_packet(
+    packet: &ReceivedLePdu,
+    data: &DataChannelPdu,
+    payload_is_plaintext: bool,
+) -> Result<()> {
     let cte = data
         .constant_tone_extension_info()
         .map(|info| {
@@ -1360,10 +1491,11 @@ fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) -> Result<()
             )
         })
         .unwrap_or_else(|| "none".to_owned());
-    let description = describe_data_pdu(data);
+    let description = payload_is_plaintext.then(|| describe_data_pdu(data));
     let plaintext_hint = match &description {
-        Ok(description) => description.clone(),
-        Err(error) => format!("decode_error={error}"),
+        Some(Ok(description)) => description.clone(),
+        Some(Err(error)) => format!("decode_error={error}"),
+        None => "encrypted".to_owned(),
     };
     println!(
         "channel={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} llid={} nesn={} sn={} md={} cp={} cte={} rfu={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} plaintext_hint=\"{}\"",
@@ -1385,6 +1517,35 @@ fn print_data_packet(packet: &ReceivedLePdu, data: &DataChannelPdu) -> Result<()
         print_hex(&data.header),
         print_hex(&data.payload),
         print_hex(&data.crc),
+        plaintext_hint.replace('"', "'"),
+    );
+    description.transpose().map(|_| ())
+}
+
+fn print_decrypted_data_packet(
+    direction: LinkDirection,
+    decryption: &LeAclDecryption,
+) -> Result<()> {
+    let description = describe_data_pdu(&decryption.packet);
+    let plaintext_hint = match &description {
+        Ok(description) => description.clone(),
+        Err(error) => format!("decode_error={error}"),
+    };
+    let (status, packet_counter) = match decryption.status {
+        LeAclDecryptionStatus::New { packet_counter, .. } => ("new", packet_counter.to_string()),
+        LeAclDecryptionStatus::Retransmission { packet_counter } => {
+            ("retransmission", packet_counter.to_string())
+        }
+        LeAclDecryptionStatus::UnencryptedEmpty => ("unencrypted-empty", "none".to_owned()),
+    };
+    println!(
+        "decrypted_data direction={} status={} packet_counter={} skipped_counters={} header={} payload={} plaintext_hint=\"{}\"",
+        direction,
+        status,
+        packet_counter,
+        decryption.status.skipped_counters(),
+        print_hex(&decryption.packet.header),
+        print_hex(&decryption.packet.payload),
         plaintext_hint.replace('"', "'"),
     );
     description.map(|_| ())
@@ -1829,6 +1990,16 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     };
     let frame_config = LeFrameConfig::data(args.access_address, args.crc_init)?;
     let mut decoder = Le1mPacketStreamDecoder::new(args.channel, frame_config, demod_config)?;
+    let mut decryptor = match &args.decryption {
+        Some(decryption) => Some(LeAclDecryptor::new(
+            decryption.session_key,
+            decryption.initialization_vector,
+            decryption.direction,
+            decryption.initial_packet_counter,
+            decryption.maximum_counter_skip,
+        )?),
+        None => None,
+    };
     let mut l2cap_reassembler = match args.plaintext_l2cap_direction {
         Some(direction) => Some((
             direction,
@@ -1850,6 +2021,11 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     let mut att_error_count = 0usize;
     let mut smp_error_count = 0usize;
     let mut ll_control_error_count = 0usize;
+    let mut decrypted_packet_count = 0usize;
+    let mut decryption_retransmission_count = 0usize;
+    let mut unencrypted_empty_count = 0usize;
+    let mut decryption_error_count = 0usize;
+    let mut skipped_packet_counter_count = 0u64;
 
     loop {
         let first_sample = reader.next_sample_index();
@@ -1874,21 +2050,96 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
             }
         }
         for packet in &batch.packets {
-            let data = DataChannelPdu::from(packet.pdu.clone());
-            if let Err(error) = print_data_packet(packet, &data)
-                && data.llid() == LogicalLinkId::Control
+            let raw_data = DataChannelPdu::from(packet.pdu.clone());
+            let data = if let Some(decryptor) = &mut decryptor {
+                print_data_packet(packet, &raw_data, false)?;
+                match decryptor.decrypt(&raw_data) {
+                    Ok(decryption) => {
+                        match decryption.status {
+                            LeAclDecryptionStatus::New {
+                                skipped_counters, ..
+                            } => {
+                                decrypted_packet_count += 1;
+                                skipped_packet_counter_count = skipped_packet_counter_count
+                                    .checked_add(skipped_counters)
+                                    .ok_or_else(|| {
+                                        Error::InvalidState(
+                                            "skipped packet-counter total overflow".to_owned(),
+                                        )
+                                    })?;
+                                if skipped_counters != 0
+                                    && let Some((direction, reassembler)) = &mut l2cap_reassembler
+                                    && let Some(incomplete) = reassembler.reset(*direction)
+                                {
+                                    l2cap_discarded_count += 1;
+                                    eprintln!(
+                                        "discarded incomplete plaintext L2CAP PDU after {skipped_counters} skipped encrypted packet counter(s): {}",
+                                        describe_incomplete_l2cap(incomplete)
+                                    );
+                                }
+                            }
+                            LeAclDecryptionStatus::Retransmission { .. } => {
+                                decryption_retransmission_count += 1;
+                            }
+                            LeAclDecryptionStatus::UnencryptedEmpty => {
+                                unencrypted_empty_count += 1;
+                            }
+                        }
+                        if let Err(error) =
+                            print_decrypted_data_packet(decryptor.direction(), &decryption)
+                            && decryption.packet.llid() == LogicalLinkId::Control
+                        {
+                            ll_control_error_count += 1;
+                            eprintln!(
+                                "decrypted LL control PDU decode error: opcode={} error={error}",
+                                decryption
+                                    .packet
+                                    .payload
+                                    .first()
+                                    .map(|opcode| format!("0x{opcode:02x}"))
+                                    .unwrap_or_else(|| "missing".to_owned())
+                            );
+                        }
+                        Some(decryption.packet)
+                    }
+                    Err(error) => {
+                        decryption_error_count += 1;
+                        eprintln!(
+                            "LE ACL decryption error: direction={} error={error}",
+                            decryptor.direction()
+                        );
+                        if let Some((direction, reassembler)) = &mut l2cap_reassembler
+                            && let Some(incomplete) = reassembler.reset(*direction)
+                        {
+                            l2cap_discarded_count += 1;
+                            eprintln!(
+                                "discarded incomplete plaintext L2CAP PDU after decryption failure: {}",
+                                describe_incomplete_l2cap(incomplete)
+                            );
+                        }
+                        None
+                    }
+                }
+            } else {
+                if let Err(error) = print_data_packet(packet, &raw_data, true)
+                    && raw_data.llid() == LogicalLinkId::Control
+                {
+                    ll_control_error_count += 1;
+                    eprintln!(
+                        "LL control PDU decode error: opcode={} error={error}",
+                        raw_data
+                            .payload
+                            .first()
+                            .map(|opcode| format!("0x{opcode:02x}"))
+                            .unwrap_or_else(|| "missing".to_owned())
+                    );
+                }
+                Some(raw_data.clone())
+            };
+            if let (Some((direction, reassembler)), Some(data)) =
+                (&mut l2cap_reassembler, data.as_ref())
             {
-                ll_control_error_count += 1;
-                eprintln!(
-                    "LL control PDU decode error: opcode={} error={error}",
-                    data.payload
-                        .first()
-                        .map(|opcode| format!("0x{opcode:02x}"))
-                        .unwrap_or_else(|| "missing".to_owned())
-                );
-            }
-            if let Some((direction, reassembler)) = &mut l2cap_reassembler {
-                match reassembler.push(*direction, &data) {
+                match reassembler.push(*direction, data) {
                     Ok(update) => {
                         if let Some(replaced) = update.replaced {
                             l2cap_discarded_count += 1;
@@ -2029,6 +2280,11 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     eprintln!(
         "decoded {packet_count} CRC-valid data-channel packet(s) from {sample_count} sample(s); ll_control_errors={ll_control_error_count}"
     );
+    if decryptor.is_some() {
+        eprintln!(
+            "authenticated {decrypted_packet_count} new encrypted packet(s); retransmissions={decryption_retransmission_count} unencrypted_empty={unencrypted_empty_count} skipped_counters={skipped_packet_counter_count} errors={decryption_error_count}"
+        );
+    }
     if l2cap_reassembler.is_some() {
         eprintln!(
             "reassembled {l2cap_pdu_count} plaintext L2CAP PDU(s); duplicates={l2cap_duplicate_count} orphan_continuations={l2cap_orphan_count} discarded_incomplete={l2cap_discarded_count} errors={l2cap_error_count} signaling_errors={l2cap_signaling_error_count} att_errors={att_error_count} smp_errors={smp_error_count}"

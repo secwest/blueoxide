@@ -192,6 +192,78 @@ fn cli_rejects_advertising_channel_and_wide_crc_init() {
         String::from_utf8_lossy(&output.stderr)
             .contains("--max-l2cap-payload requires --plaintext-l2cap-direction")
     );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--session-key",
+            "00",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected 16 hexadecimal octets"));
+
+    let decryption_options = [
+        "decode-data",
+        "--input",
+        "unused.cf32",
+        "--channel",
+        "0",
+        "--sample-rate",
+        "4000000",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+        "--session-key",
+        "99ad1b5226a37e3e058e3b8e27c2c666",
+        "--iv",
+        "24abdcbabebaafde",
+        "--decrypt-direction",
+        "central-to-peripheral",
+        "--packet-counter",
+        "0",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args(decryption_options)
+        .args(["--plaintext-l2cap-direction", "peripheral-to-central"])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--plaintext-l2cap-direction must match --decrypt-direction")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args(decryption_options)
+        .args(["--max-counter-skip", "65536"])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--max-counter-skip must be in 0..=65535")
+    );
+
+    let mut wide_counter_options = decryption_options;
+    wide_counter_options[18] = "549755813888";
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args(wide_counter_options)
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds the 39-bit range"));
 }
 
 #[test]
@@ -286,6 +358,138 @@ fn cli_reassembles_asserted_plaintext_l2cap_fragments() {
     assert!(stderr.contains("decoded 3 CRC-valid data-channel packet(s)"));
     assert!(stderr.contains(
         "reassembled 2 plaintext L2CAP PDU(s); duplicates=0 orphan_continuations=0 discarded_incomplete=0 errors=0 signaling_errors=0 att_errors=1"
+    ));
+}
+
+#[test]
+fn cli_authenticates_decrypts_and_reassembles_encrypted_waveforms() {
+    let channel = BleChannel::new(12).expect("valid channel");
+    let access_address = 0x1234_5678u32;
+    let crc_init = 0x00ab_cdef;
+    let first_ciphertext = [
+        0x15, 0x2f, 0x22, 0x1f, 0xb9, 0x0d, 0x46, 0xca, 0x36, 0x13, 0xdc, 0x47, 0x79,
+    ];
+    let second_ciphertext = [
+        0x55, 0x0a, 0x0e, 0x8b, 0xb1, 0x55, 0xe2, 0xa7, 0xdb, 0x0a, 0x85,
+    ];
+    let mut phase = 0.0f32;
+    let mut samples = vec![(1.0f32, 0.0f32); 11];
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x02, first_ciphertext.len() as u8],
+        &first_ciphertext,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x16, first_ciphertext.len() as u8],
+        &first_ciphertext,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x0a, second_ciphertext.len() as u8],
+        &second_ciphertext,
+    );
+    samples.extend(std::iter::repeat_n((phase.cos(), phase.sin()), 160));
+    let mut damaged = second_ciphertext;
+    damaged[0] ^= 1;
+    append_packet_samples(
+        &mut samples,
+        &mut phase,
+        channel,
+        access_address,
+        crc_init,
+        [0x02, damaged.len() as u8],
+        &damaged,
+    );
+
+    let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
+    for (i, q) in samples {
+        iq_bytes.extend_from_slice(&i.to_le_bytes());
+        iq_bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    let iq_path = temporary_path("encrypted.cf32");
+    fs::write(&iq_path, iq_bytes).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "73",
+            "--aa-errors",
+            "0",
+            "--session-key",
+            "99ad1b5226a37e3e058e3b8e27c2c666",
+            "--iv",
+            "24abdcbabebaafde",
+            "--decrypt-direction",
+            "central-to-peripheral",
+            "--packet-counter",
+            "5",
+            "--max-counter-skip",
+            "2",
+            "--plaintext-l2cap-direction",
+            "central-to-peripheral",
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains("payload=152f221fb90d46ca3613dc4779 crc="));
+    assert!(stdout.contains("plaintext_hint=\"encrypted\""));
+    assert!(stdout.contains(
+        "decrypted_data direction=central-to-peripheral status=new packet_counter=7 skipped_counters=2 header=0209 payload=050004000c01000200"
+    ));
+    assert!(stdout.contains(
+        "decrypted_data direction=central-to-peripheral status=retransmission packet_counter=7 skipped_counters=0 header=1609 payload=050004000c01000200"
+    ));
+    assert!(stdout.contains(
+        "decrypted_data direction=central-to-peripheral status=new packet_counter=8 skipped_counters=0 header=0a07 payload=030004000a0100"
+    ));
+    assert!(stdout.contains(
+        "att_pdu direction=central-to-peripheral opcode=0x0c name=read-blob-request type=request handle=0x0001 offset=2"
+    ));
+    assert!(stdout.contains(
+        "att_pdu direction=central-to-peripheral opcode=0x0a name=read-request type=request handle=0x0001"
+    ));
+    assert!(stdout.contains("payload=540a0e8bb155e2a7db0a85"));
+    assert!(stderr.contains("LE ACL decryption error: direction=central-to-peripheral"));
+    assert!(stderr.contains(
+        "authenticated 2 new encrypted packet(s); retransmissions=1 unencrypted_empty=0 skipped_counters=2 errors=1"
+    ));
+    assert!(stderr.contains(
+        "reassembled 2 plaintext L2CAP PDU(s); duplicates=1 orphan_continuations=0 discarded_incomplete=0 errors=0 signaling_errors=0 att_errors=0 smp_errors=0"
     ));
 }
 

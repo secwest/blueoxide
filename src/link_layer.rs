@@ -1,4 +1,5 @@
 use crate::ble::{BleChannel, LeFrameConfig, LePdu, decode_le_frames};
+use crate::crypto::Aes128Ccm;
 use crate::{Error, Result};
 use std::fmt::{Display, Formatter};
 
@@ -199,6 +200,15 @@ pub enum LinkDirection {
     PeripheralToCentral,
 }
 
+impl LinkDirection {
+    const fn encryption_direction_bit(self) -> u8 {
+        match self {
+            Self::CentralToPeripheral => 1,
+            Self::PeripheralToCentral => 0,
+        }
+    }
+}
+
 impl Display for LinkDirection {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -206,6 +216,202 @@ impl Display for LinkDirection {
             Self::PeripheralToCentral => formatter.write_str("peripheral-to-central"),
         }
     }
+}
+
+/// Number of MIC octets appended to an encrypted LE ACL payload.
+pub const LE_ACL_MIC_OCTETS: usize = 4;
+/// Exclusive upper bound for the 39-bit LE ACL packet counter.
+pub const LE_ACL_PACKET_COUNTER_LIMIT: u64 = 1 << 39;
+/// Maximum bounded packet-counter search accepted by the public decryptor.
+pub const LE_ACL_MAXIMUM_COUNTER_SKIP: u64 = 65_535;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeAclDecryptionStatus {
+    New {
+        packet_counter: u64,
+        skipped_counters: u64,
+    },
+    Retransmission {
+        packet_counter: u64,
+    },
+    UnencryptedEmpty,
+}
+
+impl LeAclDecryptionStatus {
+    pub const fn packet_counter(self) -> Option<u64> {
+        match self {
+            Self::New { packet_counter, .. } | Self::Retransmission { packet_counter } => {
+                Some(packet_counter)
+            }
+            Self::UnencryptedEmpty => None,
+        }
+    }
+
+    pub const fn skipped_counters(self) -> u64 {
+        match self {
+            Self::New {
+                skipped_counters, ..
+            } => skipped_counters,
+            Self::Retransmission { .. } | Self::UnencryptedEmpty => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeAclDecryption {
+    pub packet: DataChannelPdu,
+    pub status: LeAclDecryptionStatus,
+}
+
+/// Authenticates and decrypts one explicitly directed LE ACL packet stream.
+///
+/// The caller supplies the already-derived session key, combined IV, initial
+/// 39-bit packet counter, and actual transmitter direction. Counter state
+/// advances only after MIC verification. A bounded skip search can recover
+/// after known capture loss; retransmissions reuse the last authenticated
+/// counter, while zero-length data PDUs bypass encryption and counters.
+pub struct LeAclDecryptor {
+    ccm: Aes128Ccm,
+    initialization_vector: [u8; 8],
+    direction: LinkDirection,
+    next_packet_counter: u64,
+    maximum_counter_skip: u64,
+    last_authenticated: Option<(bool, u64)>,
+}
+
+impl LeAclDecryptor {
+    /// Creates explicit state for one transmitter direction.
+    ///
+    /// `session_key` uses AES input byte order. `initialization_vector` uses
+    /// Link Layer nonce order: the four central IV octets followed by the four
+    /// peripheral IV octets.
+    pub fn new(
+        session_key: [u8; 16],
+        initialization_vector: [u8; 8],
+        direction: LinkDirection,
+        initial_packet_counter: u64,
+        maximum_counter_skip: u64,
+    ) -> Result<Self> {
+        if initial_packet_counter >= LE_ACL_PACKET_COUNTER_LIMIT {
+            return Err(Error::InvalidConfiguration(format!(
+                "LE ACL packet counter {initial_packet_counter} exceeds the 39-bit range"
+            )));
+        }
+        if maximum_counter_skip > LE_ACL_MAXIMUM_COUNTER_SKIP {
+            return Err(Error::InvalidConfiguration(format!(
+                "LE ACL maximum counter skip must be in 0..={LE_ACL_MAXIMUM_COUNTER_SKIP}"
+            )));
+        }
+        Ok(Self {
+            ccm: Aes128Ccm::new(session_key),
+            initialization_vector,
+            direction,
+            next_packet_counter: initial_packet_counter,
+            maximum_counter_skip,
+            last_authenticated: None,
+        })
+    }
+
+    pub const fn direction(&self) -> LinkDirection {
+        self.direction
+    }
+
+    pub const fn next_packet_counter(&self) -> u64 {
+        self.next_packet_counter
+    }
+
+    pub fn decrypt(&mut self, packet: &DataChannelPdu) -> Result<LeAclDecryption> {
+        if usize::from(packet.declared_payload_length()) != packet.payload.len() {
+            return Err(Error::InvalidInput(format!(
+                "data-channel Length declares {} octets but the packet retains {}",
+                packet.declared_payload_length(),
+                packet.payload.len()
+            )));
+        }
+        if packet.payload.is_empty() {
+            return Ok(LeAclDecryption {
+                packet: packet.clone(),
+                status: LeAclDecryptionStatus::UnencryptedEmpty,
+            });
+        }
+        if packet.payload.len() < LE_ACL_MIC_OCTETS {
+            return Err(Error::InvalidInput(format!(
+                "encrypted LE ACL payload requires a {LE_ACL_MIC_OCTETS}-octet MIC, received {} Length-counted octets",
+                packet.payload.len()
+            )));
+        }
+
+        let sequence_number = packet.sequence_number();
+        if let Some((last_sequence_number, packet_counter)) = self.last_authenticated
+            && sequence_number == last_sequence_number
+            && let Some(plaintext) = self.decrypt_at_counter(packet, packet_counter)
+        {
+            return Ok(LeAclDecryption {
+                packet: decrypted_packet(packet, plaintext),
+                status: LeAclDecryptionStatus::Retransmission { packet_counter },
+            });
+        }
+
+        let first_counter = self.next_packet_counter;
+        if first_counter >= LE_ACL_PACKET_COUNTER_LIMIT {
+            return Err(Error::InvalidState(
+                "LE ACL packet counter is exhausted".to_owned(),
+            ));
+        }
+        let final_counter = first_counter
+            .saturating_add(self.maximum_counter_skip)
+            .min(LE_ACL_PACKET_COUNTER_LIMIT - 1);
+        for packet_counter in first_counter..=final_counter {
+            let Some(plaintext) = self.decrypt_at_counter(packet, packet_counter) else {
+                continue;
+            };
+            let skipped_counters = packet_counter - first_counter;
+            self.next_packet_counter = packet_counter + 1;
+            self.last_authenticated = Some((sequence_number, packet_counter));
+            return Ok(LeAclDecryption {
+                packet: decrypted_packet(packet, plaintext),
+                status: LeAclDecryptionStatus::New {
+                    packet_counter,
+                    skipped_counters,
+                },
+            });
+        }
+
+        Err(Error::InvalidInput(format!(
+            "LE ACL MIC verification failed for {} direction over packet counters {first_counter}..={final_counter}",
+            self.direction
+        )))
+    }
+
+    fn decrypt_at_counter(&self, packet: &DataChannelPdu, packet_counter: u64) -> Option<Vec<u8>> {
+        self.ccm.decrypt(
+            encryption_nonce(packet_counter, self.direction, self.initialization_vector),
+            packet.header[0] & 0xe3,
+            &packet.payload,
+        )
+    }
+}
+
+fn encryption_nonce(
+    packet_counter: u64,
+    direction: LinkDirection,
+    initialization_vector: [u8; 8],
+) -> [u8; 13] {
+    debug_assert!(packet_counter < LE_ACL_PACKET_COUNTER_LIMIT);
+    let counter = packet_counter.to_le_bytes();
+    let mut nonce = [0u8; 13];
+    nonce[..5].copy_from_slice(&counter[..5]);
+    nonce[4] |= direction.encryption_direction_bit() << 7;
+    nonce[5..].copy_from_slice(&initialization_vector);
+    nonce
+}
+
+fn decrypted_packet(packet: &DataChannelPdu, plaintext: Vec<u8>) -> DataChannelPdu {
+    let mut decrypted = packet.clone();
+    decrypted.header[1] =
+        u8::try_from(plaintext.len()).expect("MIC removal leaves at most 251 plaintext octets");
+    decrypted.payload = plaintext;
+    decrypted
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1960,6 +2166,7 @@ pub const fn csa2_pseudo_random(event_counter: u16, channel_identifier: u16) -> 
 mod tests {
     use super::*;
     use crate::ble::{bytes_to_bits_lsb, crc24_bytes, whiten_bits};
+    use crate::ll_control::DecodedControlPdu;
 
     fn all_channels() -> DataChannelMap {
         DataChannelMap::new([0xff, 0xff, 0xff, 0xff, 0x1f]).unwrap()
@@ -1989,6 +2196,257 @@ mod tests {
             cte_info: None,
             payload: payload.to_vec(),
             crc: [0; 3],
+        }
+    }
+
+    fn core_session_key() -> [u8; 16] {
+        [
+            0x99, 0xad, 0x1b, 0x52, 0x26, 0xa3, 0x7e, 0x3e, 0x05, 0x8e, 0x3b, 0x8e, 0x27, 0xc2,
+            0xc6, 0x66,
+        ]
+    }
+
+    fn core_initialization_vector() -> [u8; 8] {
+        [0x24, 0xab, 0xdc, 0xba, 0xbe, 0xba, 0xaf, 0xde]
+    }
+
+    #[test]
+    fn decrypts_bluetooth_core_acl_vectors_in_both_directions() {
+        let mut central = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            1,
+            0,
+        )
+        .unwrap();
+        let central_packet = data_packet(
+            0x0e,
+            &[
+                0x7a, 0x70, 0xd6, 0x64, 0x15, 0x22, 0x6d, 0xf2, 0x6b, 0x17, 0x83, 0x9a, 0x06, 0x04,
+                0x05, 0x59, 0x6b, 0xd6, 0x56, 0x4f, 0x79, 0x6b, 0x5b, 0x9c, 0xe6, 0xff, 0x32, 0xf7,
+                0x5a, 0x6d, 0x33,
+            ],
+        );
+        let decrypted = central.decrypt(&central_packet).unwrap();
+        assert_eq!(
+            decrypted.status,
+            LeAclDecryptionStatus::New {
+                packet_counter: 1,
+                skipped_counters: 0,
+            }
+        );
+        assert_eq!(
+            decrypted.packet.payload,
+            [
+                0x17, 0x00, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e,
+                0x6f, 0x70, 0x71, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x30,
+            ]
+        );
+        assert_eq!(decrypted.packet.header, [0x0e, 27]);
+
+        let mut peripheral = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::PeripheralToCentral,
+            1,
+            0,
+        )
+        .unwrap();
+        let peripheral_packet = data_packet(
+            0x06,
+            &[
+                0xf3, 0x88, 0x81, 0xe7, 0xbd, 0x94, 0xc9, 0xc3, 0x69, 0xb9, 0xa6, 0x68, 0x46, 0xdd,
+                0x47, 0x86, 0xaa, 0x8c, 0x39, 0xce, 0x54, 0x0d, 0x0d, 0xae, 0x3a, 0xdc, 0xdf, 0x89,
+                0xb9, 0x60, 0x88,
+            ],
+        );
+        assert_eq!(
+            peripheral
+                .decrypt(&peripheral_packet)
+                .unwrap()
+                .packet
+                .payload,
+            [
+                0x17, 0x00, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x30, 0x41, 0x42, 0x43, 0x44,
+                0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51,
+            ]
+        );
+    }
+
+    #[test]
+    fn decrypts_first_encrypted_control_packets_and_masks_sequence_bits() {
+        let mut decryptor = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            0,
+            0,
+        )
+        .unwrap();
+        let packet = data_packet(0x13, &[0x9f, 0xcd, 0xa7, 0xf4, 0x48]);
+        let decrypted = decryptor.decrypt(&packet).unwrap();
+        assert_eq!(decrypted.packet.header, [0x13, 1]);
+        assert_eq!(decrypted.packet.payload, [0x06]);
+        assert!(matches!(
+            decrypted
+                .packet
+                .control()
+                .unwrap()
+                .unwrap()
+                .decode()
+                .unwrap(),
+            DecodedControlPdu::StartEncryptionResponse
+        ));
+
+        let mut peripheral = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::PeripheralToCentral,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            peripheral
+                .decrypt(&data_packet(0x07, &[0xa3, 0x4c, 0x13, 0xa4, 0x15]))
+                .unwrap()
+                .packet
+                .payload,
+            [0x06]
+        );
+
+        let mut wrong_llid = packet;
+        wrong_llid.header[0] = 0x11;
+        let mut fresh = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(fresh.decrypt(&wrong_llid).is_err());
+    }
+
+    #[test]
+    fn decryptor_searches_skipped_counters_and_reuses_retransmission_counter() {
+        let first = data_packet(
+            0x02,
+            &[
+                0x15, 0x2f, 0x22, 0x1f, 0xb9, 0x0d, 0x46, 0xca, 0x36, 0x13, 0xdc, 0x47, 0x79,
+            ],
+        );
+        let mut decryptor = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            5,
+            2,
+        )
+        .unwrap();
+        let decrypted = decryptor.decrypt(&first).unwrap();
+        assert_eq!(
+            decrypted.status,
+            LeAclDecryptionStatus::New {
+                packet_counter: 7,
+                skipped_counters: 2,
+            }
+        );
+        assert_eq!(decrypted.packet.payload, [5, 0, 4, 0, 0x0c, 1, 0, 2, 0]);
+        assert_eq!(decryptor.next_packet_counter(), 8);
+
+        let mut retransmission = first;
+        retransmission.header[0] = 0x16;
+        assert_eq!(
+            decryptor.decrypt(&retransmission).unwrap().status,
+            LeAclDecryptionStatus::Retransmission { packet_counter: 7 }
+        );
+        assert_eq!(decryptor.next_packet_counter(), 8);
+
+        let second = data_packet(
+            0x0a,
+            &[
+                0x53, 0x0a, 0x0e, 0x8b, 0xb1, 0x55, 0xe2, 0xd9, 0x1a, 0xd3, 0x66, 0xeb, 0x93,
+            ],
+        );
+        assert_eq!(
+            decryptor.decrypt(&second).unwrap().status,
+            LeAclDecryptionStatus::New {
+                packet_counter: 8,
+                skipped_counters: 0,
+            }
+        );
+        assert_eq!(decryptor.next_packet_counter(), 9);
+    }
+
+    #[test]
+    fn mic_failure_and_empty_pdus_do_not_advance_counter_state() {
+        let mut decryptor = LeAclDecryptor::new(
+            core_session_key(),
+            core_initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            7,
+            0,
+        )
+        .unwrap();
+        let mut damaged = data_packet(
+            0x02,
+            &[
+                0x15, 0x2f, 0x22, 0x1f, 0xb9, 0x0d, 0x46, 0xca, 0x36, 0x13, 0xdc, 0x47, 0x79,
+            ],
+        );
+        damaged.payload[0] ^= 1;
+        assert!(decryptor.decrypt(&damaged).is_err());
+        assert_eq!(decryptor.next_packet_counter(), 7);
+
+        let empty = data_packet(0x01, &[]);
+        assert_eq!(
+            decryptor.decrypt(&empty).unwrap(),
+            LeAclDecryption {
+                packet: empty,
+                status: LeAclDecryptionStatus::UnencryptedEmpty,
+            }
+        );
+        assert_eq!(decryptor.next_packet_counter(), 7);
+    }
+
+    #[test]
+    fn decryptor_validates_counter_and_handles_bounded_arbitrary_pdus() {
+        assert!(
+            LeAclDecryptor::new(
+                [0; 16],
+                [0; 8],
+                LinkDirection::CentralToPeripheral,
+                LE_ACL_PACKET_COUNTER_LIMIT,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            LeAclDecryptor::new(
+                [0; 16],
+                [0; 8],
+                LinkDirection::CentralToPeripheral,
+                0,
+                LE_ACL_MAXIMUM_COUNTER_SKIP + 1,
+            )
+            .is_err()
+        );
+        let mut decryptor = LeAclDecryptor::new(
+            [0x5a; 16],
+            [0xa5; 8],
+            LinkDirection::PeripheralToCentral,
+            0,
+            0,
+        )
+        .unwrap();
+        for length in 0..=u8::MAX {
+            let payload: Vec<u8> = (0..length)
+                .map(|index| index.wrapping_mul(73).wrapping_add(length))
+                .collect();
+            let packet = data_packet(length.rotate_left(3), &payload);
+            let _ = decryptor.decrypt(&packet);
         }
     }
 

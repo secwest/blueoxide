@@ -938,3 +938,65 @@ values, choose an ACI, apply a CS channel map or Frame Space value, validate an
 instant against the observed event, derive CS security state, or schedule CS
 subevents. Those operations require connection history and negotiated local
 and remote capabilities.
+
+## 2026-07-21: Decrypt LE ACL only from explicit authenticated state
+
+### Cryptographic boundary
+
+LE ACL payload protection is AES-128 CCM with a four-octet MIC. The 13-octet
+nonce consists of the 39-bit direction-specific packet counter in little-endian
+order, the transmitter direction in the high bit of counter octet four, and the
+eight-octet Link Layer IV. Central-to-peripheral uses direction bit one;
+peripheral-to-central uses zero. The one-octet associated data is the first
+data-channel header octet masked with `0xe3`, authenticating LLID, CP, and RFU
+while excluding NESN, SN, and MD.
+
+The dependency-free core now contains an in-tree AES-128 block cipher and the
+fixed LE CCM profile rather than a general cryptographic API. The public
+`LeAclDecryptor` accepts an already-derived session key, combined IV, explicit
+`LinkDirection`, initial 39-bit counter, and bounded maximum counter skip. It
+does not accept an LTK or claim to reconstruct the encryption procedure.
+The private table-based AES implementation is scoped to offline capture
+analysis; it is not exposed as a general-purpose or side-channel-hardened
+cryptographic service.
+
+### Counter and retransmission state
+
+Each transmitter direction has an independent packet counter. A new nonempty
+packet advances state only after MIC verification. If SN matches the last
+authenticated packet, the decryptor first retries that packet's counter;
+successful authentication identifies a retransmission and leaves the next
+counter unchanged. A zero-length data PDU bypasses CCM and consumes no counter.
+
+Capture loss can make a caller's next expected counter stale. The optional
+bounded search tries the expected counter through the configured skip limit and
+accepts only a MIC-valid result. The CLI caps that search at 65,535 counters to
+bound CPU work. A successful skip reports the exact number of absent encrypted
+counter values. A failed search changes no cryptographic state.
+
+SN alone is not used to infer how many packets were missed. Empty packets can
+change sequence behavior without consuming an encryption counter, and a
+fixed-channel recording can miss arbitrary hopping events. The MIC is the only
+acceptance oracle.
+
+### Lossless output and higher-layer state
+
+`decode-data` always emits and captures the original CRC-valid ciphertext and
+MIC. When decryption is configured, that raw line is marked `encrypted`; a
+separate `decrypted_data` line reports direction, new/retransmission/empty
+status, authenticated counter, skipped counters, adjusted plaintext Length,
+and plaintext bytes. Only authenticated plaintext reaches LL control and
+L2CAP/ATT/signaling/SMP decoding.
+
+A decryption failure or a successful nonzero counter skip represents a
+plaintext stream gap. The CLI discards and reports an incomplete L2CAP PDU
+before accepting later plaintext. PCAPNG remains an over-the-air ciphertext
+record rather than being rewritten with synthetic decrypted packets.
+
+### Deliberate state boundary
+
+The decryptor does not infer packet direction, discover the initial counter,
+combine `LL_ENC_REQ` and `LL_ENC_RSP` into procedure state, derive a session key
+from an LTK/SKD, pause or refresh encryption, or derive keys from SMP. Callers
+must create independent state for each direction. Command-line session keys are
+sensitive and can be exposed through shell history or process inspection.

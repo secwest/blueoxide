@@ -14,6 +14,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - CRC-gated decoding of primary advertising PDUs on channels 37, 38, and 39.
 - Configurable CRC-gated LE 1M data-channel decoding for a known connection
   access address, CRC initializer, and logical channel.
+- Dependency-free AES-128/CCM authentication and decryption for explicitly
+  directed LE ACL streams with caller-supplied session state, MIC-gated counter
+  advancement, retransmission handling, and bounded counter resynchronization.
 - LE 1M quadrature demodulation with integer timing-phase search, robust slicing,
   spectrum-inversion handling, and configurable access-address tolerance.
 - Bounded streaming input for interleaved little-endian `f32` and signed 16-bit
@@ -129,9 +132,9 @@ and 24-bit CRC initializer normally come from a decoded CONNECT_IND. Data PDUs
 are emitted only after CRC validation. When the CP bit is set, the separate
 CTEInfo octet is retained and decoded without including it in the Length-counted
 payload. The payload field remains lossless and can include an encrypted MIC
-because decryption state is not yet tracked. Printed L2CAP and LL control
-interpretations are explicitly plaintext hints; encrypted payloads remain
-available as raw bytes but cannot yet be interpreted reliably.
+when decryption is not configured. Printed L2CAP and LL control interpretations
+are explicitly plaintext hints in that mode; encrypted payloads remain
+available as raw bytes and are not guessed from packet shape.
 
 LLID `0b11` packets receive strict typed LL control decoding without requiring
 L2CAP reassembly. Blueoxide validates exact parameter sizes for every assigned
@@ -159,6 +162,45 @@ data. The parser does not enforce procedure order, role legality relative to
 connection history, capability negotiation, instant timing relative to an
 observed event, application of CS or Frame Space changes, or encryption state.
 
+For a recording with known link-encryption state, authenticate and decrypt one
+asserted transmitter direction:
+
+```text
+cargo run --release -- decode-data \
+  --input central-encrypted.cf32 \
+  --format f32le \
+  --channel 12 \
+  --sample-rate 4000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --session-key 99ad1b5226a37e3e058e3b8e27c2c666 \
+  --iv 24abdcbabebaafde \
+  --decrypt-direction central-to-peripheral \
+  --packet-counter 0 \
+  --max-counter-skip 32 \
+  --plaintext-l2cap-direction central-to-peripheral
+```
+
+`--session-key` is the already-derived 16-octet AES key in left-to-right AES
+input order. `--iv` is the eight nonce octets in Link Layer order: the four
+central IV octets followed by the four peripheral IV octets. Blueoxide does not
+derive either value from an LTK, SMP transcript, or observed
+`LL_ENC_REQ`/`LL_ENC_RSP`.
+
+Direction and the initial 39-bit packet counter are also caller assertions.
+The decryptor advances its per-direction counter only after a valid four-octet
+MIC. Exact retransmissions reuse the last authenticated counter, zero-length
+data PDUs consume no counter, and `--max-counter-skip` permits a bounded forward
+MIC search after missing encrypted packets. A MIC failure or confirmed skipped
+counter resets any incomplete L2CAP reassembly before later plaintext is used.
+
+Every CRC-valid ciphertext packet is still printed and written to PCAPNG
+unchanged. Authenticated bytes appear on a separate `decrypted_data` line and
+only those bytes enter LL control, L2CAP, ATT, signaling, or SMP decoding. The
+PCAPNG file remains an over-the-air ciphertext capture, not a synthesized
+plaintext trace. Session keys supplied on a command line may be visible in
+shell history and process inspection and must be handled as sensitive data.
+
 For a recording that is already known to contain a complete, ordered plaintext
 stream from one link direction, opt into L2CAP PDU reassembly:
 
@@ -174,10 +216,12 @@ cargo run --release -- decode-data \
   --max-l2cap-payload 65535
 ```
 
-This option is an assertion by the caller, not direction or encryption
-detection. Each emitted `l2cap_pdu` contains the direction, CID, declared
-payload length, fragment count, and complete payload bytes. Central and
-peripheral streams require separate direction state. Exact consecutive
+This option is an assertion by the caller, not direction detection. Without
+decryption options it asserts that the captured bytes are already plaintext;
+with decryption options it selects the matching authenticated plaintext stream.
+Each emitted `l2cap_pdu` contains the direction, CID, declared payload length,
+fragment count, and complete payload bytes. Central and peripheral streams
+require separate direction, counter, and reassembly state. Exact consecutive
 fragment retransmissions are suppressed; malformed lengths, orphaned
 continuations, replacement starts, and incomplete end-of-input state are
 reported without discarding the original CRC-valid packet output.
@@ -219,11 +263,12 @@ address type/static-random structure, and keypress types. Reserved future
 command codes retain every parameter byte.
 
 SMP output is passive syntax, not a pairing engine. It does not enforce command
-sequence or role, correlate Pairing Request and Response masks, derive STK/LTK
-or MacKey, verify confirms or DHKey checks, or decrypt the link. Raw and typed
-SMP output can contain LTK, IRK, CSRK, random, and public-key material and must
-be handled as sensitive capture data. Malformed known commands increment
-`smp_errors` only after the complete raw `l2cap_pdu` has been printed.
+sequence or role, correlate Pairing Request and Response masks, derive STK/LTK,
+session keys, or MacKey, verify confirms or DHKey checks, or automatically
+configure link decryption. Raw and typed SMP output can contain LTK, IRK, CSRK,
+random, and public-key material and must be handled as sensitive capture data.
+Malformed known commands increment `smp_errors` only after the complete raw
+`l2cap_pdu` has been printed.
 
 An ordinary recording centered on one data channel is generally incomplete for
 a hopping connection because packets transmitted on other channels are absent.
@@ -399,13 +444,14 @@ The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
 synchronization, instant-based map/parameter updates, and direction-explicit
-plaintext L2CAP PDU reassembly are now present; the next receive stages are
-wideband channelization or timed retuning, automatic capture-driven observation
-delivery, and live BLE connection following. Full packet decode is a project
-requirement: extended advertising, complete LL control semantics, L2CAP
-channel state, stateful GATT reconstruction and pairing, encryption, LE
-2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added incrementally
-while retaining undecoded packet bytes losslessly.
+ACL decryption and plaintext L2CAP PDU reassembly are now present; the next
+receive stages are wideband channelization or timed retuning, automatic
+capture-driven observation delivery, and live BLE connection following. Full
+packet decode is a project requirement: extended advertising, complete LL
+procedure state, automatic pairing/session-key derivation, bidirectional
+encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
+LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added
+incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

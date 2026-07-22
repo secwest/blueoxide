@@ -10,6 +10,7 @@ pub mod backends;
 pub mod ble;
 pub mod capture;
 pub mod complex;
+mod crypto;
 pub mod demod;
 pub mod error;
 pub mod iq;

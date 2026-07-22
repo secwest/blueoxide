@@ -35,6 +35,13 @@
   initialization, and advertising/data PDU length semantics.
 - LE data-channel header decoding for LLID, NESN, SN, MD, CP, reserved bits,
   payload length, optional CTEInfo, and lossless payload/MIC bytes.
+- Dependency-free AES-128 and the Bluetooth LE ACL AES-CCM profile with
+  four-octet MIC verification, masked-header authentication, 39-bit
+  direction-specific nonces, and official Core sample-vector coverage.
+- Explicit-state `LeAclDecryptor` support for caller-supplied session keys,
+  combined IVs, transmitter direction, and initial packet counters, including
+  MIC-gated advancement, retransmission counter reuse, zero-length PDU bypass,
+  and bounded counter-skip recovery.
 - CTEInfo decoding for CTE time, AoA/AoD type, and reserved values, with the
   CTEInfo octet included in CRC and capture bytes but excluded from the
   Length-counted payload.
@@ -88,6 +95,9 @@
   `blueoxide connection-acquire`, and `blueoxide connection-sync` commands.
 - Opt-in `decode-data --plaintext-l2cap-direction` output for complete,
   direction-asserted plaintext streams.
+- Opt-in `decode-data` LE ACL authentication/decryption with separate lossless
+  ciphertext and authenticated `decrypted_data` output, decryption/error
+  counters, and safe L2CAP reset after MIC failure or confirmed packet loss.
 - A hardware-neutral `IqSource` receive trait and SDR configuration validation.
 - Receive metadata fields for sample index, dropped samples, and overrun state.
 - An in-tree Windows/Unix dynamic-library loader with tested symbol lookup.
@@ -149,7 +159,8 @@
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
-  decryption, stateful L2CAP channels, GATT/EATT and pairing state, Bluetooth
+  automatic direction/counter inference, encryption-procedure and session-key
+  derivation, stateful L2CAP channels, GATT/EATT and pairing state, Bluetooth
   Classic, LE 2M, and LE Coded PHY remain to be implemented.
-- Channel Sounding and Frame Space LL control payloads are named and preserved
-  but do not yet have typed field decoding or procedure state.
+- Channel Sounding and Frame Space LL control syntax is typed, but its
+  connection-scoped procedure state is not yet implemented.
