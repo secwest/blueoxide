@@ -1,4 +1,5 @@
 use blueoxide::ble::{BleChannel, bytes_to_bits_lsb, crc24_bytes, whiten_bits};
+use blueoxide::demod::LeUncodedPhy;
 use std::f32::consts::TAU;
 use std::fs;
 use std::process::Command;
@@ -21,18 +22,66 @@ fn append_packet_samples(
     header: [u8; 2],
     payload: &[u8],
 ) {
+    append_uncoded_packet_samples(
+        samples,
+        phase,
+        channel,
+        access_address,
+        crc_init,
+        header,
+        payload,
+        LeUncodedPhy::Le1M,
+        4,
+        -30_000.0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_uncoded_packet_samples(
+    samples: &mut Vec<(f32, f32)>,
+    phase: &mut f32,
+    channel: BleChannel,
+    access_address: u32,
+    crc_init: u32,
+    header: [u8; 2],
+    payload: &[u8],
+    phy: LeUncodedPhy,
+    samples_per_symbol: usize,
+    carrier_offset_hz: f32,
+) {
     let mut pdu = Vec::from(header);
     pdu.extend_from_slice(payload);
     pdu.extend_from_slice(&crc24_bytes(&pdu, crc_init));
     let mut body = bytes_to_bits_lsb(&pdu);
     whiten_bits(&mut body, channel);
-    let mut bits = bytes_to_bits_lsb(&[0xaa]);
+    let preamble = if access_address & 1 == 0 { 0xaa } else { 0x55 };
+    let mut bits = bytes_to_bits_lsb(&vec![preamble; phy.preamble_octets()]);
     bits.extend(bytes_to_bits_lsb(&access_address.to_le_bytes()));
     bits.extend(body);
+    append_uncoded_bit_samples(
+        samples,
+        phase,
+        &bits,
+        phy,
+        samples_per_symbol,
+        carrier_offset_hz,
+    );
+}
+
+fn append_uncoded_bit_samples(
+    samples: &mut Vec<(f32, f32)>,
+    phase: &mut f32,
+    bits: &[bool],
+    phy: LeUncodedPhy,
+    samples_per_symbol: usize,
+    carrier_offset_hz: f32,
+) {
     for bit in bits {
-        let frequency_hz = if bit { 250_000.0 } else { -250_000.0 } - 30_000.0;
-        let step = TAU * frequency_hz / 4_000_000.0;
-        for _ in 0..4 {
+        let deviation_hz = phy.nominal_deviation_hz() as f32;
+        let frequency_hz = if *bit { deviation_hz } else { -deviation_hz } + carrier_offset_hz;
+        let sample_rate_hz = phy.symbol_rate() as f32 * samples_per_symbol as f32;
+        let step = TAU * frequency_hz / sample_rate_hz;
+        for _ in 0..samples_per_symbol {
             *phase += step;
             samples.push((phase.cos(), phase.sin()));
         }
@@ -128,6 +177,102 @@ fn cli_decodes_data_channel_l2cap_and_writes_pcapng() {
 }
 
 #[test]
+fn cli_decodes_le_2m_data_channel_waveform() {
+    let phy = LeUncodedPhy::Le2M;
+    let channel = BleChannel::new(12).expect("valid channel");
+    let access_address = 0x1234_5678u32;
+    let pdu_with_crc = [
+        0x02, 0x07, 0x03, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00, 0xf2, 0x83, 0x8c,
+    ];
+    // Jiao Xianjun's BTLE crc24_core/scramble_core independently produced
+    // CRC f2838c and channel-12 whitened body 2ee8f3c789d25da03d55e53c.
+    let bits = bytes_to_bits_lsb(&[
+        0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12, 0x2e, 0xe8, 0xf3, 0xc7, 0x89, 0xd2, 0x5d, 0xa0, 0x3d,
+        0x55, 0xe5, 0x3c,
+    ]);
+    let mut phase = 0.0f32;
+    let mut samples = vec![(1.0f32, 0.0f32); 11];
+    append_uncoded_bit_samples(&mut samples, &mut phase, &bits, phy, 4, -120_000.0);
+
+    let mut iq_bytes = Vec::with_capacity(samples.len() * 8);
+    for (i, q) in samples {
+        iq_bytes.extend_from_slice(&i.to_le_bytes());
+        iq_bytes.extend_from_slice(&q.to_le_bytes());
+    }
+    let iq_path = temporary_path("le-2m.cf32");
+    let pcap_path = temporary_path("le-2m.pcapng");
+    fs::write(&iq_path, iq_bytes).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--phy",
+            "2m",
+            "--sample-rate",
+            "8000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "67",
+            "--aa-errors",
+            "0",
+            "--plaintext-l2cap-direction",
+            "central-to-peripheral",
+            "--output-pcap",
+            pcap_path.to_str().expect("UTF-8 temporary path"),
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pcap = fs::read(&pcap_path).expect("read PCAPNG");
+    let _ = fs::remove_file(&pcap_path);
+    let access_address_bytes = access_address.to_le_bytes();
+    let phy_flags = 0x4c31u16.to_le_bytes();
+    let expected_pcap_packet = [
+        [channel.index(), 0, 0, 0].as_slice(),
+        access_address_bytes.as_slice(),
+        phy_flags.as_slice(),
+        access_address_bytes.as_slice(),
+        pdu_with_crc.as_slice(),
+    ]
+    .concat();
+    assert!(
+        pcap.windows(expected_pcap_packet.len())
+            .any(|window| window == expected_pcap_packet),
+        "PCAPNG lacks the LE 2M pseudo-header and packet bytes"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains("channel=12 phy=LE-2M"));
+    let deviation_hz: f32 = stdout
+        .split_once("deviation_hz=")
+        .and_then(|(_, value)| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .expect("packet output includes numeric deviation estimate");
+    assert!((deviation_hz - 500_000.0).abs() < 20_000.0);
+    assert!(stdout.contains(
+        "l2cap_pdu direction=central-to-peripheral cid=0x0004 length=3 fragments=1 payload=0a0100"
+    ));
+    assert!(stdout.contains(
+        "att_pdu direction=central-to-peripheral opcode=0x0a name=read-request type=request handle=0x0001"
+    ));
+    assert!(stderr.contains("decoded 1 CRC-valid data-channel packet(s)"));
+}
+
+#[test]
 fn cli_rejects_advertising_channel_and_wide_crc_init() {
     let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
         .args([
@@ -213,6 +358,51 @@ fn cli_rejects_advertising_channel_and_wide_crc_init() {
         .expect("run blueoxide");
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected 16 hexadecimal octets"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--phy",
+            "coded",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected 1m or 2m"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--phy",
+            "2m",
+            "--sample-rate",
+            "5000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("LE-2M requires a sample rate that is an integer multiple of 2000000 Hz")
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
         .args([

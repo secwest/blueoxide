@@ -1,5 +1,5 @@
 use crate::ble::LE_ADV_ACCESS_ADDRESS;
-use crate::demod::{ReceivedAdvertisingPdu, ReceivedLePdu};
+use crate::demod::{LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu};
 use crate::{Error, Result};
 use std::io::Write;
 
@@ -15,6 +15,7 @@ const BLE_REFERENCE_ACCESS_ADDRESS_VALID: u16 = 0x0010;
 const BLE_ACCESS_ADDRESS_OFFENSES_VALID: u16 = 0x0020;
 const BLE_CRC_CHECKED: u16 = 0x0400;
 const BLE_CRC_VALID: u16 = 0x0800;
+const BLE_PHY_LE_2M: u16 = 0x4000;
 
 pub struct PcapNgWriter<W: Write> {
     writer: W,
@@ -54,16 +55,22 @@ impl<W: Write> PcapNgWriter<W> {
             packet.pdu.access_address_errors,
             LE_ADV_ACCESS_ADDRESS,
             &packet.pdu.link_layer_bytes(),
+            0,
             timestamp_ns,
         )
     }
 
     pub fn write_le(&mut self, packet: &ReceivedLePdu, timestamp_ns: u64) -> Result<()> {
+        let phy_flags = match packet.phy {
+            LeUncodedPhy::Le1M => 0,
+            LeUncodedPhy::Le2M => BLE_PHY_LE_2M,
+        };
         self.write_packet(
             packet.pdu.channel.index(),
             packet.pdu.access_address_errors,
             packet.pdu.access_address,
             &packet.pdu.link_layer_bytes(),
+            phy_flags,
             timestamp_ns,
         )
     }
@@ -74,6 +81,7 @@ impl<W: Write> PcapNgWriter<W> {
         access_address_errors: u8,
         access_address: u32,
         link_layer_bytes: &[u8],
+        phy_flags: u16,
         timestamp_ns: u64,
     ) -> Result<()> {
         let mut captured = Vec::with_capacity(10 + link_layer_bytes.len());
@@ -86,7 +94,8 @@ impl<W: Write> PcapNgWriter<W> {
             | BLE_REFERENCE_ACCESS_ADDRESS_VALID
             | BLE_ACCESS_ADDRESS_OFFENSES_VALID
             | BLE_CRC_CHECKED
-            | BLE_CRC_VALID;
+            | BLE_CRC_VALID
+            | phy_flags;
         captured.extend_from_slice(&flags.to_le_bytes());
         captured.extend_from_slice(link_layer_bytes);
 

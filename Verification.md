@@ -6,7 +6,7 @@ dependency.
 
 ## Environment
 
-- Date: 2026-07-13 through 2026-07-19
+- Date: 2026-07-13 through 2026-07-22
 - Rust: 1.95.0
 - Python: 3.14.4
 - NumPy: 2.4.6
@@ -727,6 +727,8 @@ git diff --check
 The checked-in test suite covers:
 
 - LE 1M at 2, 4, 8, and 16 samples per symbol.
+- LE 2M at 2, 4, and 8 samples per symbol with -200 kHz, zero, and +200 kHz
+  carrier offsets, normal/inverted spectra, and streaming block boundaries.
 - Carrier offsets of -100 kHz, 0, and +100 kHz.
 - Normal and conjugated/inverted complex spectra.
 - Packets split across arbitrary stream blocks.
@@ -1050,6 +1052,69 @@ cargo build --release
 cargo doc --no-deps
 ```
 
+## LE 2M data-channel verification
+
+PHY and controller references:
+
+- Bluetooth Core Specification, Vol 6, Part A, uncoded LE PHY modulation and
+  preamble definitions.
+- Zephyr Bluetooth Controller commit
+  `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`.
+- `subsys/bluetooth/controller/ll_sw/pdu.h`, where
+  `PDU_PREAMBLE_SIZE(phy)` selects one octet for LE 1M and two for LE 2M.
+- `subsys/bluetooth/controller/ll_sw/openisa/hal/RV32M1/radio/radio.c`, which
+  selects `DR_2MBPS`, uses GFSK modulation index 0.5, and records two bits per
+  microsecond.
+
+The independent bit-level oracle is Jiao Xianjun's BTLE commit
+`85401861e8f4b04b90cbaa0394c0f9d45ed02f18`. Its Python
+`crc24_core` and `scramble_core` generated this fixed channel-12 vector:
+
+```text
+Access address:       12345678
+CRC init:             abcdef
+Header + payload:     0207030004000a0100
+Transmitted CRC:      f2838c
+Whitened body:        2ee8f3c789d25da03d55e53c
+LE 2M over-air bytes: aaaa785634122ee8f3c789d25da03d55e53c
+```
+
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+independently returned the same `f2838c` CRC. The fixed whitened bytes are
+embedded directly in the library and CLI waveform tests; those tests do not
+call Blueoxide's CRC or whitening helpers to construct the LE 2M packet.
+
+The library modulates the vector at 2, 4, and 8 samples per symbol, checks
+-200 kHz, zero, and +200 kHz carrier offsets in both normal and conjugated
+spectra, and then feeds an 8 Msps version through 61-sample stream blocks.
+Every case must recover one CRC-valid packet with PHY `LE-2M`, the exact ATT
+Read Request payload, the expected inversion state, and a deviation estimate
+within 20 kHz of 500 kHz.
+
+The CLI fixture uses 8 Msps, -120 kHz carrier offset, channel 12, 67-sample
+blocks, access address `0x12345678`, and CRC init `0xabcdef`. It must emit
+`phy=LE-2M`, reconstruct L2CAP CID `0x0004`, decode ATT Read Request handle
+`0x0001`, and write the exact dewhitened packet to PCAPNG. The captured
+Bluetooth pseudo-header must contain flags `0x4c31`, including PHY value one
+for LE 2M. Validation tests reject LE Coded/unknown names and sample rates that
+are not integer multiples of 2 MHz before attempting to open the input file.
+
+Final local gate for this increment:
+
+```text
+159 library tests
+4 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1062,5 +1127,6 @@ cargo doc --no-deps
 - Long-duration stream tests with sample overruns and retunes.
 - Differential tests for extended advertising, data-channel following,
   stateful GATT, EATT, pairing and automatic LTK selection, full LL encryption
-  activation/pause state, automatic bidirectional encryption state, LE Coded
-  PHY, and Bluetooth Classic as those layers are added.
+  activation/pause state, automatic bidirectional encryption state, automatic
+  PHY-update application, LE Coded PHY, and Bluetooth Classic as those layers
+  are added.

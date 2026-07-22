@@ -115,18 +115,19 @@ The result is also immediately useful for receiver bring-up and RF validation.
 7. Parse the primary advertising header and bounded payload length.
 8. Emit only packets with a valid Bluetooth LE CRC.
 
-### Limitations
+### Initial limitations, partly superseded
 
-- Sample rate must currently be an integer multiple of 1 MHz, from 2 to 64
-  samples per symbol.
+- Primary advertising remains LE 1M and requires an integer multiple of 1 MHz,
+  from 2 to 64 samples per symbol.
 - Timing selection is exhaustive integer-phase search, not a streaming timing
   recovery loop.
 - Carrier offset is absorbed by the slicing threshold only while the two GFSK
   levels remain separable.
 - The decoder does not yet report calibrated RSSI, noise estimates, or a
   hardware-correlated wall-clock timestamp.
-- LE 2M, LE Coded PHY, secondary advertising, and data-channel PDUs are not yet
-  decoded.
+- This first increment omitted data-channel PDUs and LE 2M. Later entries add
+  both for fixed-PHY offline recordings; LE Coded PHY and secondary
+  advertising remain unsupported.
 
 ### Revisit when
 
@@ -181,7 +182,8 @@ priority:
    retuning plans for narrower devices.
 5. Write timestamped PCAPNG with receiver metadata and discontinuity records.
 6. Parse CONNECT_IND/AUX_CONNECT_REQ and follow LE data-channel hopping.
-7. Add LE 2M, secondary advertising, extended advertising, and LE Coded PHY.
+7. Add secondary advertising, extended advertising, and LE Coded PHY; LE 2M
+   fixed-channel data decode is now complete.
 8. Add Bluetooth Classic BR/EDR inquiry, access-code correlation, hop
    reconstruction, and packet decoding.
 9. Introduce a separately reviewed transmit/injection subsystem.
@@ -1040,3 +1042,42 @@ Both modes still require the caller's transmitter direction and initial
 packet counter and feed identical derived bytes into `LeAclDecryptor`.
 The modes are mutually exclusive, and all key/control arguments remain
 sensitive command-line data.
+
+## 2026-07-22: Share uncoded framing while keeping PHY selection explicit
+
+### Demodulation boundary
+
+LE 1M and LE 2M share access-address search, whitening, CRC validation,
+data-header parsing, packet deduplication, and bounded stream retention. The
+generic `LeUncodedPhy`, `LeUncodedDemodConfig`,
+`decode_le_uncoded_detailed`, and `LeUncodedPacketStreamDecoder` APIs select
+the symbol rate, nominal deviation, and preamble length. Existing
+`Le1mDemodConfig`, `decode_le_1m_detailed`, `Le1mPacketStreamDecoder`, and
+advertising stream APIs remain compatibility wrappers.
+
+LE 2M uses 2 Msymbol/s, 500 kHz nominal deviation for modulation index 0.5,
+and a two-octet alternating preamble. Primary advertising remains LE 1M. The
+bit-level frame decoder begins at the access address, so the longer preamble is
+part of PHY synchronization and test-vector construction rather than a second
+Link Layer framing format.
+
+### Caller assertion and connection state
+
+`decode-data --phy 1m|2m` is an explicit assertion about a recording already
+centered on one known data channel. The decoder validates an integer 2 through
+64 samples per selected-PHY symbol, but it does not classify PHY from I/Q,
+infer packet direction, or correlate a decoded `LL_PHY_UPDATE_IND` with a
+connection event and instant.
+
+Applying PHY changes automatically belongs with bidirectional connection
+procedure state, event scheduling, and channel following. Live retuning and
+capture-driven observation delivery remain separate work; this increment
+decodes a fixed-PHY offline stream without claiming those capabilities.
+
+### Capture metadata
+
+Each `ReceivedLePdu` retains its asserted PHY so observations from different
+PHY configurations cannot deduplicate together. Text output includes
+`phy=LE-1M` or `phy=LE-2M`, and PCAPNG sets the two-bit PHY field in the
+standard Bluetooth LE Link Layer pseudo-header. Advertising capture continues
+to emit the LE 1M value.

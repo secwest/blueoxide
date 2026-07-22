@@ -18,6 +18,11 @@
   robust decision-threshold estimation.
 - Bounded streaming LE 1M decoding across input blocks with exact
   access-address sample positions and explicit discontinuity resets.
+- Generic uncoded LE demodulation and bounded streaming APIs with compatibility
+  wrappers for the original LE 1M interfaces.
+- LE 2M data-channel demodulation with a 2 Msymbol/s rate, 500 kHz nominal
+  deviation, two-octet preamble handling, spectrum inversion, carrier-offset
+  estimation, and cross-block packet recovery.
 - Preservation of repeated identical advertisements at distinct sample
   positions.
 - Packet-local carrier-offset, modulation-deviation, and discriminator
@@ -99,6 +104,9 @@
 - `blueoxide channels`, `blueoxide decode`, configurable
   `blueoxide decode-data`, and offline `blueoxide connection-plan`,
   `blueoxide connection-acquire`, and `blueoxide connection-sync` commands.
+- Explicit `decode-data --phy 1m|2m` selection with LE 1M as the default,
+  selected-PHY sample-rate validation, PHY-tagged packet output, and LE 2M
+  PCAPNG pseudo-header metadata.
 - Opt-in `decode-data --plaintext-l2cap-direction` output for complete,
   direction-asserted plaintext streams.
 - Opt-in `decode-data` LE ACL authentication/decryption with separate lossless
@@ -162,12 +170,13 @@
   installed vendor libraries or physical radios in the development
   environment.
 - bladeRF live capture currently supports the RX0/X1 stream layout only.
-- The demodulator requires an integer multiple of 1 MHz sample rate.
+- The uncoded demodulator requires 2 through 64 samples per symbol and an
+  integer multiple of the selected 1 MHz or 2 MHz symbol rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
   automatic direction/counter inference, LTK selection from pairing state,
   LL encryption start/pause state, bidirectional encryption tracking, stateful
-  L2CAP channels, GATT/EATT and pairing state, Bluetooth Classic, LE 2M, and LE
-  Coded PHY remain to be implemented.
+  L2CAP channels, GATT/EATT and pairing state, automatic PHY-update
+  application, Bluetooth Classic, and LE Coded PHY remain to be implemented.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

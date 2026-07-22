@@ -1,9 +1,53 @@
 use crate::ble::{AdvertisingPdu, BleChannel, LeFrameConfig, LePdu, decode_le_frames};
 use crate::complex::Complex32;
 use crate::{Error, Result};
+use std::fmt::{Display, Formatter};
 
 pub const LE_1M_SYMBOL_RATE: u32 = 1_000_000;
+pub const LE_2M_SYMBOL_RATE: u32 = 2_000_000;
 const STREAM_THRESHOLD_CONTEXT_SYMBOLS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeUncodedPhy {
+    Le1M,
+    Le2M,
+}
+
+impl LeUncodedPhy {
+    pub const fn symbol_rate(self) -> u32 {
+        match self {
+            Self::Le1M => LE_1M_SYMBOL_RATE,
+            Self::Le2M => LE_2M_SYMBOL_RATE,
+        }
+    }
+
+    pub const fn preamble_octets(self) -> usize {
+        match self {
+            Self::Le1M => 1,
+            Self::Le2M => 2,
+        }
+    }
+
+    pub const fn nominal_deviation_hz(self) -> u32 {
+        self.symbol_rate() / 4
+    }
+}
+
+impl Display for LeUncodedPhy {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Le1M => formatter.write_str("LE-1M"),
+            Self::Le2M => formatter.write_str("LE-2M"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LeUncodedDemodConfig {
+    pub phy: LeUncodedPhy,
+    pub sample_rate_hz: u32,
+    pub max_access_address_errors: u8,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Le1mDemodConfig {
@@ -25,6 +69,7 @@ pub struct ReceivedAdvertisingPdu {
 #[derive(Clone, Debug)]
 pub struct ReceivedLePdu {
     pub pdu: LePdu,
+    pub phy: LeUncodedPhy,
     /// Sample index at the beginning of the detected access address.
     pub access_address_sample: u64,
     pub symbol_phase: usize,
@@ -53,16 +98,35 @@ pub struct LeStreamDecodeBatch {
 
 impl Le1mDemodConfig {
     pub fn validate(self) -> Result<usize> {
-        if !self.sample_rate_hz.is_multiple_of(LE_1M_SYMBOL_RATE) {
+        LeUncodedDemodConfig::from(self).validate()
+    }
+}
+
+impl From<Le1mDemodConfig> for LeUncodedDemodConfig {
+    fn from(config: Le1mDemodConfig) -> Self {
+        Self {
+            phy: LeUncodedPhy::Le1M,
+            sample_rate_hz: config.sample_rate_hz,
+            max_access_address_errors: config.max_access_address_errors,
+        }
+    }
+}
+
+impl LeUncodedDemodConfig {
+    pub fn validate(self) -> Result<usize> {
+        let symbol_rate = self.phy.symbol_rate();
+        if !self.sample_rate_hz.is_multiple_of(symbol_rate) {
             return Err(Error::InvalidConfiguration(format!(
-                "LE 1M currently requires a sample rate that is an integer multiple of {LE_1M_SYMBOL_RATE} Hz"
+                "{} requires a sample rate that is an integer multiple of {symbol_rate} Hz",
+                self.phy
             )));
         }
-        let samples_per_symbol = (self.sample_rate_hz / LE_1M_SYMBOL_RATE) as usize;
+        let samples_per_symbol = (self.sample_rate_hz / symbol_rate) as usize;
         if !(2..=64).contains(&samples_per_symbol) {
-            return Err(Error::InvalidConfiguration(
-                "LE 1M samples per symbol must be in 2..=64".to_owned(),
-            ));
+            return Err(Error::InvalidConfiguration(format!(
+                "{} samples per symbol must be in 2..=64",
+                self.phy
+            )));
         }
         if self.max_access_address_errors > 8 {
             return Err(Error::InvalidConfiguration(
@@ -126,6 +190,7 @@ fn same_le_observation(
     left.access_address_sample
         .abs_diff(right.access_address_sample)
         <= samples_per_symbol
+        && left.phy == right.phy
         && left.pdu.access_address == right.pdu.access_address
         && left.pdu.header == right.pdu.header
         && left.pdu.cte_info == right.pdu.cte_info
@@ -171,16 +236,16 @@ fn packet_slice_levels(
     })
 }
 
-/// Demodulates detailed CRC-valid LE 1M observations.
+/// Demodulates detailed CRC-valid uncoded LE observations.
 ///
 /// Every integer symbol phase is evaluated. The frame configuration selects
 /// the access address, CRC initialization, and PDU length semantics. Spectrum
 /// inversion is handled by the packet decoder.
-pub fn decode_le_1m_detailed(
+pub fn decode_le_uncoded_detailed(
     samples: &[Complex32],
     channel: BleChannel,
     frame_config: LeFrameConfig,
-    config: Le1mDemodConfig,
+    config: LeUncodedDemodConfig,
 ) -> Result<Vec<ReceivedLePdu>> {
     let samples_per_symbol = config.validate()?;
     frame_config.validate()?;
@@ -214,6 +279,7 @@ pub fn decode_le_1m_detailed(
                 packet_slice_levels(&symbols, &bits, packet.bit_offset, packet_bits)
                     .unwrap_or(levels);
             let observation = ReceivedLePdu {
+                phy: config.phy,
                 access_address_sample: (phase + 1 + packet.bit_offset * samples_per_symbol) as u64,
                 symbol_phase: phase,
                 estimated_carrier_offset_hz: packet_levels.threshold * config.sample_rate_hz as f32
@@ -237,6 +303,16 @@ pub fn decode_le_1m_detailed(
     }
     packets.sort_unstable_by_key(|packet| packet.access_address_sample);
     Ok(packets)
+}
+
+/// Compatibility wrapper for detailed CRC-valid LE 1M observations.
+pub fn decode_le_1m_detailed(
+    samples: &[Complex32],
+    channel: BleChannel,
+    frame_config: LeFrameConfig,
+    config: Le1mDemodConfig,
+) -> Result<Vec<ReceivedLePdu>> {
+    decode_le_uncoded_detailed(samples, channel, frame_config, config.into())
 }
 
 /// Demodulates detailed LE 1M primary advertising observations.
@@ -288,11 +364,11 @@ pub fn decode_le_1m_advertising(
         .collect())
 }
 
-/// Bounded, discontinuity-aware wrapper around the configurable LE 1M decoder.
-pub struct Le1mPacketStreamDecoder {
+/// Bounded, discontinuity-aware wrapper around the configurable uncoded decoder.
+pub struct LeUncodedPacketStreamDecoder {
     channel: BleChannel,
     frame_config: LeFrameConfig,
-    config: Le1mDemodConfig,
+    config: LeUncodedDemodConfig,
     samples_per_symbol: usize,
     samples: Vec<Complex32>,
     buffer_first_sample: Option<u64>,
@@ -301,11 +377,11 @@ pub struct Le1mPacketStreamDecoder {
     maximum_buffer_samples: usize,
 }
 
-impl Le1mPacketStreamDecoder {
+impl LeUncodedPacketStreamDecoder {
     pub fn new(
         channel: BleChannel,
         frame_config: LeFrameConfig,
-        config: Le1mDemodConfig,
+        config: LeUncodedDemodConfig,
     ) -> Result<Self> {
         let samples_per_symbol = config.validate()?;
         frame_config.validate()?;
@@ -379,7 +455,7 @@ impl Le1mPacketStreamDecoder {
             Error::InvalidInput("stream decoder lost its buffer sample index".to_owned())
         })?;
         for mut observation in
-            decode_le_1m_detailed(&self.samples, self.channel, self.frame_config, self.config)?
+            decode_le_uncoded_detailed(&self.samples, self.channel, self.frame_config, self.config)?
         {
             observation.access_address_sample = observation
                 .access_address_sample
@@ -412,6 +488,35 @@ impl Le1mPacketStreamDecoder {
                     >= retained_from
             });
         }
+    }
+}
+
+/// Compatibility wrapper around [`LeUncodedPacketStreamDecoder`] for LE 1M.
+pub struct Le1mPacketStreamDecoder {
+    inner: LeUncodedPacketStreamDecoder,
+}
+
+impl Le1mPacketStreamDecoder {
+    pub fn new(
+        channel: BleChannel,
+        frame_config: LeFrameConfig,
+        config: Le1mDemodConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner: LeUncodedPacketStreamDecoder::new(channel, frame_config, config.into())?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn push(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<LeStreamDecodeBatch> {
+        self.inner.push(first_sample_index, input)
     }
 }
 
@@ -484,12 +589,18 @@ mod tests {
     };
     use std::f32::consts::TAU;
 
-    fn modulate(bits: &[bool], samples_per_symbol: usize, offset_hz: f32) -> Vec<Complex32> {
-        let sample_rate = samples_per_symbol as f32 * LE_1M_SYMBOL_RATE as f32;
+    fn modulate_uncoded(
+        bits: &[bool],
+        samples_per_symbol: usize,
+        offset_hz: f32,
+        phy: LeUncodedPhy,
+    ) -> Vec<Complex32> {
+        let sample_rate = samples_per_symbol as f32 * phy.symbol_rate() as f32;
+        let deviation_hz = phy.nominal_deviation_hz() as f32;
         let mut phase = 0.0f32;
         let mut samples = vec![Complex32::new(1.0, 0.0); 7];
         for bit in bits {
-            let deviation = if *bit { 250_000.0 } else { -250_000.0 };
+            let deviation = if *bit { deviation_hz } else { -deviation_hz };
             let step = TAU * (deviation + offset_hz) / sample_rate;
             for _ in 0..samples_per_symbol {
                 phase += step;
@@ -497,6 +608,10 @@ mod tests {
             }
         }
         samples
+    }
+
+    fn modulate(bits: &[bool], samples_per_symbol: usize, offset_hz: f32) -> Vec<Complex32> {
+        modulate_uncoded(bits, samples_per_symbol, offset_hz, LeUncodedPhy::Le1M)
     }
 
     #[test]
@@ -735,6 +850,78 @@ mod tests {
     }
 
     #[test]
+    fn le_2m_demodulates_and_streams_data_across_rates_offsets_and_inversion() {
+        let phy = LeUncodedPhy::Le2M;
+        let channel = BleChannel::new(12).unwrap();
+        let frame_config = LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap();
+        let payload = [3, 0, 4, 0, 0x0a, 1, 0];
+        // Jiao Xianjun's BTLE crc24_core/scramble_core independently produced
+        // CRC f2838c and channel-12 whitened body 2ee8f3c789d25da03d55e53c.
+        let bits = bytes_to_bits_lsb(&[
+            0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12, 0x2e, 0xe8, 0xf3, 0xc7, 0x89, 0xd2, 0x5d, 0xa0,
+            0x3d, 0x55, 0xe5, 0x3c,
+        ]);
+
+        for samples_per_symbol in [2, 4, 8] {
+            for offset_hz in [-200_000.0, 0.0, 200_000.0] {
+                for inverted in [false, true] {
+                    let mut samples = modulate_uncoded(&bits, samples_per_symbol, offset_hz, phy);
+                    if inverted {
+                        for sample in &mut samples {
+                            sample.im = -sample.im;
+                        }
+                    }
+                    let packets = decode_le_uncoded_detailed(
+                        &samples,
+                        channel,
+                        frame_config,
+                        LeUncodedDemodConfig {
+                            phy,
+                            sample_rate_hz: samples_per_symbol as u32 * phy.symbol_rate(),
+                            max_access_address_errors: 0,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        packets.len(),
+                        1,
+                        "sps={samples_per_symbol} offset={offset_hz} inverted={inverted}"
+                    );
+                    assert_eq!(packets[0].phy, phy);
+                    assert_eq!(packets[0].pdu.payload, payload);
+                    assert_eq!(packets[0].pdu.inverted, inverted);
+                    let expected_offset = if inverted { -offset_hz } else { offset_hz };
+                    assert!(
+                        (packets[0].estimated_carrier_offset_hz - expected_offset).abs() < 20_000.0
+                    );
+                    assert!((packets[0].estimated_deviation_hz - 500_000.0).abs() < 20_000.0);
+                }
+            }
+        }
+
+        let samples = modulate_uncoded(&bits, 4, -80_000.0, phy);
+        let mut decoder = LeUncodedPacketStreamDecoder::new(
+            channel,
+            frame_config,
+            LeUncodedDemodConfig {
+                phy,
+                sample_rate_hz: 8_000_000,
+                max_access_address_errors: 0,
+            },
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        for (index, chunk) in samples.chunks(61).enumerate() {
+            let batch = decoder.push((index * 61) as u64, chunk).unwrap();
+            assert!(batch.discontinuity.is_none());
+            packets.extend(batch.packets);
+        }
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].phy, phy);
+        assert_eq!(packets[0].pdu.payload, payload);
+    }
+
+    #[test]
     fn rejects_non_integral_oversampling() {
         let error = Le1mDemodConfig {
             sample_rate_hz: 2_400_000,
@@ -743,5 +930,14 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(error.to_string().contains("integer multiple"));
+
+        let error = LeUncodedDemodConfig {
+            phy: LeUncodedPhy::Le2M,
+            sample_rate_hz: 5_000_000,
+            max_access_address_errors: 0,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.to_string().contains("LE-2M"));
     }
 }

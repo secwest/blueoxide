@@ -8,8 +8,8 @@ use blueoxide::capture::{
     CaptureLimits, CaptureStats, CapturedAdvertisingPdu, capture_primary_advertising,
 };
 use blueoxide::demod::{
-    Le1mDemodConfig, Le1mPacketStreamDecoder, Le1mStreamDecoder, ReceivedAdvertisingPdu,
-    ReceivedLePdu,
+    Le1mDemodConfig, Le1mStreamDecoder, LeUncodedDemodConfig, LeUncodedPacketStreamDecoder,
+    LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu,
 };
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
@@ -52,6 +52,7 @@ struct DecodeDataArgs {
     input: PathBuf,
     format: IqFormat,
     channel: BleChannel,
+    phy: LeUncodedPhy,
     sample_rate_hz: u32,
     access_address: u32,
     crc_init: u32,
@@ -148,6 +149,7 @@ DECODE OPTIONS:
 DECODE-DATA OPTIONS:
   Uses the DECODE OPTIONS above and requires a connection access address and
   24-bit CRC initialization value.
+  --phy 1m|2m             Uncoded LE data PHY (default: 1m)
   --plaintext-l2cap-direction central-to-peripheral|peripheral-to-central
                           Reassemble an asserted single-direction plaintext stream
   --max-l2cap-payload N   Maximum reassembled payload length (default: 65535)
@@ -254,6 +256,16 @@ fn parse_link_direction(value: &str, option: &str) -> Result<LinkDirection> {
         "peripheral-to-central" | "peripheral" | "p2c" => Ok(LinkDirection::PeripheralToCentral),
         _ => Err(Error::InvalidConfiguration(format!(
             "invalid value {value:?} for {option}; expected central-to-peripheral or peripheral-to-central"
+        ))),
+    }
+}
+
+fn parse_uncoded_phy(value: &str, option: &str) -> Result<LeUncodedPhy> {
+    match value.to_ascii_lowercase().as_str() {
+        "1m" | "le-1m" => Ok(LeUncodedPhy::Le1M),
+        "2m" | "le-2m" => Ok(LeUncodedPhy::Le2M),
+        _ => Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected 1m or 2m"
         ))),
     }
 }
@@ -550,6 +562,7 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     let mut input = None;
     let mut format = IqFormat::F32Le;
     let mut channel = None;
+    let mut phy = LeUncodedPhy::Le1M;
     let mut sample_rate_hz = None;
     let mut access_address = None;
     let mut crc_init = None;
@@ -579,6 +592,10 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
             "--channel" => {
                 let value = value_after(args, &mut index, "--channel")?;
                 channel = Some(BleChannel::new(parse_number(&value, "--channel")?)?);
+            }
+            "--phy" => {
+                let value = value_after(args, &mut index, "--phy")?;
+                phy = parse_uncoded_phy(&value, "--phy")?;
             }
             "--sample-rate" => {
                 let value = value_after(args, &mut index, "--sample-rate")?;
@@ -680,6 +697,15 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
             channel.index()
         )));
     }
+    let sample_rate_hz = sample_rate_hz.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-data requires --sample-rate HZ".to_owned())
+    })?;
+    LeUncodedDemodConfig {
+        phy,
+        sample_rate_hz,
+        max_access_address_errors,
+    }
+    .validate()?;
     let access_address = access_address.ok_or_else(|| {
         Error::InvalidConfiguration("decode-data requires --access-address".to_owned())
     })?;
@@ -834,9 +860,8 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
         })?,
         format,
         channel,
-        sample_rate_hz: sample_rate_hz.ok_or_else(|| {
-            Error::InvalidConfiguration("decode-data requires --sample-rate HZ".to_owned())
-        })?,
+        phy,
+        sample_rate_hz,
         access_address,
         crc_init,
         max_samples,
@@ -1594,8 +1619,9 @@ fn print_data_packet(
         None => "encrypted".to_owned(),
     };
     println!(
-        "channel={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} llid={} nesn={} sn={} md={} cp={} cte={} rfu={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} plaintext_hint=\"{}\"",
+        "channel={} phy={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} llid={} nesn={} sn={} md={} cp={} cte={} rfu={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} plaintext_hint=\"{}\"",
         data.channel.index(),
+        packet.phy,
         packet.access_address_sample,
         packet.symbol_phase,
         data.access_address,
@@ -2080,12 +2106,13 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
         )));
     }
 
-    let demod_config = Le1mDemodConfig {
+    let demod_config = LeUncodedDemodConfig {
+        phy: args.phy,
         sample_rate_hz: args.sample_rate_hz,
         max_access_address_errors: args.max_access_address_errors,
     };
     let frame_config = LeFrameConfig::data(args.access_address, args.crc_init)?;
-    let mut decoder = Le1mPacketStreamDecoder::new(args.channel, frame_config, demod_config)?;
+    let mut decoder = LeUncodedPacketStreamDecoder::new(args.channel, frame_config, demod_config)?;
     let mut decryptor = match &args.decryption {
         Some(decryption) => Some(LeAclDecryptor::new(
             decryption.session_key,

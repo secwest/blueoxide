@@ -12,13 +12,15 @@ The repository now contains a dependency-free, buildable receive core with:
 - Bluetooth LE channel-to-frequency mapping.
 - LE whitening and 24-bit CRC implementations.
 - CRC-gated decoding of primary advertising PDUs on channels 37, 38, and 39.
-- Configurable CRC-gated LE 1M data-channel decoding for a known connection
-  access address, CRC initializer, and logical channel.
+- Configurable CRC-gated LE 1M and LE 2M data-channel decoding for a known
+  connection access address, CRC initializer, logical channel, and asserted
+  PHY.
 - Dependency-free AES-128/CCM authentication and decryption for explicitly
   directed LE ACL streams with caller-supplied session state, MIC-gated counter
   advancement, retransmission handling, and bounded counter resynchronization.
-- LE 1M quadrature demodulation with integer timing-phase search, robust slicing,
-  spectrum-inversion handling, and configurable access-address tolerance.
+- Uncoded LE 1M/2M quadrature demodulation with integer timing-phase search,
+  robust slicing, spectrum-inversion handling, and configurable
+  access-address tolerance.
 - Bounded streaming input for interleaved little-endian `f32` and signed 16-bit
   I/Q files, including packet recovery across block boundaries.
 - Exact access-address sample indices, carrier-offset estimates, modulation
@@ -103,10 +105,10 @@ The file must contain interleaved I then Q samples. `f32le` uses two
 little-endian `f32` values per complex sample. `s16le` uses two little-endian
 signed 16-bit values normalized to approximately `[-1, 1]`.
 
-Only packets with a valid BLE CRC are emitted. The current demodulator requires
-an integer oversampling ratio from 2 through 64 samples per LE 1M symbol.
-`--capture-start-ns` can supply the Unix timestamp of sample zero for PCAPNG;
-without it, timestamps are relative to the Unix epoch.
+Only packets with a valid BLE CRC are emitted. Primary advertising decode is
+LE 1M and requires an integer oversampling ratio from 2 through 64 samples per
+symbol. `--capture-start-ns` can supply the Unix timestamp of sample zero for
+PCAPNG; without it, timestamps are relative to the Unix epoch.
 
 The decoder processes the file in bounded blocks and retains enough overlap to
 recover maximum-length primary advertisements split between reads. Repeated
@@ -120,6 +122,7 @@ cargo run --release -- decode-data \
   --input connection.cf32 \
   --format f32le \
   --channel 12 \
+  --phy 1m \
   --sample-rate 4000000 \
   --access-address 0x12345678 \
   --crc-init 0xabcdef \
@@ -127,14 +130,23 @@ cargo run --release -- decode-data \
   --output-pcap connection.pcapng
 ```
 
-`decode-data` accepts data channels 0 through 36. The connection access address
-and 24-bit CRC initializer normally come from a decoded CONNECT_IND. Data PDUs
-are emitted only after CRC validation. When the CP bit is set, the separate
-CTEInfo octet is retained and decoded without including it in the Length-counted
-payload. The payload field remains lossless and can include an encrypted MIC
-when decryption is not configured. Printed L2CAP and LL control interpretations
-are explicitly plaintext hints in that mode; encrypted payloads remain
-available as raw bytes and are not guessed from packet shape.
+`decode-data` accepts data channels 0 through 36 and `--phy 1m|2m`, defaulting
+to LE 1M. LE 2M uses a 2 Msymbol/s rate, 500 kHz nominal deviation, and a
+two-octet alternating preamble; for example, an 8 Msps recording uses
+`--phy 2m --sample-rate 8000000`. Both uncoded PHYs require an integer
+oversampling ratio from 2 through 64 samples per symbol. The selected PHY is an
+explicit caller assertion: Blueoxide does not infer it from samples or apply an
+observed `LL_PHY_UPDATE_IND` at its instant.
+
+The connection access address and 24-bit CRC initializer normally come from a
+decoded CONNECT_IND. Data PDUs are emitted only after CRC validation. When the
+CP bit is set, the separate CTEInfo octet is retained and decoded without
+including it in the Length-counted payload. The payload field remains lossless
+and can include an encrypted MIC when decryption is not configured. Printed
+L2CAP and LL control interpretations are explicitly plaintext hints in that
+mode; encrypted payloads remain available as raw bytes and are not guessed
+from packet shape. PCAPNG output records the asserted LE 1M or LE 2M PHY in the
+Bluetooth LE pseudo-header.
 
 LLID `0b11` packets receive strict typed LL control decoding without requiring
 L2CAP reassembly. Blueoxide validates exact parameter sizes for every assigned
@@ -482,12 +494,12 @@ synchronization, instant-based map/parameter updates, and direction-explicit
 ACL decryption, captured LL encryption-material derivation, and plaintext L2CAP
 PDU reassembly are now present; the next receive stages are wideband
 channelization or timed retuning, automatic capture-driven observation
-delivery, and live BLE connection following. Full packet decode is a project
-requirement: extended advertising, complete LL procedure state, automatic
-pairing and LTK selection, bidirectional encryption-state tracking, L2CAP
-channel state, stateful GATT reconstruction, LE 2M/Coded PHY, and Bluetooth
-Classic BR/EDR layers will be added incrementally while retaining undecoded
-packet bytes losslessly.
+delivery, automatic PHY-update application, and live BLE connection following.
+Full packet decode is a project requirement: extended advertising, complete LL
+procedure state, automatic pairing and LTK selection, bidirectional
+encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
+LE Coded PHY, and Bluetooth Classic BR/EDR layers will be added incrementally
+while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;
