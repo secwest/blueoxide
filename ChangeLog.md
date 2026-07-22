@@ -42,6 +42,12 @@
   combined IVs, transmitter direction, and initial packet counters, including
   MIC-gated advancement, retransmission counter reuse, zero-length PDU bypass,
   and bounded counter-skip recovery.
+- Direction-checked `LL_ENC_REQ`/`LL_ENC_RSP` material tracking with exact
+  retransmission handling, refresh invalidation, Core byte-order conversion,
+  and AES session-key plus combined-IV derivation from a caller-selected LTK.
+- `decode-data` support for deriving decryption material directly from
+  `--ltk`, complete captured `--enc-req`, and complete captured `--enc-rsp`
+  payloads as an alternative to supplying `--session-key` and `--iv`.
 - CTEInfo decoding for CTE time, AoA/AoD type, and reserved values, with the
   CTEInfo octet included in CRC and capture bytes but excluded from the
   Length-counted payload.
@@ -159,8 +165,9 @@
 - The demodulator requires an integer multiple of 1 MHz sample rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   capture-driven connection following and retuning, extended advertising,
-  automatic direction/counter inference, encryption-procedure and session-key
-  derivation, stateful L2CAP channels, GATT/EATT and pairing state, Bluetooth
-  Classic, LE 2M, and LE Coded PHY remain to be implemented.
+  automatic direction/counter inference, LTK selection from pairing state,
+  LL encryption start/pause state, bidirectional encryption tracking, stateful
+  L2CAP channels, GATT/EATT and pairing state, Bluetooth Classic, LE 2M, and LE
+  Coded PHY remain to be implemented.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

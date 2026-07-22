@@ -214,6 +214,85 @@ fn cli_rejects_advertising_channel_and_wide_crc_init() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected 16 hexadecimal octets"));
 
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--enc-req",
+            "03",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected 23 hexadecimal octets"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--enc-req",
+            "039078563412efcdab74241302f1e0dfcebdac24abdcba",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--ltk, --enc-req, and --enc-rsp must be supplied together")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            "unused.cf32",
+            "--channel",
+            "0",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--enc-req",
+            "049078563412efcdab74241302f1e0dfcebdac24abdcba",
+            "--enc-rsp",
+            "047968574635241302bebaafde",
+            "--decrypt-direction",
+            "central-to-peripheral",
+            "--packet-counter",
+            "0",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--enc-req must begin with LL_ENC_REQ opcode 03")
+    );
+
     let decryption_options = [
         "decode-data",
         "--input",
@@ -457,6 +536,42 @@ fn cli_authenticates_decrypts_and_reassembles_encrypted_waveforms() {
         ])
         .output()
         .expect("run blueoxide");
+    let derived_output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-data",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "12",
+            "--sample-rate",
+            "4000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "73",
+            "--aa-errors",
+            "0",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--enc-req",
+            "039078563412efcdab74241302f1e0dfcebdac24abdcba",
+            "--enc-rsp",
+            "047968574635241302bebaafde",
+            "--decrypt-direction",
+            "central-to-peripheral",
+            "--packet-counter",
+            "5",
+            "--max-counter-skip",
+            "2",
+            "--plaintext-l2cap-direction",
+            "central-to-peripheral",
+        ])
+        .output()
+        .expect("run blueoxide with derived encryption material");
 
     let _ = fs::remove_file(&iq_path);
     assert!(
@@ -464,6 +579,13 @@ fn cli_authenticates_decrypts_and_reassembles_encrypted_waveforms() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        derived_output.status.success(),
+        "derived stderr: {}",
+        String::from_utf8_lossy(&derived_output.stderr)
+    );
+    assert_eq!(derived_output.stdout, output.stdout);
+    assert_eq!(derived_output.stderr, output.stderr);
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
     assert!(stdout.contains("payload=152f221fb90d46ca3613dc4779 crc="));

@@ -941,6 +941,29 @@ AES session key: 99ad1b5226a37e3e058e3b8e27c2c666
 LL IV octets:    24abdcbabebaafde
 ```
 
+The material-reconstruction test additionally fixes the complete Core exchange:
+
+```text
+LTK (HCI/SMP order): bf01fb9d4ef3bc36d874f5394138684c
+LL_ENC_REQ raw:       039078563412efcdab74241302f1e0dfcebdac24abdcba
+LL_ENC_RSP raw:       047968574635241302bebaafde
+```
+
+The opcode-bearing request contains least-significant-octet-first Rand, EDIV,
+SKDm, and IVm; the response contains SKDs and IVs in the same raw captured
+order. Tests require the central-to-peripheral request before the
+peripheral-to-central response, accept exact retransmissions idempotently,
+reject reversed directions and out-of-order responses without state mutation,
+and invalidate ready material when a different request starts a refresh.
+
+Pinned Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+independently serializes the Core numeric fields through its `XLELongField`,
+`XLEShortField`, and `XLEIntField` definitions to the exact raw request and
+response parameter octets above. .NET
+`System.Security.Cryptography.Aes.EncryptEcb` independently derives
+`99ad1b5226a37e3e058e3b8e27c2c666` after converting the raw LTK and SKD fields
+to conventional AES order.
+
 The library decrypts and authenticates all four published encrypted Link Layer
 examples:
 
@@ -966,15 +989,19 @@ Independent implementation reference:
 - Files:
   - `subsys/bluetooth/controller/ll_sw/ull_llcp_enc.c`
   - `subsys/bluetooth/controller/ll_sw/openisa/lll/lll_conn.c`
+  - `subsys/bluetooth/controller/ll_sw/openisa/hal/RV32M1/ecb.c`
   - `subsys/bluetooth/controller/ll_sw/openisa/hal/RV32M1/radio/radio.c`
   - `subsys/bluetooth/controller/ll_sw/nordic/hal/nrf5/radio/radio.c`
+  - `tests/bluetooth/controller/ctrl_encrypt/src/main.c`
 
 The pinned controller independently confirms counter reset at encryption
 setup, central-to-peripheral direction bit one, peripheral-to-central bit zero,
 little-endian counter plus IV nonce placement, the `0xe3` ACL header mask,
 counter advancement only for accepted nonempty encrypted packets, and
 transmit-counter advancement only after acknowledgement rather than on
-retransmission.
+retransmission. Its controller encryption tests also pin the same Core LTK,
+SKDm, SKDs, IVm, IVs, and expected session key while exercising the
+central/peripheral LL encryption exchange.
 
 The waveform-backed CLI fixture uses .NET `System.Security.Cryptography.AesCcm`
 to generate two valid ATT-bearing ciphertext vectors independently of
@@ -990,14 +1017,17 @@ the authenticated skip to seven, repeats the first packet with changed
 NESN/MD, decrypts the next packet at eight, reconstructs both L2CAP/ATT PDUs,
 and corrupts one later ciphertext octet. The raw corrupted packet remains in
 output, no plaintext is emitted for it, its MIC failure is counted, and
-cryptographic state does not advance. CLI validation also covers malformed key
-width, conflicting asserted directions, excessive skip bounds, and a packet
-counter outside 39 bits.
+cryptographic state does not advance. The same waveform is decoded a second
+time from the Core LTK and complete ENC request/response payloads; stdout and
+stderr must match direct session-key mode byte for byte. CLI validation also
+covers malformed key and exchange widths, incomplete exchange options, wrong
+control opcodes, conflicting asserted directions, excessive skip bounds, and a
+packet counter outside 39 bits.
 
 Final local gate for this increment:
 
 ```text
-157 library tests
+158 library tests
 4 connection planning/acquisition/synchronization CLI integration tests
 7 data-channel CLI integration tests
 1 advertising decode/PCAPNG integration test
@@ -1031,6 +1061,6 @@ cargo doc --no-deps
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
 - Differential tests for extended advertising, data-channel following,
-  stateful GATT, EATT, pairing/session-key derivation, automatic bidirectional
-  encryption state, LE Coded PHY, and Bluetooth Classic as those layers are
-  added.
+  stateful GATT, EATT, pairing and automatic LTK selection, full LL encryption
+  activation/pause state, automatic bidirectional encryption state, LE Coded
+  PHY, and Bluetooth Classic as those layers are added.

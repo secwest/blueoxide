@@ -1000,3 +1000,43 @@ combine `LL_ENC_REQ` and `LL_ENC_RSP` into procedure state, derive a session key
 from an LTK/SKD, pause or refresh encryption, or derive keys from SMP. Callers
 must create independent state for each direction. Command-line session keys are
 sensitive and can be exposed through shell history or process inspection.
+
+## 2026-07-22: Reconstruct encryption material without overstating procedure state
+
+### Exchange and byte-order boundary
+
+`LeEncryptionMaterialTracker` accepts a caller-selected 16-octet LTK and
+explicitly direction-tagged LL control PDUs. Only a central-to-peripheral
+`LL_ENC_REQ` followed by a peripheral-to-central `LL_ENC_RSP` can produce
+material. Both PDUs pass through the existing strict control decoder, so short,
+trailing, or wrong-opcode payloads cannot enter derivation.
+
+The HCI/SMP LTK and parsed SKDm, SKDs, IVm, and IVs arrays preserve their
+least-significant-octet-first storage or wire order. The LTK is reversed for
+conventional AES key order; the AES plaintext is reversed SKDs followed by
+reversed SKDm. Raw IVm followed by raw IVs already forms the eight nonce octets
+used by the software CCM implementation. With the Core sample LTK and raw
+exchange this produces session key `99ad1b5226a37e3e058e3b8e27c2c666`
+and IV `24abdcbabebaafde`, matching the published encrypted ACL examples.
+
+### Passive state policy
+
+An exact repeated request or response is idempotent. A different new central
+request invalidates previously derived material and starts a fresh exchange.
+A response before a request, a response from the central, a request from the
+peripheral, or a different response after material is ready is rejected
+without mutating accepted state.
+
+This is deliberately material state, not the complete encryption procedure.
+The tracker does not choose an LTK from Rand/EDIV, correlate SMP pairing, infer
+direction, model `LL_START_ENC_REQ`/`LL_START_ENC_RSP`, pause or activation
+boundaries, initialize two directional packet streams, or infer counters.
+
+### CLI integration
+
+`decode-data` now accepts either the direct `--session-key`/`--iv` pair or
+`--ltk` plus complete opcode-bearing `--enc-req` and `--enc-rsp` payloads.
+Both modes still require the caller's transmitter direction and initial
+packet counter and feed identical derived bytes into `LeAclDecryptor`.
+The modes are mutually exclusive, and all key/control arguments remain
+sensitive command-line data.

@@ -22,6 +22,10 @@ const S_BOX: [u8; 256] = [
 
 const ROUND_CONSTANTS: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
 
+pub(crate) fn aes_128_encrypt_block(key: [u8; AES_BLOCK_OCTETS], block: [u8; 16]) -> [u8; 16] {
+    Aes128::new(key).encrypt(block)
+}
+
 pub(crate) struct Aes128Ccm {
     aes: Aes128,
 }

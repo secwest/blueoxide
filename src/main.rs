@@ -19,7 +19,9 @@ use blueoxide::link_layer::{
     L2capSignalingCommand, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryption, LeAclDecryptionStatus,
     LeAclDecryptor, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
 };
-use blueoxide::ll_control::{ChannelClassification, CsConfigAction, DecodedControlPdu};
+use blueoxide::ll_control::{
+    ChannelClassification, CsConfigAction, DecodedControlPdu, LeEncryptionMaterialTracker,
+};
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::smp::{DecodedSmpPdu, SmpAuthenticationRequirements, SmpKeyDistribution, SmpPdu};
@@ -151,6 +153,9 @@ DECODE-DATA OPTIONS:
   --max-l2cap-payload N   Maximum reassembled payload length (default: 65535)
   --session-key HEX       16 AES session-key octets, left to right
   --iv HEX                Eight combined LL initialization-vector octets
+  --ltk HEX               16 LTK octets in HCI/SMP field order
+  --enc-req HEX           Complete 23-octet LL_ENC_REQ control payload
+  --enc-rsp HEX           Complete 13-octet LL_ENC_RSP control payload
   --decrypt-direction central-to-peripheral|peripheral-to-central
                           Assert the transmitter direction for AES-CCM
   --packet-counter N      Initial 39-bit direction-specific packet counter
@@ -558,6 +563,9 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     let mut maximum_l2cap_payload_length_supplied = false;
     let mut session_key = None;
     let mut initialization_vector = None;
+    let mut long_term_key = None;
+    let mut encryption_request: Option<[u8; 23]> = None;
+    let mut encryption_response: Option<[u8; 13]> = None;
     let mut decryption_direction = None;
     let mut initial_packet_counter = None;
     let mut maximum_counter_skip = 0u64;
@@ -625,6 +633,18 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
                 let value = value_after(args, &mut index, "--iv")?;
                 initialization_vector = Some(parse_fixed_hex(&value, "--iv")?);
             }
+            "--ltk" => {
+                let value = value_after(args, &mut index, "--ltk")?;
+                long_term_key = Some(parse_fixed_hex(&value, "--ltk")?);
+            }
+            "--enc-req" => {
+                let value = value_after(args, &mut index, "--enc-req")?;
+                encryption_request = Some(parse_fixed_hex(&value, "--enc-req")?);
+            }
+            "--enc-rsp" => {
+                let value = value_after(args, &mut index, "--enc-rsp")?;
+                encryption_response = Some(parse_fixed_hex(&value, "--enc-rsp")?);
+            }
             "--decrypt-direction" => {
                 let value = value_after(args, &mut index, "--decrypt-direction")?;
                 decryption_direction = Some(parse_link_direction(&value, "--decrypt-direction")?);
@@ -679,22 +699,54 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
             "--max-counter-skip must be in 0..={LE_ACL_MAXIMUM_COUNTER_SKIP}"
         )));
     }
-    let decryption_option_count = [
-        session_key.is_some(),
-        initialization_vector.is_some(),
+    let direct_material_option_count = [session_key.is_some(), initialization_vector.is_some()]
+        .into_iter()
+        .filter(|supplied| *supplied)
+        .count();
+    if direct_material_option_count != 0 && direct_material_option_count != 2 {
+        return Err(Error::InvalidConfiguration(
+            "--session-key and --iv must be supplied together".to_owned(),
+        ));
+    }
+    let exchange_material_option_count = [
+        long_term_key.is_some(),
+        encryption_request.is_some(),
+        encryption_response.is_some(),
+    ]
+    .into_iter()
+    .filter(|supplied| *supplied)
+    .count();
+    if exchange_material_option_count != 0 && exchange_material_option_count != 3 {
+        return Err(Error::InvalidConfiguration(
+            "--ltk, --enc-req, and --enc-rsp must be supplied together".to_owned(),
+        ));
+    }
+    if direct_material_option_count != 0 && exchange_material_option_count != 0 {
+        return Err(Error::InvalidConfiguration(
+            "--session-key/--iv and --ltk/--enc-req/--enc-rsp are mutually exclusive".to_owned(),
+        ));
+    }
+    let has_key_material = direct_material_option_count == 2 || exchange_material_option_count == 3;
+    let decryption_state_option_count = [
         decryption_direction.is_some(),
         initial_packet_counter.is_some(),
     ]
     .into_iter()
     .filter(|supplied| *supplied)
     .count();
-    if decryption_option_count != 0 && decryption_option_count != 4 {
+    if has_key_material && decryption_state_option_count != 2 {
         return Err(Error::InvalidConfiguration(
-            "--session-key, --iv, --decrypt-direction, and --packet-counter must be supplied together"
+            "key material, --decrypt-direction, and --packet-counter must be supplied together"
                 .to_owned(),
         ));
     }
-    if maximum_counter_skip_supplied && decryption_option_count == 0 {
+    if !has_key_material && decryption_state_option_count != 0 {
+        return Err(Error::InvalidConfiguration(
+            "--decrypt-direction and --packet-counter require a complete key-material option set"
+                .to_owned(),
+        ));
+    }
+    if maximum_counter_skip_supplied && !has_key_material {
         return Err(Error::InvalidConfiguration(
             "--max-counter-skip requires the complete decryption option set".to_owned(),
         ));
@@ -706,13 +758,57 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
             "--plaintext-l2cap-direction must match --decrypt-direction".to_owned(),
         ));
     }
-    let decryption = match (
+    let material = match (
         session_key,
         initialization_vector,
-        decryption_direction,
-        initial_packet_counter,
+        long_term_key,
+        encryption_request,
+        encryption_response,
     ) {
-        (Some(session_key), Some(initialization_vector), Some(direction), Some(packet_counter)) => {
+        (Some(session_key), Some(initialization_vector), None, None, None) => {
+            Some((session_key, initialization_vector))
+        }
+        (None, None, Some(long_term_key), Some(request), Some(response)) => {
+            if request[0] != 0x03 {
+                return Err(Error::InvalidConfiguration(format!(
+                    "--enc-req must begin with LL_ENC_REQ opcode 03, received {:02x}",
+                    request[0]
+                )));
+            }
+            if response[0] != 0x04 {
+                return Err(Error::InvalidConfiguration(format!(
+                    "--enc-rsp must begin with LL_ENC_RSP opcode 04, received {:02x}",
+                    response[0]
+                )));
+            }
+            let mut tracker = LeEncryptionMaterialTracker::new(long_term_key);
+            tracker.observe(
+                LinkDirection::CentralToPeripheral,
+                ControlPdu {
+                    opcode: request[0],
+                    parameters: &request[1..],
+                },
+            )?;
+            let material = tracker
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    ControlPdu {
+                        opcode: response[0],
+                        parameters: &response[1..],
+                    },
+                )?
+                .ok_or_else(|| {
+                    Error::InvalidState(
+                        "LL encryption exchange did not produce session material".to_owned(),
+                    )
+                })?;
+            Some((material.session_key(), material.initialization_vector()))
+        }
+        (None, None, None, None, None) => None,
+        _ => unreachable!("partial or conflicting key-material options rejected above"),
+    };
+    let decryption = match (material, decryption_direction, initial_packet_counter) {
+        (Some((session_key, initialization_vector)), Some(direction), Some(packet_counter)) => {
             LeAclDecryptor::new(
                 session_key,
                 initialization_vector,
@@ -728,8 +824,8 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
                 maximum_counter_skip,
             })
         }
-        (None, None, None, None) => None,
-        _ => unreachable!("partial decryption options rejected above"),
+        (None, None, None) => None,
+        _ => unreachable!("partial decryption state options rejected above"),
     };
 
     Ok(DecodeDataArgs {

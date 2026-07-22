@@ -161,6 +161,9 @@ nonces, and personalization vectors and must be handled as sensitive capture
 data. The parser does not enforce procedure order, role legality relative to
 connection history, capability negotiation, instant timing relative to an
 observed event, application of CS or Frame Space changes, or encryption state.
+The separate encryption-material tracker does enforce central
+`LL_ENC_REQ`/peripheral `LL_ENC_RSP` direction and order when a caller supplies
+the matching LTK.
 
 For a recording with known link-encryption state, authenticate and decrypt one
 asserted transmitter direction:
@@ -183,9 +186,34 @@ cargo run --release -- decode-data \
 
 `--session-key` is the already-derived 16-octet AES key in left-to-right AES
 input order. `--iv` is the eight nonce octets in Link Layer order: the four
-central IV octets followed by the four peripheral IV octets. Blueoxide does not
-derive either value from an LTK, SMP transcript, or observed
-`LL_ENC_REQ`/`LL_ENC_RSP`.
+central IV octets followed by the four peripheral IV octets.
+
+Alternatively, derive both values from a caller-selected LTK and the complete
+captured LL control payloads, including their opcode octets:
+
+```text
+cargo run --release -- decode-data \
+  --input central-encrypted.cf32 \
+  --format f32le \
+  --channel 12 \
+  --sample-rate 4000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --ltk bf01fb9d4ef3bc36d874f5394138684c \
+  --enc-req 039078563412efcdab74241302f1e0dfcebdac24abdcba \
+  --enc-rsp 047968574635241302bebaafde \
+  --decrypt-direction central-to-peripheral \
+  --packet-counter 0 \
+  --max-counter-skip 32
+```
+
+`--ltk` uses the least-significant-octet-first order carried by HCI and SMP key
+fields. `--enc-req` requires all 23 raw captured octets from opcode `0x03`
+through IVm; `--enc-rsp` requires all 13 raw captured octets from opcode
+`0x04` through IVs. The tracker validates the strict PDU layouts and
+transmitter roles, converts the key and SKD fields into AES input order, and
+concatenates the raw IVm and IVs fields into nonce order. These options are
+mutually exclusive with `--session-key` and `--iv`.
 
 Direction and the initial 39-bit packet counter are also caller assertions.
 The decryptor advances its per-direction counter only after a valid four-octet
@@ -198,8 +226,15 @@ Every CRC-valid ciphertext packet is still printed and written to PCAPNG
 unchanged. Authenticated bytes appear on a separate `decrypted_data` line and
 only those bytes enter LL control, L2CAP, ATT, signaling, or SMP decoding. The
 PCAPNG file remains an over-the-air ciphertext capture, not a synthesized
-plaintext trace. Session keys supplied on a command line may be visible in
-shell history and process inspection and must be handled as sensitive data.
+plaintext trace. LTKs, session keys, and captured encryption material supplied
+on a command line may be visible in shell history and process inspection and
+must be handled as sensitive data.
+
+Material reconstruction does not select an LTK from Rand/EDIV or pairing
+history, infer packet direction or the initial counter, model
+`LL_START_ENC_*`/`LL_PAUSE_ENC_*` activation, or create independent
+bidirectional decryptors automatically. A complete capture-driven encryption
+procedure still requires those states.
 
 For a recording that is already known to contain a complete, ordered plaintext
 stream from one link direction, opt into L2CAP PDU reassembly:
@@ -444,14 +479,15 @@ The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
 synchronization, instant-based map/parameter updates, and direction-explicit
-ACL decryption and plaintext L2CAP PDU reassembly are now present; the next
-receive stages are wideband channelization or timed retuning, automatic
-capture-driven observation delivery, and live BLE connection following. Full
-packet decode is a project requirement: extended advertising, complete LL
-procedure state, automatic pairing/session-key derivation, bidirectional
-encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
-LE 2M/Coded PHY, and Bluetooth Classic BR/EDR layers will be added
-incrementally while retaining undecoded packet bytes losslessly.
+ACL decryption, captured LL encryption-material derivation, and plaintext L2CAP
+PDU reassembly are now present; the next receive stages are wideband
+channelization or timed retuning, automatic capture-driven observation
+delivery, and live BLE connection following. Full packet decode is a project
+requirement: extended advertising, complete LL procedure state, automatic
+pairing and LTK selection, bidirectional encryption-state tracking, L2CAP
+channel state, stateful GATT reconstruction, LE 2M/Coded PHY, and Bluetooth
+Classic BR/EDR layers will be added incrementally while retaining undecoded
+packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;
