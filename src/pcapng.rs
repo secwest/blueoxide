@@ -1,4 +1,3 @@
-use crate::ble::LE_ADV_ACCESS_ADDRESS;
 use crate::demod::{LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu};
 use crate::{Error, Result};
 use std::io::Write;
@@ -57,7 +56,7 @@ impl<W: Write> PcapNgWriter<W> {
         self.write_packet(
             packet.pdu.channel.index(),
             packet.pdu.access_address_errors,
-            LE_ADV_ACCESS_ADDRESS,
+            packet.pdu.access_address,
             &packet.pdu.link_layer_bytes(),
             phy_flags,
             timestamp_ns,
@@ -160,7 +159,7 @@ fn write_block(writer: &mut impl Write, block_type: u32, body: &[u8]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ble::{AdvertisingPdu, BleChannel};
+    use crate::ble::{AdvertisingPdu, BleChannel, LE_ADV_ACCESS_ADDRESS};
 
     fn read_u16(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -175,6 +174,7 @@ mod tests {
         let packet = ReceivedAdvertisingPdu {
             pdu: AdvertisingPdu {
                 channel: BleChannel::new(37).unwrap(),
+                access_address: crate::ble::LE_ADV_ACCESS_ADDRESS,
                 bit_offset: 8,
                 inverted: false,
                 access_address_errors: 0,
@@ -217,6 +217,41 @@ mod tests {
         assert_eq!(
             &bytes[captured + 10..captured + 14],
             &LE_ADV_ACCESS_ADDRESS.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn writes_periodic_advertising_access_address_to_header_and_packet() {
+        let packet = ReceivedAdvertisingPdu {
+            pdu: AdvertisingPdu {
+                channel: BleChannel::new(27).unwrap(),
+                access_address: 0x1234_5678,
+                bit_offset: 0,
+                inverted: false,
+                access_address_errors: 0,
+                header: [0x07, 0x01],
+                payload: vec![0xaa],
+                crc: [0xef, 0xcd, 0xab],
+            },
+            phy: LeUncodedPhy::Le2M,
+            access_address_sample: 400,
+            symbol_phase: 0,
+            estimated_carrier_offset_hz: 0.0,
+            estimated_deviation_hz: 500_000.0,
+            discriminator_separation: 1.0,
+        };
+        let mut writer = PcapNgWriter::new(Vec::new()).unwrap();
+        writer.write_advertising(&packet, 123_456_789).unwrap();
+        let bytes = writer.into_inner();
+        let shb_length = read_u32(&bytes, 4) as usize;
+        let idb_length = read_u32(&bytes, shb_length + 4) as usize;
+        let captured = shb_length + idb_length + 28;
+
+        assert_eq!(bytes[captured], 27);
+        assert_eq!(read_u32(&bytes, captured + 4), 0x1234_5678);
+        assert_eq!(
+            &bytes[captured + 10..captured + 14],
+            &0x1234_5678u32.to_le_bytes()
         );
     }
 

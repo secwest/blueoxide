@@ -19,6 +19,12 @@ The repository now contains a dependency-free, buildable receive core with:
   quantization, combined advertiser/receiver clock widening, contextual
   AUX_ADV_IND/AUX_CHAIN_IND validation, ADI-bound chain state, and bounded
   advertising-data reassembly.
+- Fixed-channel periodic advertising decode with SyncInfo-supplied access
+  address and CRC initialization, contextual AUX_SYNC_IND semantics, exact
+  sample positions, and custom-access-address PCAPNG output.
+- SyncInfo-driven offline periodic event planning with CSA#2 channel
+  selection, first-event offset quantization, interval-based clock widening,
+  bounded missed-event matching, observation re-anchoring, and counter wrap.
 - Configurable CRC-gated LE 1M and LE 2M data-channel decoding for a known
   connection access address, CRC initializer, logical channel, and asserted
   PHY.
@@ -161,8 +167,38 @@ lossless raw payloads instead of being assigned legacy primary meanings.
 The command decodes one already selected channel and PHY. In isolation it
 does not infer whether a type-`0x07` packet is AUX_ADV_IND, AUX_CHAIN_IND,
 AUX_SYNC_IND, or AUX_SCAN_RSP because that name depends on scheduling context.
-It does not retune, combine channels, maintain periodic synchronization state,
-or demodulate LE Coded.
+It does not retune, combine channels, or demodulate LE Coded. Use
+`decode-periodic` when SyncInfo supplies the periodic access address and CRC
+initializer, and use `periodic-advertising-plan` when exact packet sample
+coordinates are available.
+
+Decode a recording already centered on one periodic advertising channel:
+
+```text
+cargo run --release -- decode-periodic \
+  --input periodic.cf32 \
+  --format f32le \
+  --channel 27 \
+  --phy 2m \
+  --sample-rate 8000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --block-samples 262144 \
+  --output-pcap periodic.pcapng
+```
+
+`decode-periodic` accepts channels 0 through 36 and an asserted
+`--phy 1m|2m`. It uses the full eight-bit advertising Length layout with the
+access address and 24-bit CRC initializer copied from SyncInfo. CRC-valid PDU
+type `0x07` packets are decoded in periodic context as `AUX_SYNC_IND`, while
+the packet object and Bluetooth LE PCAPNG pseudo-header retain the actual
+periodic access address rather than substituting the standard advertising
+address.
+
+This remains a fixed-channel offline decoder. It does not discover SyncInfo
+from another recording, change channels between periodic events, or infer the
+PHY. LE Coded periodic packets can be represented by the planner but are not
+demodulated.
 
 Plan and validate a timestamp-aligned extended-advertising sequence offline:
 
@@ -195,6 +231,34 @@ accumulated losslessly through the configured `--max-data` bound, and a
 fragment without AuxPtr completes the chain. A rejected observation does not
 alter tracker state. This is an offline workflow over a shared exact sample
 coordinate system, not a claim that current SDR backends can retune in time.
+
+Plan periodic advertising events from a packet containing SyncInfo:
+
+```text
+cargo run --release -- periodic-advertising-plan \
+  --sync-packet 20:2m:1000:4714132021632000ffffffff7f78563412efcdab6745 \
+  --sample-rate 4000000 \
+  --receiver-ppm 20 \
+  --events 6 \
+  --observe 27:2m:10792700 \
+  --observe 32:2m:11112705 \
+  --max-event-advance 3
+```
+
+`--sync-packet` is
+`CHANNEL:PHY:ACCESS_ADDRESS_SAMPLE:HEADER_AND_PAYLOAD_HEX` and must be a
+CRC-validated secondary advertising packet with SyncInfo. The planner
+inherits its periodic PHY, access address, CRC initializer, interval, channel
+map, sleep-clock accuracy, and initial event counter.
+
+The first event retains the complete quantized SyncPacketOffset interval
+instead of inventing an exact midpoint. Its widened bounds combine advertiser
+SCA with `--receiver-ppm`. Later events advance by the 1.25 millisecond
+periodic interval and select channels with CSA#2. Repeatable
+`--observe CHANNEL:PHY:SAMPLE` values search through a bounded number of
+missed events, require channel/PHY/window agreement, report early/on-time/late
+error, and re-anchor later timing to the exact observed sample. Rejected
+observations leave the tracker unchanged.
 
 Decode a recording from a known LE connection data channel:
 
@@ -647,13 +711,14 @@ available; the next receive stages are wideband channelization or timed
 retuning, routing those observations into connection-event state, applying
 tracked PHY transitions to demodulator selection, and full live BLE connection
 following. Offline AuxPtr scheduling and extended-advertising chain
-reassembly are present; live AuxPtr-driven secondary-channel capture still
-requires timestamp-preserving timed retuning or channelization. Full packet
-decode remains a project requirement: periodic advertising synchronization,
-complete LL procedure state, automatic pairing and LTK selection,
-bidirectional encryption-state tracking, L2CAP channel state, stateful GATT
-reconstruction, LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers
-will be added incrementally while retaining undecoded packet bytes losslessly.
+reassembly plus periodic advertising planning, fixed-channel decode, and
+observation re-anchoring are present. Live AuxPtr-driven or periodic
+multi-channel capture still requires timestamp-preserving timed retuning or
+channelization. Full packet decode remains a project requirement: complete LL
+procedure state, automatic pairing and LTK selection, bidirectional
+encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
+LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers will be added
+incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

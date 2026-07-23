@@ -1342,3 +1342,84 @@ Current `IqSource` backends do not prove stop/retune/start timing continuity
 and reject reconfiguration while streaming, so this increment does not claim
 live AuxPtr following. Timed radio control or timestamp-preserving
 channelization is still required to connect the scheduler to hardware.
+
+## 2026-07-23: Synchronize periodic advertising from explicit SyncInfo
+
+### Advertising framing with a nonstandard access address
+
+Periodic advertising keeps the secondary advertising PDU layout but replaces
+the standard advertising access address and CRC initializer with the values
+carried by SyncInfo. Treating it as a data-channel PDU would incorrectly
+enable CP/CTEInfo header semantics; forcing it through the original
+`AdvertisingPdu` conversion would discard or reject the actual access address.
+
+`LeFrameConfig::periodic_advertising` therefore combines the SyncInfo access
+address and CRC initializer with the complete eight-bit secondary advertising
+Length layout. `AdvertisingPdu::from_le_pdu` is the checked representation
+boundary for this context, while `TryFrom<LePdu>` deliberately retains the
+old standard-address requirement for primary and ordinary secondary
+advertising. Packet bytes and the PCAPNG reference-access-address field both
+use the retained address.
+
+PDU type `0x07` still does not encode its AUX subtype. The periodic decoder
+supplies typed `AUX_SYNC_IND` context to the extended-header parser rather than
+rewriting display text or changing isolated `decode-secondary` behavior.
+
+### First-event timing remains an interval
+
+SyncPacketOffset is measured from the beginning of the packet containing
+SyncInfo to the beginning of the first AUX_SYNC_IND. The containing packet and
+periodic packet use the same PHY, so their preamble durations cancel when both
+timestamps identify the beginning of the access address.
+
+An encoded offset represents the interval from `offset * unit` through one
+additional 30- or 300-microsecond unit. The tracker floors the lower
+sample conversion and ceils the upper conversion. It keeps these represented
+bounds separate from clock widening instead of selecting a midpoint.
+Offset Adjust contributes 2,457,600 microseconds and is accepted only with
+300-microsecond units. Zero offsets and short unadjusted offsets encoded with
+300-microsecond units are rejected as unrepresentable or noncanonical.
+
+The initial widening is the ceiling of:
+
+```text
+elapsed_us * (advertiser_SCA_ppm + receiver_ppm) * sample_rate_hz / 1e12
+```
+
+Later unanchored events add the periodic interval in 1.25 millisecond units.
+Widening is capped at half the periodic interval minus the 150 microsecond
+inter-frame space so adjacent event searches cannot consume each other.
+
+### CSA#2 progression and transactional re-anchoring
+
+Periodic channel selection always uses CSA#2 with the SyncInfo access address,
+channel map, and 16-bit event counter. Event-counter wrapping is natural;
+an independent monotonic event index protects anchor-relative timing from the
+wrap.
+
+Observation matching searches the current event and a caller-bounded number
+of later events. A match requires channel, inherited PHY, and widened sample
+window agreement. If multiple candidates have the same absolute timing error,
+the observation is ambiguous and rejected. All searching occurs on cloned
+tracker state, so channel, PHY, timing, and ambiguity failures cannot advance
+the schedule. A unique match replaces the quantized prediction with the exact
+observed access-address sample; clock widening for later events then
+accumulates from that anchor.
+
+`periodic-advertising-plan` exposes this state over a CRC-validated packet
+containing SyncInfo and optional repeated observations.
+`decode-periodic` handles one already selected uncoded channel and PHY using
+the same access address and CRC. Neither command retunes hardware, combines
+channels, discovers the PHY, or demodulates LE Coded.
+
+### Independent behavior boundary
+
+The SyncInfo layout, offset units/adjustment, interval, inherited PHY, channel
+map, access address, CRC initializer, event counter, CSA#2 call site, widening
+accumulation, and widening cap were checked against Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4`. Wireshark commit
+`403c9a36ea7fa8f2d69a449be1f4fa97c52817c0` independently confirms that raw
+SyncOffset zero cannot be represented and that AUX_SYNC_IND is contextual.
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8` generated the fixed
+periodic CRC, and Jiao Xianjun BTLE commit
+`85401861e8f4b04b90cbaa0394c0f9d45ed02f18` generated its whitening bytes.

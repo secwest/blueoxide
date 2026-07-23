@@ -42,6 +42,7 @@ impl BleChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdvertisingPdu {
     pub channel: BleChannel,
+    pub access_address: u32,
     pub bit_offset: usize,
     pub inverted: bool,
     pub access_address_errors: u8,
@@ -116,6 +117,16 @@ impl LeFrameConfig {
             crc_init: LE_ADV_CRC_INIT,
             layout: LePduLayout::SecondaryAdvertising,
         }
+    }
+
+    pub fn periodic_advertising(access_address: u32, crc_init: u32) -> Result<Self> {
+        let config = Self {
+            access_address,
+            crc_init,
+            layout: LePduLayout::SecondaryAdvertising,
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn data(access_address: u32, crc_init: u32) -> Result<Self> {
@@ -198,7 +209,7 @@ impl AdvertisingPdu {
 
     pub fn link_layer_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(4 + 2 + self.payload.len() + 3);
-        bytes.extend_from_slice(&LE_ADV_ACCESS_ADDRESS.to_le_bytes());
+        bytes.extend_from_slice(&self.access_address.to_le_bytes());
         bytes.extend_from_slice(&self.header);
         bytes.extend_from_slice(&self.payload);
         bytes.extend_from_slice(&self.crc);
@@ -216,6 +227,12 @@ impl TryFrom<LePdu> for AdvertisingPdu {
                 packet.access_address
             )));
         }
+        Self::from_le_pdu(packet)
+    }
+}
+
+impl AdvertisingPdu {
+    pub fn from_le_pdu(packet: LePdu) -> Result<Self> {
         if packet.cte_info.is_some() {
             return Err(Error::InvalidInput(
                 "advertising PDU cannot contain a data-channel CTEInfo header".to_owned(),
@@ -223,6 +240,7 @@ impl TryFrom<LePdu> for AdvertisingPdu {
         }
         Ok(Self {
             channel: packet.channel,
+            access_address: packet.access_address,
             bit_offset: packet.bit_offset,
             inverted: packet.inverted,
             access_address_errors: packet.access_address_errors,
@@ -445,6 +463,7 @@ pub fn decode_primary_advertising(
     .into_iter()
     .map(|packet| AdvertisingPdu {
         channel: packet.channel,
+        access_address: packet.access_address,
         bit_offset: packet.bit_offset,
         inverted: packet.inverted,
         access_address_errors: packet.access_address_errors,
@@ -657,6 +676,31 @@ mod tests {
             crc: [0; 3],
         };
         assert!(AdvertisingPdu::try_from(packet).is_err());
+    }
+
+    #[test]
+    fn periodic_advertising_conversion_retains_custom_access_address() {
+        let packet = LePdu {
+            channel: BleChannel::new(27).unwrap(),
+            access_address: 0x1234_5678,
+            bit_offset: 32,
+            inverted: true,
+            access_address_errors: 1,
+            header: [0x07, 2],
+            cte_info: None,
+            payload: vec![0xaa, 0xbb],
+            crc: [0xef, 0xcd, 0xab],
+        };
+        assert!(AdvertisingPdu::try_from(packet.clone()).is_err());
+
+        let advertising = AdvertisingPdu::from_le_pdu(packet).unwrap();
+        assert_eq!(advertising.access_address, 0x1234_5678);
+        assert_eq!(
+            advertising.link_layer_bytes(),
+            [
+                0x78, 0x56, 0x34, 0x12, 0x07, 0x02, 0xaa, 0xbb, 0xef, 0xcd, 0xab
+            ]
+        );
     }
 
     #[test]

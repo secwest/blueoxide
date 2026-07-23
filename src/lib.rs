@@ -18,6 +18,7 @@ pub mod link_layer;
 pub mod ll_control;
 pub mod native;
 pub mod pcapng;
+pub mod periodic;
 pub mod sdr;
 pub mod smp;
 

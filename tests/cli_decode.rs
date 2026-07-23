@@ -313,6 +313,162 @@ fn cli_rejects_invalid_secondary_advertising_configuration_before_input_open() {
 }
 
 #[test]
+fn cli_decodes_independent_periodic_advertising_fixture() {
+    // Scapy commit de339926 generated CRC 58c8ce with init abcdef.
+    // Jiao Xianjun BTLE commit 8540186 generated the channel-27 whitening.
+    let whitened_body = [
+        0xc4, 0x19, 0x34, 0x42, 0xe3, 0x5f, 0xf4, 0x9d, 0xc2, 0x09, 0x18,
+    ];
+    let dewhitened_body = [
+        0x07, 0x06, 0x03, 0x08, 0xbc, 0xda, 0x02, 0x01, 0x58, 0xc8, 0xce,
+    ];
+    let access_address = 0x1234_5678u32;
+    let mut bits = bytes_to_bits_lsb(&[0xaa, 0xaa]);
+    bits.extend(bytes_to_bits_lsb(&access_address.to_le_bytes()));
+    bits.extend(bytes_to_bits_lsb(&whitened_body));
+
+    let iq_path = temporary_path("periodic-advertising.cf32");
+    let pcap_path = temporary_path("periodic-advertising.pcapng");
+    fs::write(&iq_path, modulate_bits(bits, 4, 500_000.0, 8_000_000.0)).expect("write fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-periodic",
+            "--input",
+            iq_path.to_str().expect("UTF-8 temporary path"),
+            "--format",
+            "f32le",
+            "--channel",
+            "27",
+            "--phy",
+            "2m",
+            "--sample-rate",
+            "8000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "79",
+            "--aa-errors",
+            "0",
+            "--output-pcap",
+            pcap_path.to_str().expect("UTF-8 temporary path"),
+        ])
+        .output()
+        .expect("run blueoxide");
+
+    let _ = fs::remove_file(&iq_path);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    for expected in [
+        "channel=27 phy=LE-2M",
+        "access_address=12345678",
+        "header=0706",
+        "crc=58c8ce",
+        "AUX_SYNC_IND",
+        "sid=13 did=2748",
+        "advertising_data_octets=2",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in stdout: {stdout}"
+        );
+    }
+    assert!(stderr.contains("decoded 1 CRC-valid packet(s)"));
+
+    let pcap = fs::read(&pcap_path).expect("read PCAPNG");
+    let _ = fs::remove_file(&pcap_path);
+    let expected_packet = [
+        access_address.to_le_bytes().as_slice(),
+        dewhitened_body.as_slice(),
+    ]
+    .concat();
+    let packet_offset = pcap
+        .windows(expected_packet.len())
+        .position(|window| window == expected_packet)
+        .expect("PCAPNG contains exact dewhitened periodic advertising packet");
+    assert_eq!(
+        &pcap[packet_offset - 6..packet_offset - 2],
+        &access_address.to_le_bytes()
+    );
+    let flags = u16::from_le_bytes([pcap[packet_offset - 2], pcap[packet_offset - 1]]);
+    assert_eq!(flags & 0x4000, 0x4000);
+}
+
+#[test]
+fn cli_rejects_invalid_periodic_advertising_configuration_before_input_open() {
+    let primary_channel = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-periodic",
+            "--input",
+            "missing.cf32",
+            "--channel",
+            "37",
+            "--sample-rate",
+            "8000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(primary_channel.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&primary_channel.stderr)
+            .contains("periodic advertising channel in 0..=36")
+    );
+
+    let wide_crc = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-periodic",
+            "--input",
+            "missing.cf32",
+            "--channel",
+            "27",
+            "--sample-rate",
+            "8000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0x1000000",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(wide_crc.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&wide_crc.stderr).contains("exceeds 24 bits"));
+
+    let zero_block = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "decode-periodic",
+            "--input",
+            "missing.cf32",
+            "--channel",
+            "27",
+            "--sample-rate",
+            "8000000",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--block-samples",
+            "0",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(zero_block.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&zero_block.stderr)
+            .contains("--block-samples must be greater than zero")
+    );
+}
+
+#[test]
 fn cli_plans_and_reassembles_contextual_extended_advertising() {
     // AuxOffset timing and contextual AUX subtype behavior are fixed from the
     // pinned Zephyr and Wireshark implementations documented in Verification.md.
@@ -375,4 +531,50 @@ fn cli_rejects_extended_advertising_observation_outside_window() {
         String::from_utf8_lossy(&output.stderr)
             .contains("AUX_ADV_IND sample 4000 is outside 3399..=3521")
     );
+}
+
+#[test]
+fn cli_plans_and_reanchors_periodic_advertising() {
+    // SyncInfo interpretation and periodic CSA#2 scheduling are fixed against
+    // the pinned Zephyr and Wireshark revisions documented in Verification.md.
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "periodic-advertising-plan",
+            "--sync-packet",
+            "20:2m:1000:4714132021632000ffffffff7f78563412efcdab6745",
+            "--sample-rate",
+            "4000000",
+            "--receiver-ppm",
+            "20",
+            "--events",
+            "2",
+            "--observe",
+            "27:2m:10792700",
+            "--observe",
+            "32:2m:11112705",
+            "--max-event-advance",
+            "3",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    for expected in [
+        "sync_packet channel=20 phy=LE-2M sample=1000 access_address=12345678 crc_init=abcdef interval_us=40000 event=17767 channel_map=ffffffff1f advertiser_sca_ppm=100",
+        "observation=0 event=17767 channel=27 phy=LE-2M observed_sample=10792700 advanced_events=0 missed_events=0 timing=on-time:0",
+        "represented_earliest_sample=10792600 represented_latest_sample=10793800 earliest_sample=10791305 latest_sample=10795095 widening_samples=1295",
+        "observation=1 event=17769 channel=32 phy=LE-2M observed_sample=11112705 advanced_events=2 missed_events=2 timing=late:5",
+        "represented_earliest_sample=11112700 represented_latest_sample=11112700 earliest_sample=11112661 latest_sample=11112739 widening_samples=39",
+        "plan=0 event=17769 channel=32 frequency_hz=2470000000 phy=LE-2M represented_earliest_sample=11112705 represented_latest_sample=11112705 earliest_sample=11112705 latest_sample=11112705 quantization_width_samples=0 widening_samples=0",
+        "plan=1 event=17770 channel=5 frequency_hz=2414000000 phy=LE-2M represented_earliest_sample=11272705 represented_latest_sample=11272705 earliest_sample=11272685 latest_sample=11272725 quantization_width_samples=0 widening_samples=20",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in stdout: {stdout}"
+        );
+    }
 }

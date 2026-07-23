@@ -1486,6 +1486,113 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Periodic advertising synchronization verification
+
+The periodic scheduling model was checked against Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4`:
+
+- `subsys/bluetooth/controller/ll_sw/pdu.h` defines SyncInfo offset units,
+  Offset Adjust, periodic interval, channel map/SCA packing, access address,
+  CRC initializer, and event counter.
+- `subsys/bluetooth/controller/ll_sw/ull_sync.c` inherits the PHY from the
+  packet containing SyncInfo, consumes the encoded offset, and initializes
+  synchronization state from the periodic interval and advertiser SCA.
+- `subsys/bluetooth/controller/ll_sw/nordic/lll/lll_sync.c` advances periodic
+  events with `lll_chan_sel_2(event_counter, channel_id, ...)`, accumulates
+  widening while packets are missed, caps widening before half the interval,
+  and resets widening after a successful anchor.
+- `subsys/bluetooth/controller/ll_sw/lll_chan.c` supplies the independently
+  implemented CSA#2 permutation/remapping behavior already covered by the
+  Blueoxide channel-selection vectors.
+
+Zephyr's generated SyncInfo uses 300-microsecond units only when the
+30-microsecond representation cannot hold the residual offset and pairs
+Offset Adjust with the large-offset form. Wireshark commit
+`403c9a36ea7fa8f2d69a449be1f4fa97c52817c0`,
+`epan/dissectors/packet-btle.c`, independently reports raw SyncOffset zero as
+not representable and selects AUX_SYNC_IND only from external AUX context.
+
+The exact SyncInfo scheduling vector is:
+
+```text
+Containing PDU:      4714132021632000ffffffff7f78563412efcdab6745
+Parent channel/PHY:  channel 20, LE 2M
+Parent AA sample:    1,000
+Sample rate:         4,000,000 samples/s
+Receiver accuracy:   20 ppm
+SyncPacketOffset:    801 * 300 us + 2,457,600 us = 2,697,900 us
+Interval:            32 * 1,250 us = 40,000 us
+Channel map:         all 37 data channels
+Advertiser SCA:      100 ppm
+Access address:      0x12345678
+CRC initializer:     0xabcdef
+Initial event:       0x4567
+```
+
+The first event must select channel 27 and retain this complete timing state:
+
+```text
+Represented samples: 10,792,600 through 10,793,800
+Clock widening:      1,295 samples per side
+Receive window:      10,791,305 through 10,795,095
+```
+
+Pinned CSA#2 channels for events `0x4567..0x456c` are:
+
+```text
+27, 14, 32, 5, 13, 34
+```
+
+After event `0x4567` is observed at sample `10,792,700`, an observation on
+channel 32 at sample `11,112,705` uniquely matches event `0x4569`, advances
+two events, reports five samples late, and has 39 samples of accumulated
+widening. The successful observation then re-anchors the represented sample
+to `11,112,705` with zero immediate widening.
+
+The independent fixed-channel waveform uses:
+
+```text
+Access address:  0x12345678
+CRC initializer: 0xabcdef
+Channel/PHY:     channel 27, LE 2M
+Header/payload:  07060308bcda0201
+CRC:             58c8ce
+Whitened body:   c4193442e35ff49dc20918
+```
+
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+generated CRC `58c8ce` with `BTLE.compute_crc`. Jiao Xianjun BTLE commit
+`85401861e8f4b04b90cbaa0394c0f9d45ed02f18` generated the channel-27
+whitened body with `scramble_core`. The library and CLI tests embed these
+fixed bytes directly and do not call Blueoxide CRC or whitening helpers. They
+must recover one `AUX_SYNC_IND` with SID 13, DID 2748, two advertising-data
+octets, and the custom access address. The PCAPNG test checks both the
+pseudo-header reference access address and the packet access address bytes.
+
+Focused tests cover custom-address representation boundaries, 24-bit CRC
+validation, primary-channel rejection, full-length advertising framing,
+cross-block streaming, discontinuity reset, SyncInfo offset encoding,
+first-event quantization, clock-widening accumulation and cap behavior, CSA#2
+progression, event-counter wrapping, channel/PHY/timing mismatch, bounded
+missed-event recovery, exact re-anchoring, explicit reset, and non-mutating
+rejection.
+
+Final local gate for this increment:
+
+```text
+199 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+9 advertising decode/planning/reassembly/periodic CLI integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1497,9 +1604,9 @@ git diff --check
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
 - Recorded multi-channel or timed-retune validation for live AuxPtr-driven
-  extended advertising, plus differential tests for periodic advertising
-  synchronization, data-channel following, stateful GATT, EATT, pairing and
-  automatic LTK selection, full LL encryption activation/pause state,
-  automatic bidirectional encryption state, automatic capture-driven PHY
-  transition delivery and demodulator switching, LE Coded PHY demodulation,
-  and Bluetooth Classic as those layers are added.
+  extended advertising and periodic advertising following, plus differential
+  tests for data-channel following, stateful GATT, EATT, pairing and automatic
+  LTK selection, full LL encryption activation/pause state, automatic
+  bidirectional encryption state, automatic capture-driven PHY transition
+  delivery and demodulator switching, LE Coded PHY demodulation, and Bluetooth
+  Classic as those layers are added.

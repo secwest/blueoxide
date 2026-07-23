@@ -357,10 +357,47 @@ pub fn decode_secondary_advertising_detailed(
     .collect()
 }
 
+/// Demodulates CRC-valid uncoded periodic advertising observations.
+pub fn decode_periodic_advertising_detailed(
+    samples: &[Complex32],
+    channel: BleChannel,
+    access_address: u32,
+    crc_init: u32,
+    config: LeUncodedDemodConfig,
+) -> Result<Vec<ReceivedAdvertisingPdu>> {
+    if channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "periodic advertising decoder requires channel 0 through 36; got {}",
+            channel.index()
+        )));
+    }
+    decode_le_uncoded_detailed(
+        samples,
+        channel,
+        LeFrameConfig::periodic_advertising(access_address, crc_init)?,
+        config,
+    )?
+    .into_iter()
+    .map(received_advertising_layout_pdu)
+    .collect()
+}
+
 fn received_advertising_pdu(packet: ReceivedLePdu) -> Result<ReceivedAdvertisingPdu> {
     Ok(ReceivedAdvertisingPdu {
         phy: packet.phy,
         pdu: AdvertisingPdu::try_from(packet.pdu)?,
+        access_address_sample: packet.access_address_sample,
+        symbol_phase: packet.symbol_phase,
+        estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
+        estimated_deviation_hz: packet.estimated_deviation_hz,
+        discriminator_separation: packet.discriminator_separation,
+    })
+}
+
+fn received_advertising_layout_pdu(packet: ReceivedLePdu) -> Result<ReceivedAdvertisingPdu> {
+    Ok(ReceivedAdvertisingPdu {
+        phy: packet.phy,
+        pdu: AdvertisingPdu::from_le_pdu(packet.pdu)?,
         access_address_sample: packet.access_address_sample,
         symbol_phase: packet.symbol_phase,
         estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
@@ -582,6 +619,54 @@ impl Le1mStreamDecoder {
 /// Bounded stream decoder for fixed-channel uncoded secondary advertising.
 pub struct LeSecondaryAdvertisingStreamDecoder {
     inner: LeUncodedPacketStreamDecoder,
+}
+
+/// Bounded stream decoder for periodic advertising on one asserted channel.
+pub struct LePeriodicAdvertisingStreamDecoder {
+    inner: LeUncodedPacketStreamDecoder,
+}
+
+impl LePeriodicAdvertisingStreamDecoder {
+    pub fn new(
+        channel: BleChannel,
+        access_address: u32,
+        crc_init: u32,
+        config: LeUncodedDemodConfig,
+    ) -> Result<Self> {
+        if channel.is_primary_advertising() {
+            return Err(Error::InvalidConfiguration(format!(
+                "periodic advertising stream decoder requires channel 0 through 36; got {}",
+                channel.index()
+            )));
+        }
+        Ok(Self {
+            inner: LeUncodedPacketStreamDecoder::new(
+                channel,
+                LeFrameConfig::periodic_advertising(access_address, crc_init)?,
+                config,
+            )?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn push(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<StreamDecodeBatch> {
+        let batch = self.inner.push(first_sample_index, input)?;
+        Ok(StreamDecodeBatch {
+            packets: batch
+                .packets
+                .into_iter()
+                .map(received_advertising_layout_pdu)
+                .collect::<Result<Vec<_>>>()?,
+            discontinuity: batch.discontinuity,
+        })
+    }
 }
 
 impl LeSecondaryAdvertisingStreamDecoder {
@@ -947,6 +1032,95 @@ mod tests {
         assert!(
             decode_secondary_advertising_detailed(&[], BleChannel::new(39).unwrap(), config)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn periodic_advertising_stream_decodes_independent_custom_access_address_fixture() {
+        let phy = LeUncodedPhy::Le2M;
+        let channel = BleChannel::new(27).unwrap();
+        // Scapy commit de339926 generated CRC 58c8ce with init abcdef.
+        // Jiao Xianjun BTLE commit 8540186 generated the channel-27
+        // whitened body c4193442e35ff49dc20918.
+        let bits = bytes_to_bits_lsb(&[
+            0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12, 0xc4, 0x19, 0x34, 0x42, 0xe3, 0x5f, 0xf4, 0x9d,
+            0xc2, 0x09, 0x18,
+        ]);
+        let samples = modulate_uncoded(&bits, 4, 45_000.0, phy);
+        let config = LeUncodedDemodConfig {
+            phy,
+            sample_rate_hz: 8_000_000,
+            max_access_address_errors: 0,
+        };
+
+        let packets = decode_periodic_advertising_detailed(
+            &samples,
+            channel,
+            0x1234_5678,
+            0x00ab_cdef,
+            config,
+        )
+        .unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].pdu.access_address, 0x1234_5678);
+        assert_eq!(packets[0].pdu.header, [0x07, 0x06]);
+        assert_eq!(packets[0].pdu.payload, [0x03, 0x08, 0xbc, 0xda, 0x02, 0x01]);
+        assert_eq!(packets[0].pdu.crc, [0x58, 0xc8, 0xce]);
+
+        let mut decoder =
+            LePeriodicAdvertisingStreamDecoder::new(channel, 0x1234_5678, 0x00ab_cdef, config)
+                .unwrap();
+        let split = samples.len() / 2;
+        assert!(
+            decoder
+                .push(1_000, &samples[..split])
+                .unwrap()
+                .packets
+                .is_empty()
+        );
+        let reset_batch = decoder.push(5_000, &samples).unwrap();
+        assert_eq!(
+            reset_batch.discontinuity,
+            Some(SampleDiscontinuity {
+                expected_first_sample: 1_000 + split as u64,
+                observed_first_sample: 5_000,
+            })
+        );
+        assert_eq!(reset_batch.packets.len(), 1);
+        assert_eq!(
+            reset_batch.packets[0].pdu.link_layer_bytes(),
+            [
+                0x78, 0x56, 0x34, 0x12, 0x07, 0x06, 0x03, 0x08, 0xbc, 0xda, 0x02, 0x01, 0x58, 0xc8,
+                0xce
+            ]
+        );
+    }
+
+    #[test]
+    fn periodic_advertising_decoder_rejects_invalid_configuration() {
+        let config = LeUncodedDemodConfig {
+            phy: LeUncodedPhy::Le1M,
+            sample_rate_hz: 4_000_000,
+            max_access_address_errors: 0,
+        };
+        assert!(
+            LePeriodicAdvertisingStreamDecoder::new(
+                BleChannel::new(37).unwrap(),
+                0x1234_5678,
+                0x00ab_cdef,
+                config,
+            )
+            .is_err()
+        );
+        assert!(
+            decode_periodic_advertising_detailed(
+                &[],
+                BleChannel::new(27).unwrap(),
+                0x1234_5678,
+                0x0100_0000,
+                config,
+            )
+            .is_err()
         );
     }
 

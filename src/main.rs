@@ -1,7 +1,7 @@
 use blueoxide::advertising::{
     ConnectRequest, ExtendedAdvertisingChainConfig, ExtendedAdvertisingChainProgress,
     ExtendedAdvertisingChainTracker, ExtendedAdvertisingPduKind, FirstCentralTransmission,
-    decode_advertising_pdu,
+    decode_advertising_pdu, decode_contextual_extended_advertising_pdu,
 };
 use blueoxide::att::{AttPdu, AttUuid, DecodedAttPdu};
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
@@ -14,8 +14,9 @@ use blueoxide::capture::{
     capture_data_channel, capture_primary_advertising,
 };
 use blueoxide::demod::{
-    Le1mDemodConfig, Le1mStreamDecoder, LeSecondaryAdvertisingStreamDecoder, LeUncodedDemodConfig,
-    LeUncodedPacketStreamDecoder, LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu,
+    Le1mDemodConfig, Le1mStreamDecoder, LePeriodicAdvertisingStreamDecoder,
+    LeSecondaryAdvertisingStreamDecoder, LeUncodedDemodConfig, LeUncodedPacketStreamDecoder,
+    LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu,
 };
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
@@ -30,6 +31,9 @@ use blueoxide::ll_control::{
     ChannelClassification, CsConfigAction, DecodedControlPdu, LeEncryptionMaterialTracker,
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
+use blueoxide::periodic::{
+    PeriodicAdvertisingEvent, PeriodicAdvertisingTracker, PeriodicAdvertisingTrackerConfig,
+};
 use blueoxide::sdr::{IqSource, SdrConfig};
 use blueoxide::smp::{DecodedSmpPdu, SmpAuthenticationRequirements, SmpKeyDistribution, SmpPdu};
 use blueoxide::{Error, Result};
@@ -62,6 +66,22 @@ struct DecodeSecondaryArgs {
     channel: BleChannel,
     phy: LeUncodedPhy,
     sample_rate_hz: u32,
+    max_samples: usize,
+    block_samples: usize,
+    max_access_address_errors: u8,
+    output_pcap: Option<PathBuf>,
+    capture_start_ns: u64,
+}
+
+#[derive(Debug)]
+struct DecodePeriodicArgs {
+    input: PathBuf,
+    format: IqFormat,
+    channel: BleChannel,
+    phy: LeUncodedPhy,
+    sample_rate_hz: u32,
+    access_address: u32,
+    crc_init: u32,
     max_samples: usize,
     block_samples: usize,
     max_access_address_errors: u8,
@@ -183,6 +203,23 @@ struct ExtendedAdvertisingPacketArg {
     access_address_sample: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PeriodicAdvertisingObservationArg {
+    channel: BleChannel,
+    phy: LePhy,
+    access_address_sample: u64,
+}
+
+#[derive(Debug)]
+struct PeriodicAdvertisingPlanArgs {
+    sync_packet: ExtendedAdvertisingPacketArg,
+    sample_rate_hz: u32,
+    receiver_clock_accuracy_ppm: u32,
+    event_count: usize,
+    maximum_event_advance: u16,
+    observations: Vec<PeriodicAdvertisingObservationArg>,
+}
+
 fn usage() -> &'static str {
     "blueoxide - Bluetooth/BLE SDR receive and capture tools
 
@@ -191,6 +228,8 @@ USAGE:
   blueoxide backends
   blueoxide decode --input FILE --channel 37|38|39 --sample-rate HZ [OPTIONS]
   blueoxide decode-secondary --input FILE --channel 0..36 --sample-rate HZ [OPTIONS]
+  blueoxide decode-periodic --input FILE --channel 0..36 --sample-rate HZ \
+    --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide decode-data --input FILE --channel 0..36 --sample-rate HZ \
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide connection-plan --access-address 0xNNNNNNNN \
@@ -203,6 +242,8 @@ USAGE:
     --connect-sample N --central-observe CHANNEL:SAMPLE [OPTIONS]
   blueoxide extended-advertising-plan --sample-rate HZ \
     --packet CHANNEL:PHY:SAMPLE:PDUHEX [--packet ...]
+  blueoxide periodic-advertising-plan --sample-rate HZ \
+    --sync-packet CHANNEL:PHY:SAMPLE:PDUHEX [OPTIONS]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
   blueoxide capture-data --device bladerf|limesdr|xtrx --channel 0..36 \
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
@@ -219,6 +260,12 @@ DECODE OPTIONS:
 DECODE-SECONDARY OPTIONS:
   Uses the DECODE OPTIONS above on one asserted secondary advertising channel.
   --phy 1m|2m             Uncoded secondary advertising PHY (default: 1m)
+
+DECODE-PERIODIC OPTIONS:
+  Uses the DECODE OPTIONS above on one asserted periodic advertising channel.
+  --phy 1m|2m             Uncoded periodic advertising PHY (default: 1m)
+  --access-address HEX    SyncInfo periodic advertising access address
+  --crc-init HEX          SyncInfo 24-bit CRC initialization value
 
 DECODE-DATA OPTIONS:
   Uses the DECODE OPTIONS above and requires a connection access address and
@@ -269,6 +316,15 @@ EXTENDED-ADVERTISING-PLAN OPTIONS:
   --max-data N            Maximum assembled advertising data (default: 1650)
   --packet C:P:S:HEX      CRC-valid header+payload at channel, PHY, and sample;
                           repeat in ADV_EXT_IND/AUX_ADV_IND/AUX_CHAIN_IND order
+                          PHY is 1m, 2m, or coded
+
+PERIODIC-ADVERTISING-PLAN OPTIONS:
+  --sync-packet C:P:S:HEX Packet containing SyncInfo at channel, PHY, and sample
+  --sample-rate HZ        Shared exact sample-coordinate rate
+  --receiver-ppm N        Receiver sample-clock error bound (default: 20)
+  --events N              Number of scheduled events to print (default: 10)
+  --observe C:P:S         CRC-valid periodic observation; repeat as needed
+  --max-event-advance N   Maximum event advancement searched (default: 32)
                           PHY is 1m, 2m, or coded
 
 CAPTURE OPTIONS:
@@ -488,37 +544,37 @@ fn parse_connection_observation(value: &str, option: &str) -> Result<ConnectionO
     })
 }
 
-fn parse_extended_advertising_packet(value: &str) -> Result<ExtendedAdvertisingPacketArg> {
+fn parse_advertising_packet_arg(value: &str, option: &str) -> Result<ExtendedAdvertisingPacketArg> {
     let mut fields = value.splitn(4, ':');
     let channel = fields.next().ok_or_else(|| {
-        Error::InvalidConfiguration(
-            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
-        )
+        Error::InvalidConfiguration(format!(
+            "invalid {option}; expected CHANNEL:PHY:SAMPLE:PDUHEX"
+        ))
     })?;
     let phy = fields.next().ok_or_else(|| {
-        Error::InvalidConfiguration(
-            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
-        )
+        Error::InvalidConfiguration(format!(
+            "invalid {option}; expected CHANNEL:PHY:SAMPLE:PDUHEX"
+        ))
     })?;
     let sample = fields.next().ok_or_else(|| {
-        Error::InvalidConfiguration(
-            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
-        )
+        Error::InvalidConfiguration(format!(
+            "invalid {option}; expected CHANNEL:PHY:SAMPLE:PDUHEX"
+        ))
     })?;
     let bytes = parse_hex_bytes(
         fields.next().ok_or_else(|| {
-            Error::InvalidConfiguration(
-                "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
-            )
+            Error::InvalidConfiguration(format!(
+                "invalid {option}; expected CHANNEL:PHY:SAMPLE:PDUHEX"
+            ))
         })?,
-        "--packet PDUHEX",
+        &format!("{option} PDUHEX"),
     )?;
     if bytes.len() < 2 {
-        return Err(Error::InvalidConfiguration(
-            "--packet PDUHEX must contain the two-octet advertising header".to_owned(),
-        ));
+        return Err(Error::InvalidConfiguration(format!(
+            "{option} PDUHEX must contain the two-octet advertising header"
+        )));
     }
-    let channel = BleChannel::new(parse_number(channel, "--packet channel")?)?;
+    let channel = BleChannel::new(parse_number(channel, &format!("{option} channel"))?)?;
     let header = [bytes[0], bytes[1]];
     let declared_length = if channel.is_primary_advertising() {
         usize::from(header[1] & 0x3f)
@@ -527,13 +583,14 @@ fn parse_extended_advertising_packet(value: &str) -> Result<ExtendedAdvertisingP
     };
     if bytes.len() != 2 + declared_length {
         return Err(Error::InvalidConfiguration(format!(
-            "--packet PDUHEX declares {declared_length} payload octets but contains {}",
+            "{option} PDUHEX declares {declared_length} payload octets but contains {}",
             bytes.len() - 2
         )));
     }
     Ok(ExtendedAdvertisingPacketArg {
         pdu: blueoxide::ble::AdvertisingPdu {
             channel,
+            access_address: blueoxide::ble::LE_ADV_ACCESS_ADDRESS,
             bit_offset: 0,
             inverted: false,
             access_address_errors: 0,
@@ -541,9 +598,13 @@ fn parse_extended_advertising_packet(value: &str) -> Result<ExtendedAdvertisingP
             payload: bytes[2..].to_vec(),
             crc: [0; 3],
         },
-        phy: parse_connection_phy(phy, "--packet PHY")?,
-        access_address_sample: parse_u64(sample, "--packet sample")?,
+        phy: parse_connection_phy(phy, &format!("{option} PHY"))?,
+        access_address_sample: parse_u64(sample, &format!("{option} sample"))?,
     })
+}
+
+fn parse_extended_advertising_packet(value: &str) -> Result<ExtendedAdvertisingPacketArg> {
+    parse_advertising_packet_arg(value, "--packet")
 }
 
 fn parse_extended_advertising_plan_args(args: &[String]) -> Result<ExtendedAdvertisingPlanArgs> {
@@ -607,6 +668,134 @@ fn parse_extended_advertising_plan_args(args: &[String]) -> Result<ExtendedAdver
     }
     .validate()?;
     Ok(plan)
+}
+
+fn parse_periodic_advertising_observation(
+    value: &str,
+) -> Result<PeriodicAdvertisingObservationArg> {
+    let mut fields = value.split(':');
+    let channel = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --observe; expected CHANNEL:PHY:SAMPLE".to_owned())
+    })?;
+    let phy = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --observe; expected CHANNEL:PHY:SAMPLE".to_owned())
+    })?;
+    let sample = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --observe; expected CHANNEL:PHY:SAMPLE".to_owned())
+    })?;
+    if fields.next().is_some() {
+        return Err(Error::InvalidConfiguration(
+            "invalid --observe; expected CHANNEL:PHY:SAMPLE".to_owned(),
+        ));
+    }
+    let channel = BleChannel::new(parse_number(channel, "--observe channel")?)?;
+    if channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "--observe requires a periodic advertising channel in 0..=36; got {}",
+            channel.index()
+        )));
+    }
+    Ok(PeriodicAdvertisingObservationArg {
+        channel,
+        phy: parse_connection_phy(phy, "--observe PHY")?,
+        access_address_sample: parse_u64(sample, "--observe sample")?,
+    })
+}
+
+fn parse_periodic_advertising_plan_args(args: &[String]) -> Result<PeriodicAdvertisingPlanArgs> {
+    let mut sync_packet = None;
+    let mut sample_rate_hz = None;
+    let mut receiver_clock_accuracy_ppm = 20u32;
+    let mut event_count = 10usize;
+    let mut maximum_event_advance = 32u16;
+    let mut observations = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sync-packet" => {
+                let packet = parse_advertising_packet_arg(
+                    &value_after(args, &mut index, "--sync-packet")?,
+                    "--sync-packet",
+                )?;
+                if sync_packet.replace(packet).is_some() {
+                    return Err(Error::InvalidConfiguration(
+                        "--sync-packet may only be supplied once".to_owned(),
+                    ));
+                }
+            }
+            "--sample-rate" => {
+                sample_rate_hz = Some(parse_number(
+                    &value_after(args, &mut index, "--sample-rate")?,
+                    "--sample-rate",
+                )?);
+            }
+            "--receiver-ppm" => {
+                receiver_clock_accuracy_ppm = parse_number(
+                    &value_after(args, &mut index, "--receiver-ppm")?,
+                    "--receiver-ppm",
+                )?;
+            }
+            "--events" => {
+                event_count =
+                    parse_number(&value_after(args, &mut index, "--events")?, "--events")?;
+            }
+            "--max-event-advance" => {
+                maximum_event_advance = parse_number(
+                    &value_after(args, &mut index, "--max-event-advance")?,
+                    "--max-event-advance",
+                )?;
+            }
+            "--observe" => observations.push(parse_periodic_advertising_observation(
+                &value_after(args, &mut index, "--observe")?,
+            )?),
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown periodic-advertising-plan option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let sync_packet = sync_packet.ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "periodic-advertising-plan requires --sync-packet CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
+        )
+    })?;
+    if sync_packet.pdu.channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "--sync-packet requires a secondary advertising channel in 0..=36; got {}",
+            sync_packet.pdu.channel.index()
+        )));
+    }
+    if event_count == 0 {
+        return Err(Error::InvalidConfiguration(
+            "--events must be greater than zero".to_owned(),
+        ));
+    }
+    let sample_rate_hz = sample_rate_hz.ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "periodic-advertising-plan requires --sample-rate HZ".to_owned(),
+        )
+    })?;
+    PeriodicAdvertisingTrackerConfig {
+        sample_rate_hz,
+        receiver_clock_accuracy_ppm,
+    }
+    .validate()?;
+    Ok(PeriodicAdvertisingPlanArgs {
+        sync_packet,
+        sample_rate_hz,
+        receiver_clock_accuracy_ppm,
+        event_count,
+        maximum_event_advance,
+        observations,
+    })
 }
 
 fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
@@ -970,6 +1159,147 @@ fn parse_decode_secondary_args(args: &[String]) -> Result<DecodeSecondaryArgs> {
         channel,
         phy,
         sample_rate_hz,
+        max_samples,
+        block_samples,
+        max_access_address_errors,
+        output_pcap,
+        capture_start_ns,
+    })
+}
+
+fn parse_decode_periodic_args(args: &[String]) -> Result<DecodePeriodicArgs> {
+    let mut input = None;
+    let mut format = IqFormat::F32Le;
+    let mut channel = None;
+    let mut phy = LeUncodedPhy::Le1M;
+    let mut sample_rate_hz = None;
+    let mut access_address = None;
+    let mut crc_init = None;
+    let mut max_samples = DEFAULT_MAX_SAMPLES;
+    let mut block_samples = DEFAULT_BLOCK_SAMPLES;
+    let mut max_access_address_errors = 1u8;
+    let mut output_pcap = None;
+    let mut capture_start_ns = 0u64;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--input" => input = Some(PathBuf::from(value_after(args, &mut index, "--input")?)),
+            "--format" => format = IqFormat::parse(&value_after(args, &mut index, "--format")?)?,
+            "--channel" => {
+                channel = Some(BleChannel::new(parse_number(
+                    &value_after(args, &mut index, "--channel")?,
+                    "--channel",
+                )?)?);
+            }
+            "--phy" => {
+                phy = parse_uncoded_phy(&value_after(args, &mut index, "--phy")?, "--phy")?;
+            }
+            "--sample-rate" => {
+                sample_rate_hz = Some(parse_number(
+                    &value_after(args, &mut index, "--sample-rate")?,
+                    "--sample-rate",
+                )?);
+            }
+            "--access-address" => {
+                access_address = Some(parse_u32(
+                    &value_after(args, &mut index, "--access-address")?,
+                    "--access-address",
+                )?);
+            }
+            "--crc-init" => {
+                crc_init = Some(parse_u32(
+                    &value_after(args, &mut index, "--crc-init")?,
+                    "--crc-init",
+                )?);
+            }
+            "--max-samples" => {
+                max_samples = parse_number(
+                    &value_after(args, &mut index, "--max-samples")?,
+                    "--max-samples",
+                )?;
+            }
+            "--block-samples" => {
+                block_samples = parse_number(
+                    &value_after(args, &mut index, "--block-samples")?,
+                    "--block-samples",
+                )?;
+            }
+            "--aa-errors" => {
+                max_access_address_errors = parse_number(
+                    &value_after(args, &mut index, "--aa-errors")?,
+                    "--aa-errors",
+                )?;
+            }
+            "--output-pcap" => {
+                output_pcap = Some(PathBuf::from(value_after(
+                    args,
+                    &mut index,
+                    "--output-pcap",
+                )?));
+            }
+            "--capture-start-ns" => {
+                capture_start_ns = parse_number(
+                    &value_after(args, &mut index, "--capture-start-ns")?,
+                    "--capture-start-ns",
+                )?;
+            }
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown decode-periodic option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    let channel = channel.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-periodic requires --channel 0..36".to_owned())
+    })?;
+    if channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "decode-periodic requires a periodic advertising channel in 0..=36; got {}",
+            channel.index()
+        )));
+    }
+    let sample_rate_hz = sample_rate_hz.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-periodic requires --sample-rate HZ".to_owned())
+    })?;
+    let access_address = access_address.ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "decode-periodic requires --access-address 0xNNNNNNNN".to_owned(),
+        )
+    })?;
+    let crc_init = crc_init.ok_or_else(|| {
+        Error::InvalidConfiguration("decode-periodic requires --crc-init 0xNNNNNN".to_owned())
+    })?;
+    LeFrameConfig::periodic_advertising(access_address, crc_init)?;
+    LeUncodedDemodConfig {
+        phy,
+        sample_rate_hz,
+        max_access_address_errors,
+    }
+    .validate()?;
+    if block_samples == 0 {
+        return Err(Error::InvalidConfiguration(
+            "--block-samples must be greater than zero".to_owned(),
+        ));
+    }
+
+    Ok(DecodePeriodicArgs {
+        input: input.ok_or_else(|| {
+            Error::InvalidConfiguration("decode-periodic requires --input FILE".to_owned())
+        })?,
+        format,
+        channel,
+        phy,
+        sample_rate_hz,
+        access_address,
+        crc_init,
         max_samples,
         block_samples,
         max_access_address_errors,
@@ -1648,6 +1978,32 @@ fn print_packet(packet: &ReceivedAdvertisingPdu) {
         packet.phy,
         packet.access_address_sample,
         packet.symbol_phase,
+        packet.pdu.inverted,
+        packet.pdu.access_address_errors,
+        packet.pdu.pdu_type(),
+        packet.estimated_carrier_offset_hz,
+        packet.estimated_deviation_hz,
+        print_hex(&packet.pdu.header),
+        print_hex(&packet.pdu.payload),
+        print_hex(&packet.pdu.crc),
+        semantic.replace('"', "'"),
+    );
+}
+
+fn print_periodic_packet(packet: &ReceivedAdvertisingPdu) {
+    let semantic = decode_contextual_extended_advertising_pdu(
+        &packet.pdu,
+        ExtendedAdvertisingPduKind::AuxSyncInd,
+    )
+    .map(|decoded| decoded.to_string())
+    .unwrap_or_else(|error| format!("decode_error={error}"));
+    println!(
+        "channel={} phy={} sample={} phase={} access_address={:08x} inverted={} aa_errors={} pdu_type={} carrier_offset_hz={:.1} deviation_hz={:.1} header={} payload={} crc={} semantic=\"{}\"",
+        packet.pdu.channel.index(),
+        packet.phy,
+        packet.access_address_sample,
+        packet.symbol_phase,
+        packet.pdu.access_address,
         packet.pdu.inverted,
         packet.pdu.access_address_errors,
         packet.pdu.pdu_type(),
@@ -2766,6 +3122,66 @@ fn decode_secondary(args: DecodeSecondaryArgs) -> Result<()> {
     Ok(())
 }
 
+fn decode_periodic(args: DecodePeriodicArgs) -> Result<()> {
+    let (mut reader, sample_count) = open_iq_file(&args.input, args.format)?;
+    if sample_count > args.max_samples {
+        return Err(Error::InvalidInput(format!(
+            "I/Q file contains {sample_count} samples, exceeding the configured limit of {}",
+            args.max_samples
+        )));
+    }
+
+    let config = LeUncodedDemodConfig {
+        phy: args.phy,
+        sample_rate_hz: args.sample_rate_hz,
+        max_access_address_errors: args.max_access_address_errors,
+    };
+    let mut decoder = LePeriodicAdvertisingStreamDecoder::new(
+        args.channel,
+        args.access_address,
+        args.crc_init,
+        config,
+    )?;
+    let mut pcap = match &args.output_pcap {
+        Some(path) => Some(PcapNgWriter::new(BufWriter::new(File::create(path)?))?),
+        None => None,
+    };
+    let mut packet_count = 0usize;
+
+    loop {
+        let first_sample = reader.next_sample_index();
+        let samples = reader.read_block(args.block_samples)?;
+        if samples.is_empty() {
+            break;
+        }
+        let batch = decoder.push(first_sample, &samples)?;
+        if let Some(discontinuity) = batch.discontinuity {
+            eprintln!(
+                "sample discontinuity: expected {}, observed {}",
+                discontinuity.expected_first_sample, discontinuity.observed_first_sample
+            );
+        }
+        for packet in &batch.packets {
+            print_periodic_packet(packet);
+            if let Some(writer) = &mut pcap {
+                let timestamp = sample_timestamp_ns(
+                    args.capture_start_ns,
+                    packet.access_address_sample,
+                    args.sample_rate_hz,
+                )?;
+                writer.write_advertising(packet, timestamp)?;
+            }
+        }
+        packet_count += batch.packets.len();
+    }
+
+    if let Some(writer) = pcap {
+        writer.into_inner().flush()?;
+    }
+    eprintln!("decoded {packet_count} CRC-valid packet(s) from {sample_count} sample(s)");
+    Ok(())
+}
+
 fn decode_data(args: DecodeDataArgs) -> Result<()> {
     if args.block_samples == 0 {
         return Err(Error::InvalidConfiguration(
@@ -3624,17 +4040,106 @@ fn extended_advertising_plan(args: ExtendedAdvertisingPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_periodic_advertising_event(index: usize, event: PeriodicAdvertisingEvent) {
+    let window = event.timing_window;
+    println!(
+        "plan={} event={} channel={} frequency_hz={} phy={} represented_earliest_sample={} represented_latest_sample={} earliest_sample={} latest_sample={} quantization_width_samples={} widening_samples={}",
+        index,
+        event.event_counter,
+        event.channel.index(),
+        event.channel.center_frequency_hz(),
+        event.phy,
+        window.represented_earliest_sample,
+        window.represented_latest_sample,
+        window.earliest_sample,
+        window.latest_sample,
+        window.quantization_width_samples,
+        window.widening_samples,
+    );
+}
+
+fn periodic_advertising_plan(args: PeriodicAdvertisingPlanArgs) -> Result<()> {
+    let decoded = decode_contextual_extended_advertising_pdu(
+        &args.sync_packet.pdu,
+        ExtendedAdvertisingPduKind::AuxAdvInd,
+    )?;
+    let sync_info = decoded.header.sync_info.ok_or_else(|| {
+        Error::InvalidInput(
+            "periodic-advertising-plan --sync-packet does not contain SyncInfo".to_owned(),
+        )
+    })?;
+    println!(
+        "sync_packet channel={} phy={} sample={} access_address={:08x} crc_init={:06x} interval_us={} event={} channel_map={} advertiser_sca_ppm={}",
+        args.sync_packet.pdu.channel.index(),
+        args.sync_packet.phy,
+        args.sync_packet.access_address_sample,
+        sync_info.access_address,
+        sync_info.crc_init,
+        sync_info.interval_us(),
+        sync_info.event_counter,
+        print_hex(&sync_info.channel_map.bytes()),
+        sync_info.sleep_clock_accuracy.maximum_ppm(),
+    );
+    let mut tracker = PeriodicAdvertisingTracker::new(
+        sync_info,
+        args.sync_packet.phy,
+        args.sync_packet.access_address_sample,
+        PeriodicAdvertisingTrackerConfig {
+            sample_rate_hz: args.sample_rate_hz,
+            receiver_clock_accuracy_ppm: args.receiver_clock_accuracy_ppm,
+        },
+    )?;
+    for (index, observed) in args.observations.into_iter().enumerate() {
+        let observation = tracker.synchronize_observation(
+            observed.channel,
+            observed.phy,
+            observed.access_address_sample,
+            args.maximum_event_advance,
+        )?;
+        let window = observation.event.timing_window;
+        println!(
+            "observation={} event={} channel={} phy={} observed_sample={} advanced_events={} missed_events={} timing={} represented_earliest_sample={} represented_latest_sample={} earliest_sample={} latest_sample={} widening_samples={}",
+            index,
+            observation.event.event_counter,
+            observation.event.channel.index(),
+            observation.event.phy,
+            observed.access_address_sample,
+            observation.advanced_events,
+            observation.advanced_events,
+            describe_sample_timing(observation.timing_error),
+            window.represented_earliest_sample,
+            window.represented_latest_sample,
+            window.earliest_sample,
+            window.latest_sample,
+            window.widening_samples,
+        );
+    }
+    for index in 0..args.event_count {
+        let event = if index == 0 {
+            tracker.current_event()?
+        } else {
+            tracker.advance()?
+        };
+        print_periodic_advertising_event(index, event);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("decode") => decode(parse_decode_args(&args[1..])?),
         Some("decode-secondary") => decode_secondary(parse_decode_secondary_args(&args[1..])?),
+        Some("decode-periodic") => decode_periodic(parse_decode_periodic_args(&args[1..])?),
         Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
         Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),
         Some("extended-advertising-plan") => {
             extended_advertising_plan(parse_extended_advertising_plan_args(&args[1..])?)
+        }
+        Some("periodic-advertising-plan") => {
+            periodic_advertising_plan(parse_periodic_advertising_plan_args(&args[1..])?)
         }
         Some("capture") => capture(parse_capture_args(&args[1..], CaptureCommand::Advertising)?),
         Some("capture-data") => capture(parse_capture_args(&args[1..], CaptureCommand::Data)?),
