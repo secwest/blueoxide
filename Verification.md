@@ -1264,6 +1264,76 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Primary extended-advertising verification
+
+The common extended-header layout was reviewed against two pinned independent
+implementations:
+
+- Zephyr controller commit
+  `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`,
+  `subsys/bluetooth/controller/ll_sw/pdu.h`.
+- Wireshark commit `403c9a36ea7fa8f2d69a449be1f4fa97c52817c0`,
+  `epan/dissectors/packet-btle.c`.
+
+Both references independently confirm the six-bit ExtHdrLen, two-bit AdvMode,
+flag and optional-field order, 12-bit DID/four-bit SID, AuxPtr channel/clock/
+unit/offset/PHY masks, 18-octet SyncInfo order, signed TxPower, and residual
+ACAD handling.
+
+The principal exact vector is:
+
+```text
+Header + payload: 47141059010203040506bcdad42321f4020106020105
+CRC:              e36c3b
+Whitened body:    cac647f83ca565b47037ad924254d91744e8add29f56d0b481
+```
+
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+independently generated CRC `e36c3b`. Jiao Xianjun's BTLE whitening table
+independently generated the fixed channel-37 whitened body. The CLI integration
+test embeds those bytes directly, modulates them at 4 Msps, and does not call
+Blueoxide CRC or whitening helpers. It must recover one CRC-valid
+`ADV_EXT_IND` with advertiser `06:05:04:03:02:01`, SID 13, DID 2748, AuxPtr
+channel 20 at 87,300 microseconds on LE 2M, -12 dBm TxPower, three ACAD octets,
+and three advertising-data octets.
+
+A second fixed semantic vector covers SyncInfo:
+
+```text
+Header + payload: 0714132021632000ffffffff7f78563412efcdab6745
+CRC:              f06057
+```
+
+It verifies 300-microsecond offset units, the 2,457,600-microsecond adjustment,
+a 40,000-microsecond interval, all 37 data channels after separating SCA bits,
+SCA value 3, access address `0x12345678`, CRC initializer `0xabcdef`, and event
+counter `0x4567`.
+
+Focused rejection tests cover a declared ExtHdrLen beyond the payload, every
+individually truncated optional field, reserved AdvMode and flag values,
+invalid AuxPtr channels and PHY values, reserved SyncInfo bits, periodic
+intervals below six units, and invalid channel maps. Zero-length extended
+headers and arbitrary bounded PDU inputs are also exercised. The feature is
+semantic primary-PDU decoding only: no AuxPtr following, secondary-channel
+reception, chain reassembly, periodic synchronization state, or LE Coded
+demodulation is claimed.
+
+Final local gate for this increment:
+
+```text
+173 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+2 advertising decode/PCAPNG integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1274,8 +1344,9 @@ git diff --check
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
-- Differential tests for extended advertising, data-channel following,
-  stateful GATT, EATT, pairing and automatic LTK selection, full LL encryption
-  activation/pause state, automatic bidirectional encryption state, automatic
-  capture-driven PHY transition delivery and demodulator switching, LE Coded
-  PHY demodulation, and Bluetooth Classic as those layers are added.
+- Differential tests for secondary/chained extended advertising, periodic
+  advertising synchronization, data-channel following, stateful GATT, EATT,
+  pairing and automatic LTK selection, full LL encryption activation/pause
+  state, automatic bidirectional encryption state, automatic capture-driven
+  PHY transition delivery and demodulator switching, LE Coded PHY
+  demodulation, and Bluetooth Classic as those layers are added.

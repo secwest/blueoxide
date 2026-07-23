@@ -32,6 +32,9 @@
   sample rejection.
 - Typed semantic decoding for legacy advertising, direct advertising, scan
   requests/responses, scannable advertising, and CONNECT_IND.
+- Strict semantic decoding for CRC-valid primary `ADV_EXT_IND`, including
+  bounded common-header flags, typed AdvA/TargetA, CTEInfo, ADI, AuxPtr,
+  SyncInfo, signed TxPower, and lossless residual ACAD and advertising data.
 - Advertising Data structure parsing with known type names and UTF-8 local-name
   access.
 - CONNECT_IND validation for timing, latency, channel map, hop increment,
@@ -190,11 +193,13 @@
   integer multiple of the selected 1 MHz or 2 MHz symbol rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   multi-channel connection following and retuning, automatic direction
-  classification and unasserted routing of live observations, extended
-  advertising, automatic direction/counter inference, LTK selection from
-  pairing state, LL encryption start/pause state, bidirectional encryption
-  tracking, stateful L2CAP channels, GATT/EATT and pairing state,
-  capture-driven PHY transition delivery/demodulator switching, Bluetooth
-  Classic, and LE Coded PHY demodulation remain to be implemented.
+  classification and unasserted routing of live observations, secondary
+  advertising-channel reception, AuxPtr following, extended-advertising chain
+  reassembly, periodic-advertising synchronization state, automatic
+  direction/counter inference, LTK selection from pairing state, LL encryption
+  start/pause state, bidirectional encryption tracking, stateful L2CAP
+  channels, GATT/EATT and pairing state, capture-driven PHY transition
+  delivery/demodulator switching, Bluetooth Classic, and LE Coded PHY
+  demodulation remain to be implemented.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

@@ -2,7 +2,7 @@ use crate::ble::{AdvertisingPdu, BleChannel};
 use crate::demod::Le1mDemodConfig;
 use crate::link_layer::{
     ChannelSelectionAlgorithm, ConnectionChannelSelector, ConnectionParameters, ConnectionTracker,
-    ConnectionTrackerConfig, DataChannelMap, SleepClockAccuracy,
+    ConnectionTrackerConfig, ConstantToneExtensionInfo, DataChannelMap, LePhy, SleepClockAccuracy,
 };
 use crate::{Error, Result};
 use std::fmt::{Display, Formatter};
@@ -44,6 +44,116 @@ impl Display for DeviceAddress {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtendedAdvertisingMode {
+    NonConnectableNonScannable,
+    ConnectableNonScannable,
+    NonConnectableScannable,
+}
+
+impl ExtendedAdvertisingMode {
+    fn parse(raw: u8) -> Result<Self> {
+        match raw {
+            0 => Ok(Self::NonConnectableNonScannable),
+            1 => Ok(Self::ConnectableNonScannable),
+            2 => Ok(Self::NonConnectableScannable),
+            _ => Err(Error::InvalidInput(
+                "extended advertising mode 3 is reserved".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Display for ExtendedAdvertisingMode {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonConnectableNonScannable => {
+                formatter.write_str("non-connectable-non-scannable")
+            }
+            Self::ConnectableNonScannable => formatter.write_str("connectable-non-scannable"),
+            Self::NonConnectableScannable => formatter.write_str("non-connectable-scannable"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdvertisingDataInfo {
+    pub data_id: u16,
+    pub advertising_set_id: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuxiliaryClockAccuracy {
+    Ppm500,
+    Ppm50,
+}
+
+impl AuxiliaryClockAccuracy {
+    pub const fn maximum_ppm(self) -> u16 {
+        match self {
+            Self::Ppm500 => 500,
+            Self::Ppm50 => 50,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuxiliaryPointer {
+    pub channel: BleChannel,
+    pub clock_accuracy: AuxiliaryClockAccuracy,
+    pub offset_units_us: u16,
+    pub offset: u16,
+    pub phy: LePhy,
+}
+
+impl AuxiliaryPointer {
+    pub const fn offset_us(self) -> u32 {
+        self.offset as u32 * self.offset_units_us as u32
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeriodicAdvertisingSyncInfo {
+    pub packet_offset: u16,
+    pub offset_units_us: u16,
+    pub offset_adjust: bool,
+    pub interval: u16,
+    pub channel_map: DataChannelMap,
+    pub sleep_clock_accuracy: SleepClockAccuracy,
+    pub access_address: u32,
+    pub crc_init: u32,
+    pub event_counter: u16,
+}
+
+impl PeriodicAdvertisingSyncInfo {
+    pub const fn packet_offset_us(&self) -> u32 {
+        self.packet_offset as u32 * self.offset_units_us as u32
+            + if self.offset_adjust { 2_457_600 } else { 0 }
+    }
+
+    pub const fn interval_us(&self) -> u32 {
+        self.interval as u32 * 1_250
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendedAdvertisingHeader {
+    pub extended_header_length: u8,
+    pub mode: ExtendedAdvertisingMode,
+    pub flags: u8,
+    pub advertiser_address: Option<DeviceAddress>,
+    pub advertiser_address_kind: Option<AddressKind>,
+    pub target_address: Option<DeviceAddress>,
+    pub target_address_kind: Option<AddressKind>,
+    pub constant_tone_extension_info: Option<ConstantToneExtensionInfo>,
+    pub advertising_data_info: Option<AdvertisingDataInfo>,
+    pub auxiliary_pointer: Option<AuxiliaryPointer>,
+    pub sync_info: Option<PeriodicAdvertisingSyncInfo>,
+    pub tx_power_dbm: Option<i8>,
+    pub additional_controller_advertising_data: Vec<u8>,
+    pub advertising_data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -405,6 +515,9 @@ pub enum DecodedAdvertisingPdu {
         advertiser_kind: AddressKind,
         data: Vec<AdStructure>,
     },
+    AdvExtInd {
+        header: ExtendedAdvertisingHeader,
+    },
     ExtendedOrReserved {
         pdu_type: u8,
         payload: Vec<u8>,
@@ -485,6 +598,57 @@ impl Display for DecodedAdvertisingPdu {
                 "ADV_SCAN_IND advertiser={advertiser} address_type={advertiser_kind} ad_structures={}",
                 data.len()
             ),
+            Self::AdvExtInd { header } => {
+                write!(
+                    formatter,
+                    "ADV_EXT_IND mode={} ext_header_octets={} flags=0x{:02x}",
+                    header.mode, header.extended_header_length, header.flags
+                )?;
+                if let (Some(address), Some(kind)) =
+                    (header.advertiser_address, header.advertiser_address_kind)
+                {
+                    write!(formatter, " advertiser={address} advertiser_type={kind}")?;
+                }
+                if let (Some(address), Some(kind)) =
+                    (header.target_address, header.target_address_kind)
+                {
+                    write!(formatter, " target={address} target_type={kind}")?;
+                }
+                if let Some(info) = header.advertising_data_info {
+                    write!(
+                        formatter,
+                        " sid={} did={}",
+                        info.advertising_set_id, info.data_id
+                    )?;
+                }
+                if let Some(pointer) = header.auxiliary_pointer {
+                    write!(
+                        formatter,
+                        " aux_channel={} aux_offset_us={} aux_phy={}",
+                        pointer.channel.index(),
+                        pointer.offset_us(),
+                        pointer.phy
+                    )?;
+                }
+                if let Some(sync) = &header.sync_info {
+                    write!(
+                        formatter,
+                        " sync_offset_us={} sync_interval_us={} sync_event={}",
+                        sync.packet_offset_us(),
+                        sync.interval_us(),
+                        sync.event_counter
+                    )?;
+                }
+                if let Some(tx_power_dbm) = header.tx_power_dbm {
+                    write!(formatter, " tx_power_dbm={tx_power_dbm}")?;
+                }
+                write!(
+                    formatter,
+                    " acad_octets={} advertising_data_octets={}",
+                    header.additional_controller_advertising_data.len(),
+                    header.advertising_data.len()
+                )
+            }
             Self::ExtendedOrReserved { pdu_type, payload } => write!(
                 formatter,
                 "PDU_TYPE_{pdu_type} undecoded_payload_octets={}",
@@ -527,6 +691,198 @@ fn decode_advertiser_and_data(
         address_kind(pdu.tx_add_random()),
         parse_ad_structures(&pdu.payload[6..])?,
     ))
+}
+
+fn take_extended_field<'a>(
+    remaining: &mut &'a [u8],
+    length: usize,
+    name: &str,
+) -> Result<&'a [u8]> {
+    if remaining.len() < length {
+        return Err(Error::InvalidInput(format!(
+            "ADV_EXT_IND {name} requires {length} octets with only {} remaining in the extended header",
+            remaining.len()
+        )));
+    }
+    let (field, rest) = remaining.split_at(length);
+    *remaining = rest;
+    Ok(field)
+}
+
+fn decode_extended_advertising_header(pdu: &AdvertisingPdu) -> Result<ExtendedAdvertisingHeader> {
+    if pdu.header[0] & 0x30 != 0 {
+        return Err(Error::InvalidInput(format!(
+            "ADV_EXT_IND sets reserved first-header bits 0x{:02x}",
+            pdu.header[0] & 0x30
+        )));
+    }
+    if pdu.header[1] & 0xc0 != 0 {
+        return Err(Error::InvalidInput(format!(
+            "ADV_EXT_IND sets reserved length-header bits 0x{:02x}",
+            pdu.header[1] & 0xc0
+        )));
+    }
+    let Some(&common_header) = pdu.payload.first() else {
+        return Err(Error::InvalidInput(
+            "ADV_EXT_IND requires the common extended advertising header octet".to_owned(),
+        ));
+    };
+    let extended_header_length = common_header & 0x3f;
+    let mode = ExtendedAdvertisingMode::parse(common_header >> 6)?;
+    let header_end = 1usize
+        .checked_add(extended_header_length as usize)
+        .ok_or_else(|| Error::InvalidInput("ADV_EXT_IND header length overflow".to_owned()))?;
+    if header_end > pdu.payload.len() {
+        return Err(Error::InvalidInput(format!(
+            "ADV_EXT_IND declares {extended_header_length} extended-header octets with only {} available",
+            pdu.payload.len().saturating_sub(1)
+        )));
+    }
+
+    let mut extended_header = &pdu.payload[1..header_end];
+    let flags = if extended_header_length == 0 {
+        0
+    } else {
+        take_extended_field(&mut extended_header, 1, "flags")?[0]
+    };
+    if flags & 0x80 != 0 {
+        return Err(Error::InvalidInput(
+            "ADV_EXT_IND extended-header reserved flag is set".to_owned(),
+        ));
+    }
+
+    let (advertiser_address, advertiser_address_kind) = if flags & 0x01 != 0 {
+        (
+            Some(DeviceAddress::from_air_bytes(take_extended_field(
+                &mut extended_header,
+                6,
+                "advertiser address",
+            )?)?),
+            Some(address_kind(pdu.tx_add_random())),
+        )
+    } else {
+        (None, None)
+    };
+    let (target_address, target_address_kind) = if flags & 0x02 != 0 {
+        (
+            Some(DeviceAddress::from_air_bytes(take_extended_field(
+                &mut extended_header,
+                6,
+                "target address",
+            )?)?),
+            Some(address_kind(pdu.rx_add_random())),
+        )
+    } else {
+        (None, None)
+    };
+    let constant_tone_extension_info = if flags & 0x04 != 0 {
+        Some(ConstantToneExtensionInfo::from_raw(
+            take_extended_field(&mut extended_header, 1, "CTEInfo")?[0],
+        ))
+    } else {
+        None
+    };
+    let advertising_data_info = if flags & 0x08 != 0 {
+        let bytes = take_extended_field(&mut extended_header, 2, "ADI")?;
+        let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
+        Some(AdvertisingDataInfo {
+            data_id: raw & 0x0fff,
+            advertising_set_id: (raw >> 12) as u8,
+        })
+    } else {
+        None
+    };
+    let auxiliary_pointer = if flags & 0x10 != 0 {
+        let bytes = take_extended_field(&mut extended_header, 3, "AuxPtr")?;
+        let channel_index = bytes[0] & 0x3f;
+        if channel_index > 36 {
+            return Err(Error::InvalidInput(format!(
+                "ADV_EXT_IND AuxPtr channel {channel_index} is outside 0..=36"
+            )));
+        }
+        let offset_and_phy = u16::from_le_bytes([bytes[1], bytes[2]]);
+        let phy = match offset_and_phy >> 13 {
+            0 => LePhy::Le1M,
+            1 => LePhy::Le2M,
+            2 => LePhy::LeCoded,
+            raw => {
+                return Err(Error::InvalidInput(format!(
+                    "ADV_EXT_IND AuxPtr PHY value {raw} is reserved"
+                )));
+            }
+        };
+        Some(AuxiliaryPointer {
+            channel: BleChannel::new(channel_index)?,
+            clock_accuracy: if bytes[0] & 0x40 != 0 {
+                AuxiliaryClockAccuracy::Ppm50
+            } else {
+                AuxiliaryClockAccuracy::Ppm500
+            },
+            offset_units_us: if bytes[0] & 0x80 != 0 { 300 } else { 30 },
+            offset: offset_and_phy & 0x1fff,
+            phy,
+        })
+    } else {
+        None
+    };
+    let sync_info = if flags & 0x20 != 0 {
+        let bytes = take_extended_field(&mut extended_header, 18, "SyncInfo")?;
+        let offset_fields = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if offset_fields & 0x8000 != 0 {
+            return Err(Error::InvalidInput(
+                "ADV_EXT_IND SyncInfo reserved offset bit is set".to_owned(),
+            ));
+        }
+        let interval = u16::from_le_bytes([bytes[2], bytes[3]]);
+        if interval < 6 {
+            return Err(Error::InvalidInput(format!(
+                "ADV_EXT_IND SyncInfo interval {interval} is outside 6..=65535"
+            )));
+        }
+        let sleep_clock_accuracy = SleepClockAccuracy::new(bytes[8] >> 5)?;
+        let mut channel_map = [0u8; 5];
+        channel_map.copy_from_slice(&bytes[4..9]);
+        channel_map[4] &= 0x1f;
+        Some(PeriodicAdvertisingSyncInfo {
+            packet_offset: offset_fields & 0x1fff,
+            offset_units_us: if offset_fields & 0x2000 != 0 { 300 } else { 30 },
+            offset_adjust: offset_fields & 0x4000 != 0,
+            interval,
+            channel_map: DataChannelMap::new(channel_map).map_err(|error| {
+                Error::InvalidInput(format!(
+                    "ADV_EXT_IND SyncInfo channel map is invalid: {error}"
+                ))
+            })?,
+            sleep_clock_accuracy,
+            access_address: u32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]),
+            crc_init: bytes[13] as u32 | (bytes[14] as u32) << 8 | (bytes[15] as u32) << 16,
+            event_counter: u16::from_le_bytes([bytes[16], bytes[17]]),
+        })
+    } else {
+        None
+    };
+    let tx_power_dbm = if flags & 0x40 != 0 {
+        Some(take_extended_field(&mut extended_header, 1, "TxPower")?[0] as i8)
+    } else {
+        None
+    };
+
+    Ok(ExtendedAdvertisingHeader {
+        extended_header_length,
+        mode,
+        flags,
+        advertiser_address,
+        advertiser_address_kind,
+        target_address,
+        target_address_kind,
+        constant_tone_extension_info,
+        advertising_data_info,
+        auxiliary_pointer,
+        sync_info,
+        tx_power_dbm,
+        additional_controller_advertising_data: extended_header.to_vec(),
+        advertising_data: pdu.payload[header_end..].to_vec(),
+    })
 }
 
 pub fn decode_advertising_pdu(pdu: &AdvertisingPdu) -> Result<DecodedAdvertisingPdu> {
@@ -667,6 +1023,9 @@ pub fn decode_advertising_pdu(pdu: &AdvertisingPdu) -> Result<DecodedAdvertising
                 data,
             })
         }
+        7 => Ok(DecodedAdvertisingPdu::AdvExtInd {
+            header: decode_extended_advertising_header(pdu)?,
+        }),
         pdu_type => Ok(DecodedAdvertisingPdu::ExtendedOrReserved {
             pdu_type,
             payload: pdu.payload.clone(),
@@ -882,6 +1241,171 @@ mod tests {
         payload[33] = 5;
         let error = decode_advertising_pdu(&pdu(5, 0, payload)).unwrap_err();
         assert!(error.to_string().contains("must exceed"));
+    }
+
+    #[test]
+    fn decodes_extended_advertising_header_losslessly() {
+        let decoded = decode_advertising_pdu(&pdu(
+            7,
+            0x40,
+            vec![
+                0x10, 0x59, 1, 2, 3, 4, 5, 6, 0xbc, 0xda, 0xd4, 0x23, 0x21, 0xf4, 2, 1, 6, 2, 1, 5,
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            decoded.to_string(),
+            "ADV_EXT_IND mode=non-connectable-non-scannable ext_header_octets=16 flags=0x59 advertiser=06:05:04:03:02:01 advertiser_type=random sid=13 did=2748 aux_channel=20 aux_offset_us=87300 aux_phy=LE-2M tx_power_dbm=-12 acad_octets=3 advertising_data_octets=3"
+        );
+        let DecodedAdvertisingPdu::AdvExtInd { header } = decoded else {
+            panic!("expected ADV_EXT_IND");
+        };
+        assert_eq!(header.extended_header_length, 16);
+        assert_eq!(
+            header.mode,
+            ExtendedAdvertisingMode::NonConnectableNonScannable
+        );
+        assert_eq!(header.flags, 0x59);
+        assert_eq!(
+            header.advertiser_address.unwrap().to_string(),
+            "06:05:04:03:02:01"
+        );
+        assert_eq!(header.advertiser_address_kind, Some(AddressKind::Random));
+        assert_eq!(
+            header.advertising_data_info,
+            Some(AdvertisingDataInfo {
+                data_id: 0x0abc,
+                advertising_set_id: 0x0d,
+            })
+        );
+        let auxiliary_pointer = header.auxiliary_pointer.unwrap();
+        assert_eq!(auxiliary_pointer.channel.index(), 20);
+        assert_eq!(
+            auxiliary_pointer.clock_accuracy,
+            AuxiliaryClockAccuracy::Ppm50
+        );
+        assert_eq!(auxiliary_pointer.clock_accuracy.maximum_ppm(), 50);
+        assert_eq!(auxiliary_pointer.offset_units_us, 300);
+        assert_eq!(auxiliary_pointer.offset, 0x0123);
+        assert_eq!(auxiliary_pointer.offset_us(), 87_300);
+        assert_eq!(auxiliary_pointer.phy, LePhy::Le2M);
+        assert_eq!(header.tx_power_dbm, Some(-12));
+        assert_eq!(header.additional_controller_advertising_data, [2, 1, 6]);
+        assert_eq!(header.advertising_data, [2, 1, 5]);
+    }
+
+    #[test]
+    fn decodes_periodic_advertising_sync_info() {
+        let decoded = decode_advertising_pdu(&pdu(
+            7,
+            0,
+            vec![
+                0x13, 0x20, 0x21, 0x63, 0x20, 0x00, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x78, 0x56, 0x34,
+                0x12, 0xef, 0xcd, 0xab, 0x67, 0x45,
+            ],
+        ))
+        .unwrap();
+        let DecodedAdvertisingPdu::AdvExtInd { header } = decoded else {
+            panic!("expected ADV_EXT_IND");
+        };
+        let sync_info = header.sync_info.unwrap();
+        assert_eq!(sync_info.packet_offset, 0x0321);
+        assert_eq!(sync_info.offset_units_us, 300);
+        assert!(sync_info.offset_adjust);
+        assert_eq!(sync_info.packet_offset_us(), 2_697_900);
+        assert_eq!(sync_info.interval, 0x0020);
+        assert_eq!(sync_info.interval_us(), 40_000);
+        assert_eq!(
+            sync_info.channel_map.bytes(),
+            [0xff, 0xff, 0xff, 0xff, 0x1f]
+        );
+        assert_eq!(sync_info.channel_map.used_count(), 37);
+        assert_eq!(sync_info.sleep_clock_accuracy.raw(), 3);
+        assert_eq!(sync_info.sleep_clock_accuracy.maximum_ppm(), 100);
+        assert_eq!(sync_info.access_address, 0x1234_5678);
+        assert_eq!(sync_info.crc_init, 0x00ab_cdef);
+        assert_eq!(sync_info.event_counter, 0x4567);
+        assert!(header.additional_controller_advertising_data.is_empty());
+        assert!(header.advertising_data.is_empty());
+    }
+
+    #[test]
+    fn accepts_zero_length_extended_header() {
+        let decoded = decode_advertising_pdu(&pdu(7, 0, vec![0, 2, 1, 6])).unwrap();
+        let DecodedAdvertisingPdu::AdvExtInd { header } = decoded else {
+            panic!("expected ADV_EXT_IND");
+        };
+        assert_eq!(header.extended_header_length, 0);
+        assert_eq!(header.flags, 0);
+        assert!(header.additional_controller_advertising_data.is_empty());
+        assert_eq!(header.advertising_data, [2, 1, 6]);
+    }
+
+    #[test]
+    fn rejects_truncated_extended_advertising_header() {
+        let error = decode_advertising_pdu(&pdu(7, 0, vec![3, 0])).unwrap_err();
+        assert!(error.to_string().contains("declares 3"));
+    }
+
+    #[test]
+    fn rejects_truncated_extended_advertising_fields() {
+        let fields = [
+            (0x01, 6, "advertiser address"),
+            (0x02, 6, "target address"),
+            (0x04, 1, "CTEInfo"),
+            (0x08, 2, "ADI"),
+            (0x10, 3, "AuxPtr"),
+            (0x20, 18, "SyncInfo"),
+            (0x40, 1, "TxPower"),
+        ];
+        for (flag, field_length, name) in fields {
+            let mut payload = vec![field_length as u8, flag];
+            payload.resize(field_length + 1, 0);
+            let error = decode_advertising_pdu(&pdu(7, 0, payload)).unwrap_err();
+            assert!(
+                error.to_string().contains(name),
+                "{name}: unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_extended_advertising_values() {
+        let reserved_mode = decode_advertising_pdu(&pdu(7, 0, vec![0xc0])).unwrap_err();
+        assert!(reserved_mode.to_string().contains("mode 3 is reserved"));
+
+        let reserved_flag = decode_advertising_pdu(&pdu(7, 0, vec![1, 0x80])).unwrap_err();
+        assert!(reserved_flag.to_string().contains("reserved flag"));
+
+        let invalid_channel =
+            decode_advertising_pdu(&pdu(7, 0, vec![4, 0x10, 37, 1, 0])).unwrap_err();
+        assert!(invalid_channel.to_string().contains("channel 37"));
+
+        let reserved_phy =
+            decode_advertising_pdu(&pdu(7, 0, vec![4, 0x10, 0, 1, 0x60])).unwrap_err();
+        assert!(reserved_phy.to_string().contains("PHY value 3"));
+    }
+
+    #[test]
+    fn rejects_invalid_periodic_advertising_sync_info() {
+        let mut sync_info = vec![
+            0x13, 0x20, 0x21, 0x63, 0x20, 0x00, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x78, 0x56, 0x34,
+            0x12, 0xef, 0xcd, 0xab, 0x67, 0x45,
+        ];
+
+        sync_info[3] |= 0x80;
+        let reserved_bit = decode_advertising_pdu(&pdu(7, 0, sync_info.clone())).unwrap_err();
+        assert!(reserved_bit.to_string().contains("reserved offset bit"));
+
+        sync_info[3] &= 0x7f;
+        sync_info[4..6].copy_from_slice(&5u16.to_le_bytes());
+        let short_interval = decode_advertising_pdu(&pdu(7, 0, sync_info.clone())).unwrap_err();
+        assert!(short_interval.to_string().contains("interval 5"));
+
+        sync_info[4..6].copy_from_slice(&6u16.to_le_bytes());
+        sync_info[6..11].copy_from_slice(&[1, 0, 0, 0, 0]);
+        let invalid_map = decode_advertising_pdu(&pdu(7, 0, sync_info)).unwrap_err();
+        assert!(invalid_map.to_string().contains("fewer than two channels"));
     }
 
     #[test]

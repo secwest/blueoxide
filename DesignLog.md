@@ -1196,3 +1196,42 @@ This bridge does not infer direction, retune among hop channels, switch the
 demodulator PHY, or automatically schedule decoded channel-map, connection-
 parameter, or PHY control procedures. Those require direction-aware packet
 routing and timed radio control beyond a fixed-channel receive stream.
+
+## 2026-07-22: Decode primary extended advertising without implying following
+
+### Semantic boundary
+
+CRC-valid primary-channel PDU type 7 packets are decoded as `ADV_EXT_IND`.
+The parser bounds ExtHdrLen against the received payload, rejects reserved
+common-header and flag values, and consumes the optional fields in their
+specified order. Advertising mode, AdvA, TargetA, CTEInfo, ADI, AuxPtr,
+SyncInfo, and signed TxPower have typed representations. Any bytes left inside
+ExtHdrLen are retained as ACAD, and all bytes after the extended header remain
+lossless advertising data.
+
+ADI retains its 12-bit DID and four-bit SID. AuxPtr retains its data-channel
+index, 50/500 ppm clock-accuracy class, 30/300 microsecond offset units,
+13-bit offset, and LE 1M/2M/Coded PHY. SyncInfo retains its packet offset,
+offset adjustment, periodic interval, validated channel map and sleep-clock
+accuracy, access address, CRC initializer, and event counter. Invalid AuxPtr
+channels/PHY values, reserved SyncInfo bits, undersized periodic intervals,
+invalid channel maps, and every truncated optional field are rejected without
+discarding the original CRC-valid packet bytes.
+
+### Receive boundary
+
+An AuxPtr is decoded metadata, not a receive schedule. Blueoxide still receives
+only the primary advertising channels in this path and does not retune to a
+secondary channel, reassemble AUX_CHAIN_IND data, maintain periodic
+advertising synchronization state, or demodulate LE Coded. These require
+timestamp-preserving multi-channel delivery and PHY-specific demodulation
+beyond semantic parsing of one primary PDU.
+
+### Verification boundary
+
+The wire layouts were checked independently against Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4` and Wireshark commit
+`403c9a36ea7fa8f2d69a449be1f4fa97c52817c0`. Fixed CRCs come from Scapy commit
+`de3399269bad8c9a6bfb1dc181c3876340c198b8`; the CLI fixture's channel-37
+whitening comes from Jiao Xianjun's BTLE implementation rather than
+Blueoxide's own helper.

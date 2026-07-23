@@ -27,6 +27,9 @@ The repository now contains a dependency-free, buildable receive core with:
   deviation estimates, and discontinuity reset/reporting.
 - Typed decoding for legacy advertising, scan, direct, and connection-request
   PDUs, including AD structures and validated CONNECT_IND timing/channel data.
+- Strict primary-channel `ADV_EXT_IND` decoding with typed advertising mode,
+  AdvA, TargetA, CTEInfo, ADI, AuxPtr, SyncInfo, and TxPower fields; residual
+  ACAD and advertising data remain lossless raw bytes.
 - Data-channel header, CTEInfo, and L2CAP-start decoding plus strict, lossless
   LL control-PDU syntax through Core 6.1 Channel Sounding and Frame Space
   Update, with future opcode payloads retained raw.
@@ -113,6 +116,15 @@ Only packets with a valid BLE CRC are emitted. Primary advertising decode is
 LE 1M and requires an integer oversampling ratio from 2 through 64 samples per
 symbol. `--capture-start-ns` can supply the Unix timestamp of sample zero for
 PCAPNG; without it, timestamps are relative to the Unix epoch.
+
+CRC-valid primary `ADV_EXT_IND` packets receive strict bounded decoding of the
+common extended header. The decoder reports typed advertiser and target
+addresses, CTEInfo, ADI set/data identifiers, AuxPtr channel/timing/PHY,
+periodic SyncInfo, signed transmit power, and exact residual ACAD and
+advertising-data lengths. An AuxPtr is descriptive only: `decode` does not
+retune to or receive the secondary advertising channel, reassemble chained
+advertising data, or establish periodic synchronization state. LE Coded may be
+represented by an AuxPtr but is not demodulated.
 
 The decoder processes the file in bounded blocks and retains enough overlap to
 recover maximum-length primary advertisements split between reads. Repeated
@@ -569,12 +581,12 @@ PDU reassembly are now present. Fixed-channel live data observations are also
 available; the next receive stages are wideband channelization or timed
 retuning, routing those observations into connection-event state, applying
 tracked PHY transitions to demodulator selection, and full live BLE connection
-following. Full packet decode is a project requirement:
-extended advertising, complete LL procedure state, automatic pairing and LTK
-selection, bidirectional encryption-state tracking, L2CAP channel state,
-stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth Classic
-BR/EDR layers will be added incrementally while retaining undecoded packet
-bytes losslessly.
+following. Full packet decode is a project requirement: secondary and chained
+extended advertising, periodic advertising synchronization, complete LL
+procedure state, automatic pairing and LTK selection, bidirectional
+encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
+LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers will be added
+incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;
