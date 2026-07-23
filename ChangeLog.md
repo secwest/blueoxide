@@ -38,6 +38,19 @@
 - `decode-secondary` fixed-channel LE 1M/2M secondary advertising reception,
   with full eight-bit Length framing through 255 octets, streaming decode,
   extended-header semantics, exact sample positions, and PHY-correct PCAPNG.
+- Checked AuxPtr reception windows from exact parent access-address samples,
+  including 30/300 microsecond quantization, parent airtime plus 300
+  microsecond MAFS validation, 50/500 ppm advertiser accuracy combined with a
+  caller receiver bound, LE 1M/2M parent timing, and LE Coded child-preamble
+  adjustment.
+- Stateful contextual extended-advertising tracking from primary ADV_EXT_IND
+  through AUX_ADV_IND and AUX_CHAIN_IND, with channel/PHY/window matching,
+  ADI and advertiser consistency, chain-field restrictions, non-mutating
+  rejection, explicit reset, caller-bounded lossless data accumulation, and
+  completion on the first valid fragment without AuxPtr.
+- `extended-advertising-plan` for offline scheduling and chain reassembly from
+  CRC-valid packet header/payload bytes sharing one exact sample coordinate
+  system.
 - Advertising Data structure parsing with known type names and UTF-8 local-name
   access.
 - CONNECT_IND validation for timing, latency, channel map, hop increment,
@@ -197,13 +210,13 @@
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
   multi-channel connection following and retuning, automatic direction
   classification and unasserted routing of live observations, live or
-  AuxPtr-driven secondary advertising reception, contextual AUX subtype
-  classification, extended-advertising chain reassembly,
-  periodic-advertising synchronization state, automatic direction/counter
-  inference, LTK selection from pairing state, LL encryption start/pause
-  state, bidirectional encryption tracking, stateful L2CAP channels, GATT/EATT
-  and pairing state, capture-driven PHY transition delivery/demodulator
-  switching, Bluetooth Classic, and LE Coded PHY demodulation remain to be
-  implemented.
+  AuxPtr-driven secondary advertising reception, periodic-advertising
+  synchronization state, automatic direction/counter inference, LTK selection
+  from pairing state, LL encryption start/pause state, bidirectional
+  encryption tracking, stateful L2CAP channels, GATT/EATT and pairing state,
+  capture-driven PHY transition delivery/demodulator switching, Bluetooth
+  Classic, and LE Coded PHY demodulation remain to be implemented. Contextual
+  AUX_ADV_IND/AUX_CHAIN_IND classification and chain reassembly are available
+  offline when packets share exact sample coordinates.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

@@ -112,6 +112,468 @@ impl AuxiliaryPointer {
     pub const fn offset_us(self) -> u32 {
         self.offset as u32 * self.offset_units_us as u32
     }
+
+    pub fn reception_window(
+        self,
+        parent: &AdvertisingPdu,
+        parent_phy: LePhy,
+        parent_access_address_sample: u64,
+        sample_rate_hz: u32,
+        receiver_clock_accuracy_ppm: u32,
+        expected_kind: ExtendedAdvertisingPduKind,
+    ) -> Result<AuxiliaryReceptionWindow> {
+        if expected_kind == ExtendedAdvertisingPduKind::AdvExtInd {
+            return Err(Error::InvalidConfiguration(
+                "an AuxPtr cannot schedule a primary ADV_EXT_IND".to_owned(),
+            ));
+        }
+        if parent.pdu_type() != 7 {
+            return Err(Error::InvalidInput(format!(
+                "AuxPtr scheduling requires advertising PDU type 0x07; got 0x{:02x}",
+                parent.pdu_type()
+            )));
+        }
+        if sample_rate_hz == 0 {
+            return Err(Error::InvalidConfiguration(
+                "AuxPtr scheduling sample rate must be greater than zero".to_owned(),
+            ));
+        }
+        if receiver_clock_accuracy_ppm > 1_000_000 {
+            return Err(Error::InvalidConfiguration(format!(
+                "receiver clock accuracy {receiver_clock_accuracy_ppm} ppm exceeds 1000000"
+            )));
+        }
+        if self.offset == 0 {
+            return Err(Error::InvalidInput(
+                "AuxPtr offset zero does not identify a schedulable auxiliary packet".to_owned(),
+            ));
+        }
+
+        let parent_preamble_us = match parent_phy {
+            LePhy::Le1M | LePhy::Le2M => 8u128,
+            LePhy::LeCoded => {
+                return Err(Error::InvalidConfiguration(
+                    "AuxPtr scheduling from an LE Coded parent is not implemented".to_owned(),
+                ));
+            }
+        };
+        let parent_airtime_us = advertising_packet_airtime_us(parent, parent_phy)?;
+        let offset_us = u128::from(self.offset_us());
+        let quantization_width_us = u128::from(self.offset_units_us);
+        let represented_packet_end_us = offset_us
+            .checked_add(quantization_width_us)
+            .ok_or_else(|| Error::InvalidState("AuxPtr represented offset overflow".to_owned()))?;
+        let minimum_child_start_us = parent_airtime_us
+            .checked_add(300)
+            .ok_or_else(|| Error::InvalidState("AuxPtr minimum spacing overflow".to_owned()))?;
+        if represented_packet_end_us < minimum_child_start_us {
+            return Err(Error::InvalidInput(format!(
+                "AuxPtr represented interval ends at {represented_packet_end_us} us, before parent airtime {parent_airtime_us} us plus 300 us MAFS"
+            )));
+        }
+
+        let child_preamble_us = match self.phy {
+            LePhy::Le1M | LePhy::Le2M => 8u128,
+            LePhy::LeCoded => 80u128,
+        };
+        let preamble_adjustment_us = child_preamble_us
+            .checked_sub(parent_preamble_us)
+            .ok_or_else(|| {
+                Error::InvalidState("AuxPtr child preamble precedes the parent preamble".to_owned())
+            })?;
+        let represented_earliest_us = offset_us
+            .checked_add(preamble_adjustment_us)
+            .ok_or_else(|| Error::InvalidState("AuxPtr earliest-time overflow".to_owned()))?;
+        let represented_latest_us = represented_packet_end_us
+            .checked_add(preamble_adjustment_us)
+            .ok_or_else(|| Error::InvalidState("AuxPtr latest-time overflow".to_owned()))?;
+
+        let represented_earliest_sample = parent_access_address_sample
+            .checked_add(microseconds_to_samples_floor(
+                represented_earliest_us,
+                sample_rate_hz,
+            )?)
+            .ok_or_else(|| Error::InvalidState("AuxPtr earliest sample exceeds u64".to_owned()))?;
+        let represented_latest_sample = parent_access_address_sample
+            .checked_add(microseconds_to_samples_ceil(
+                represented_latest_us,
+                sample_rate_hz,
+            )?)
+            .ok_or_else(|| Error::InvalidState("AuxPtr latest sample exceeds u64".to_owned()))?;
+        let combined_ppm = u128::from(receiver_clock_accuracy_ppm)
+            .checked_add(u128::from(self.clock_accuracy.maximum_ppm()))
+            .ok_or_else(|| Error::InvalidState("AuxPtr clock-accuracy overflow".to_owned()))?;
+        let widening_numerator = offset_us
+            .checked_mul(combined_ppm)
+            .and_then(|value| value.checked_mul(u128::from(sample_rate_hz)))
+            .ok_or_else(|| {
+                Error::InvalidState("AuxPtr timing-window arithmetic overflow".to_owned())
+            })?;
+        let widening_samples = divide_round_up(widening_numerator, 1_000_000_000_000)?;
+        let quantization_width_samples =
+            microseconds_to_samples_ceil(quantization_width_us, sample_rate_hz)?;
+
+        Ok(AuxiliaryReceptionWindow {
+            expected_kind,
+            channel: self.channel,
+            phy: self.phy,
+            represented_earliest_sample,
+            represented_latest_sample,
+            earliest_sample: represented_earliest_sample.saturating_sub(widening_samples),
+            latest_sample: represented_latest_sample
+                .checked_add(widening_samples)
+                .ok_or_else(|| {
+                    Error::InvalidState("AuxPtr widened latest sample exceeds u64".to_owned())
+                })?,
+            quantization_width_us: self.offset_units_us,
+            quantization_width_samples,
+            widening_samples,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExtendedAdvertisingPduKind {
+    AdvExtInd,
+    AuxAdvInd,
+    AuxChainInd,
+}
+
+impl Display for ExtendedAdvertisingPduKind {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AdvExtInd => formatter.write_str("ADV_EXT_IND"),
+            Self::AuxAdvInd => formatter.write_str("AUX_ADV_IND"),
+            Self::AuxChainInd => formatter.write_str("AUX_CHAIN_IND"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuxiliaryReceptionWindow {
+    pub expected_kind: ExtendedAdvertisingPduKind,
+    pub channel: BleChannel,
+    pub phy: LePhy,
+    pub represented_earliest_sample: u64,
+    pub represented_latest_sample: u64,
+    pub earliest_sample: u64,
+    pub latest_sample: u64,
+    pub quantization_width_us: u16,
+    pub quantization_width_samples: u64,
+    pub widening_samples: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtendedAdvertisingChainConfig {
+    pub sample_rate_hz: u32,
+    pub receiver_clock_accuracy_ppm: u32,
+    pub maximum_advertising_data_length: usize,
+}
+
+impl ExtendedAdvertisingChainConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.sample_rate_hz == 0 {
+            return Err(Error::InvalidConfiguration(
+                "extended advertising tracker sample rate must be greater than zero".to_owned(),
+            ));
+        }
+        if self.receiver_clock_accuracy_ppm > 1_000_000 {
+            return Err(Error::InvalidConfiguration(format!(
+                "receiver clock accuracy {} ppm exceeds 1000000",
+                self.receiver_clock_accuracy_ppm
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReassembledExtendedAdvertising {
+    pub advertiser_address: Option<DeviceAddress>,
+    pub advertiser_address_kind: Option<AddressKind>,
+    pub advertising_data_info: Option<AdvertisingDataInfo>,
+    pub mode: ExtendedAdvertisingMode,
+    pub advertising_data: Vec<u8>,
+    pub fragment_count: usize,
+    pub first_auxiliary_sample: u64,
+    pub last_auxiliary_sample: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtendedAdvertisingChainProgress {
+    Awaiting {
+        window: AuxiliaryReceptionWindow,
+        fragment_count: usize,
+        advertising_data_octets: usize,
+    },
+    Complete(ReassembledExtendedAdvertising),
+}
+
+#[derive(Clone, Debug)]
+struct ActiveExtendedAdvertisingChain {
+    pending: AuxiliaryReceptionWindow,
+    advertiser_address: Option<DeviceAddress>,
+    advertiser_address_kind: Option<AddressKind>,
+    advertising_data_info: Option<AdvertisingDataInfo>,
+    mode: Option<ExtendedAdvertisingMode>,
+    advertising_data: Vec<u8>,
+    fragment_count: usize,
+    first_auxiliary_sample: Option<u64>,
+    last_auxiliary_sample: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum ExtendedAdvertisingChainState {
+    Idle,
+    Active(ActiveExtendedAdvertisingChain),
+    Complete(ReassembledExtendedAdvertising),
+}
+
+#[derive(Clone, Debug)]
+pub struct ExtendedAdvertisingChainTracker {
+    config: ExtendedAdvertisingChainConfig,
+    state: ExtendedAdvertisingChainState,
+}
+
+impl ExtendedAdvertisingChainTracker {
+    pub fn new(config: ExtendedAdvertisingChainConfig) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config,
+            state: ExtendedAdvertisingChainState::Idle,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.state = ExtendedAdvertisingChainState::Idle;
+    }
+
+    pub fn progress(&self) -> Option<ExtendedAdvertisingChainProgress> {
+        match &self.state {
+            ExtendedAdvertisingChainState::Idle => None,
+            ExtendedAdvertisingChainState::Active(active) => {
+                Some(ExtendedAdvertisingChainProgress::Awaiting {
+                    window: active.pending,
+                    fragment_count: active.fragment_count,
+                    advertising_data_octets: active.advertising_data.len(),
+                })
+            }
+            ExtendedAdvertisingChainState::Complete(chain) => {
+                Some(ExtendedAdvertisingChainProgress::Complete(chain.clone()))
+            }
+        }
+    }
+
+    pub fn begin(
+        &mut self,
+        primary: &AdvertisingPdu,
+        phy: LePhy,
+        access_address_sample: u64,
+    ) -> Result<ExtendedAdvertisingChainProgress> {
+        if !matches!(self.state, ExtendedAdvertisingChainState::Idle) {
+            return Err(Error::InvalidState(
+                "extended advertising tracker must be reset before beginning another chain"
+                    .to_owned(),
+            ));
+        }
+        if !primary.channel.is_primary_advertising() {
+            return Err(Error::InvalidInput(format!(
+                "extended advertising chain must begin on primary channel 37..=39; got {}",
+                primary.channel.index()
+            )));
+        }
+        if phy != LePhy::Le1M {
+            return Err(Error::InvalidInput(format!(
+                "primary ADV_EXT_IND must use LE-1M; got {phy}"
+            )));
+        }
+        let header = extended_header(primary, ExtendedAdvertisingPduKind::AdvExtInd)?;
+        let pointer = header.auxiliary_pointer.ok_or_else(|| {
+            Error::InvalidInput(
+                "primary ADV_EXT_IND does not contain an AuxPtr to follow".to_owned(),
+            )
+        })?;
+        let pending = pointer.reception_window(
+            primary,
+            phy,
+            access_address_sample,
+            self.config.sample_rate_hz,
+            self.config.receiver_clock_accuracy_ppm,
+            ExtendedAdvertisingPduKind::AuxAdvInd,
+        )?;
+        self.state = ExtendedAdvertisingChainState::Active(ActiveExtendedAdvertisingChain {
+            pending,
+            advertiser_address: header.advertiser_address,
+            advertiser_address_kind: header.advertiser_address_kind,
+            advertising_data_info: header.advertising_data_info,
+            mode: None,
+            advertising_data: Vec::new(),
+            fragment_count: 0,
+            first_auxiliary_sample: None,
+            last_auxiliary_sample: None,
+        });
+        self.progress().ok_or_else(|| {
+            Error::InvalidState("extended advertising tracker failed to start".to_owned())
+        })
+    }
+
+    pub fn observe(
+        &mut self,
+        pdu: &AdvertisingPdu,
+        phy: LePhy,
+        access_address_sample: u64,
+    ) -> Result<ExtendedAdvertisingChainProgress> {
+        let ExtendedAdvertisingChainState::Active(active) = &self.state else {
+            return Err(Error::InvalidState(
+                "extended advertising tracker is not awaiting an auxiliary packet".to_owned(),
+            ));
+        };
+        let mut candidate = active.clone();
+        let pending = candidate.pending;
+        if pdu.channel != pending.channel {
+            return Err(Error::InvalidInput(format!(
+                "{} expected channel {}, received {}",
+                pending.expected_kind,
+                pending.channel.index(),
+                pdu.channel.index()
+            )));
+        }
+        if phy != pending.phy {
+            return Err(Error::InvalidInput(format!(
+                "{} expected PHY {}, received {phy}",
+                pending.expected_kind, pending.phy
+            )));
+        }
+        if !(pending.earliest_sample..=pending.latest_sample).contains(&access_address_sample) {
+            return Err(Error::InvalidInput(format!(
+                "{} sample {access_address_sample} is outside {}..={}",
+                pending.expected_kind, pending.earliest_sample, pending.latest_sample
+            )));
+        }
+        let header = extended_header(pdu, pending.expected_kind)?;
+        validate_contextual_extended_header(pending.expected_kind, &header)?;
+
+        match (
+            candidate.advertiser_address,
+            header.advertiser_address,
+            candidate.advertiser_address_kind,
+            header.advertiser_address_kind,
+        ) {
+            (Some(expected), Some(observed), Some(expected_kind), Some(observed_kind))
+                if expected != observed || expected_kind != observed_kind =>
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{} advertiser identity does not match the initiating ADV_EXT_IND",
+                    pending.expected_kind
+                )));
+            }
+            (None, Some(observed), _, Some(observed_kind)) => {
+                candidate.advertiser_address = Some(observed);
+                candidate.advertiser_address_kind = Some(observed_kind);
+            }
+            _ => {}
+        }
+
+        match (
+            candidate.advertising_data_info,
+            header.advertising_data_info,
+        ) {
+            (Some(expected), Some(observed)) if expected != observed => {
+                return Err(Error::InvalidInput(format!(
+                    "{} ADI SID/DID does not match the initiating chain",
+                    pending.expected_kind
+                )));
+            }
+            (Some(_), None) => {
+                return Err(Error::InvalidInput(format!(
+                    "{} omits the chain ADI",
+                    pending.expected_kind
+                )));
+            }
+            (None, Some(observed)) => candidate.advertising_data_info = Some(observed),
+            (None, None) | (Some(_), Some(_)) => {}
+        }
+
+        if header.auxiliary_pointer.is_some() && candidate.advertising_data_info.is_none() {
+            return Err(Error::InvalidInput(format!(
+                "{} with a continuation AuxPtr requires an ADI",
+                pending.expected_kind
+            )));
+        }
+
+        let assembled_length = candidate
+            .advertising_data
+            .len()
+            .checked_add(header.advertising_data.len())
+            .ok_or_else(|| {
+                Error::InvalidState(
+                    "extended advertising data length arithmetic overflow".to_owned(),
+                )
+            })?;
+        if assembled_length > self.config.maximum_advertising_data_length {
+            return Err(Error::InvalidInput(format!(
+                "extended advertising data would reach {assembled_length} octets, exceeding configured maximum {}",
+                self.config.maximum_advertising_data_length
+            )));
+        }
+        candidate
+            .advertising_data
+            .extend_from_slice(&header.advertising_data);
+        candidate.fragment_count = candidate.fragment_count.checked_add(1).ok_or_else(|| {
+            Error::InvalidState("extended advertising fragment count overflow".to_owned())
+        })?;
+        candidate.first_auxiliary_sample = candidate
+            .first_auxiliary_sample
+            .or(Some(access_address_sample));
+        candidate.last_auxiliary_sample = Some(access_address_sample);
+        if pending.expected_kind == ExtendedAdvertisingPduKind::AuxAdvInd {
+            candidate.mode = Some(header.mode);
+        }
+
+        let progress = if let Some(pointer) = header.auxiliary_pointer {
+            candidate.pending = pointer.reception_window(
+                pdu,
+                phy,
+                access_address_sample,
+                self.config.sample_rate_hz,
+                self.config.receiver_clock_accuracy_ppm,
+                ExtendedAdvertisingPduKind::AuxChainInd,
+            )?;
+            let progress = ExtendedAdvertisingChainProgress::Awaiting {
+                window: candidate.pending,
+                fragment_count: candidate.fragment_count,
+                advertising_data_octets: candidate.advertising_data.len(),
+            };
+            self.state = ExtendedAdvertisingChainState::Active(candidate);
+            progress
+        } else {
+            let chain = ReassembledExtendedAdvertising {
+                advertiser_address: candidate.advertiser_address,
+                advertiser_address_kind: candidate.advertiser_address_kind,
+                advertising_data_info: candidate.advertising_data_info,
+                mode: candidate.mode.ok_or_else(|| {
+                    Error::InvalidState(
+                        "extended advertising chain completed before AUX_ADV_IND".to_owned(),
+                    )
+                })?,
+                advertising_data: candidate.advertising_data,
+                fragment_count: candidate.fragment_count,
+                first_auxiliary_sample: candidate.first_auxiliary_sample.ok_or_else(|| {
+                    Error::InvalidState(
+                        "extended advertising chain has no first auxiliary sample".to_owned(),
+                    )
+                })?,
+                last_auxiliary_sample: candidate.last_auxiliary_sample.ok_or_else(|| {
+                    Error::InvalidState(
+                        "extended advertising chain has no last auxiliary sample".to_owned(),
+                    )
+                })?,
+            };
+            self.state = ExtendedAdvertisingChainState::Complete(chain.clone());
+            ExtendedAdvertisingChainProgress::Complete(chain)
+        };
+        Ok(progress)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -709,6 +1171,117 @@ fn take_extended_field<'a>(
     Ok(field)
 }
 
+fn extended_header(
+    pdu: &AdvertisingPdu,
+    kind: ExtendedAdvertisingPduKind,
+) -> Result<ExtendedAdvertisingHeader> {
+    if pdu.pdu_type() != 7 {
+        return Err(Error::InvalidInput(format!(
+            "{kind} requires advertising PDU type 0x07; got 0x{:02x}",
+            pdu.pdu_type()
+        )));
+    }
+    match kind {
+        ExtendedAdvertisingPduKind::AdvExtInd if !pdu.channel.is_primary_advertising() => {
+            return Err(Error::InvalidInput(format!(
+                "ADV_EXT_IND requires primary channel 37..=39; got {}",
+                pdu.channel.index()
+            )));
+        }
+        ExtendedAdvertisingPduKind::AuxAdvInd | ExtendedAdvertisingPduKind::AuxChainInd
+            if pdu.channel.is_primary_advertising() =>
+        {
+            return Err(Error::InvalidInput(format!(
+                "{kind} requires a secondary channel in 0..=36; got {}",
+                pdu.channel.index()
+            )));
+        }
+        _ => {}
+    }
+    decode_extended_advertising_header(pdu)
+}
+
+fn validate_contextual_extended_header(
+    kind: ExtendedAdvertisingPduKind,
+    header: &ExtendedAdvertisingHeader,
+) -> Result<()> {
+    match kind {
+        ExtendedAdvertisingPduKind::AdvExtInd => {}
+        ExtendedAdvertisingPduKind::AuxAdvInd => {
+            if header.auxiliary_pointer.is_some()
+                && header.mode != ExtendedAdvertisingMode::NonConnectableNonScannable
+            {
+                return Err(Error::InvalidInput(
+                    "connectable or scannable AUX_ADV_IND reserves AuxPtr".to_owned(),
+                ));
+            }
+        }
+        ExtendedAdvertisingPduKind::AuxChainInd => {
+            if header.mode != ExtendedAdvertisingMode::NonConnectableNonScannable {
+                return Err(Error::InvalidInput(
+                    "AUX_CHAIN_IND requires non-connectable non-scannable mode".to_owned(),
+                ));
+            }
+            if header.advertiser_address.is_some() || header.target_address.is_some() {
+                return Err(Error::InvalidInput(
+                    "AUX_CHAIN_IND reserves AdvA and TargetA".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn advertising_packet_airtime_us(pdu: &AdvertisingPdu, phy: LePhy) -> Result<u128> {
+    let octets = 4usize
+        .checked_add(2)
+        .and_then(|value| value.checked_add(pdu.payload.len()))
+        .and_then(|value| value.checked_add(3))
+        .ok_or_else(|| Error::InvalidState("advertising packet length overflow".to_owned()))?;
+    let (preamble_octets, microseconds_per_octet) = match phy {
+        LePhy::Le1M => (1usize, 8u128),
+        LePhy::Le2M => (2usize, 4u128),
+        LePhy::LeCoded => {
+            return Err(Error::InvalidConfiguration(
+                "LE Coded advertising airtime is not implemented".to_owned(),
+            ));
+        }
+    };
+    u128::try_from(
+        preamble_octets
+            .checked_add(octets)
+            .ok_or_else(|| Error::InvalidState("advertising airtime overflow".to_owned()))?,
+    )
+    .map_err(|_| Error::InvalidState("advertising packet length exceeds u128".to_owned()))?
+    .checked_mul(microseconds_per_octet)
+    .ok_or_else(|| Error::InvalidState("advertising airtime overflow".to_owned()))
+}
+
+fn microseconds_to_samples_floor(microseconds: u128, sample_rate_hz: u32) -> Result<u64> {
+    let samples = microseconds
+        .checked_mul(u128::from(sample_rate_hz))
+        .ok_or_else(|| Error::InvalidState("sample-time multiplication overflow".to_owned()))?
+        / 1_000_000;
+    u64::try_from(samples)
+        .map_err(|_| Error::InvalidState("sample-time result exceeds u64".to_owned()))
+}
+
+fn microseconds_to_samples_ceil(microseconds: u128, sample_rate_hz: u32) -> Result<u64> {
+    let numerator = microseconds
+        .checked_mul(u128::from(sample_rate_hz))
+        .ok_or_else(|| Error::InvalidState("sample-time multiplication overflow".to_owned()))?;
+    divide_round_up(numerator, 1_000_000)
+}
+
+fn divide_round_up(numerator: u128, denominator: u128) -> Result<u64> {
+    let rounded = numerator
+        .checked_add(denominator - 1)
+        .ok_or_else(|| Error::InvalidState("integer ceiling arithmetic overflow".to_owned()))?
+        / denominator;
+    u64::try_from(rounded)
+        .map_err(|_| Error::InvalidState("integer ceiling result exceeds u64".to_owned()))
+}
+
 fn decode_extended_advertising_header(pdu: &AdvertisingPdu) -> Result<ExtendedAdvertisingHeader> {
     if pdu.header[0] & 0x30 != 0 {
         return Err(Error::InvalidInput(format!(
@@ -1054,6 +1627,72 @@ mod tests {
             payload,
             crc: [0; 3],
         }
+    }
+
+    fn extended_pdu(
+        channel: u8,
+        mode: ExtendedAdvertisingMode,
+        header_flags: u8,
+        fields: &[u8],
+        advertising_data: &[u8],
+    ) -> AdvertisingPdu {
+        let mode_bits = match mode {
+            ExtendedAdvertisingMode::NonConnectableNonScannable => 0,
+            ExtendedAdvertisingMode::ConnectableNonScannable => 1,
+            ExtendedAdvertisingMode::NonConnectableScannable => 2,
+        };
+        let extended_header_length = 1 + fields.len();
+        let mut payload = Vec::with_capacity(1 + extended_header_length + advertising_data.len());
+        payload.push((mode_bits << 6) | extended_header_length as u8);
+        payload.push(header_flags);
+        payload.extend_from_slice(fields);
+        payload.extend_from_slice(advertising_data);
+        AdvertisingPdu {
+            channel: BleChannel::new(channel).unwrap(),
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [7, payload.len() as u8],
+            payload,
+            crc: [0; 3],
+        }
+    }
+
+    fn adi(data_id: u16, advertising_set_id: u8) -> [u8; 2] {
+        (data_id | u16::from(advertising_set_id) << 12).to_le_bytes()
+    }
+
+    fn aux_pointer(
+        channel: u8,
+        clock_accuracy: AuxiliaryClockAccuracy,
+        units_us: u16,
+        offset: u16,
+        phy: LePhy,
+    ) -> [u8; 3] {
+        let mut first = channel;
+        if clock_accuracy == AuxiliaryClockAccuracy::Ppm50 {
+            first |= 0x40;
+        }
+        if units_us == 300 {
+            first |= 0x80;
+        }
+        let phy_bits = match phy {
+            LePhy::Le1M => 0,
+            LePhy::Le2M => 1,
+            LePhy::LeCoded => 2,
+        };
+        let offset_and_phy = offset | phy_bits << 13;
+        let encoded = offset_and_phy.to_le_bytes();
+        [first, encoded[0], encoded[1]]
+    }
+
+    fn chain_tracker(maximum_advertising_data_length: usize) -> ExtendedAdvertisingChainTracker {
+        ExtendedAdvertisingChainTracker::new(ExtendedAdvertisingChainConfig {
+            sample_rate_hz: 4_000_000,
+            receiver_clock_accuracy_ppm: 20,
+            maximum_advertising_data_length,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -1452,6 +2091,526 @@ mod tests {
         sync_info[6..11].copy_from_slice(&[1, 0, 0, 0, 0]);
         let invalid_map = decode_advertising_pdu(&pdu(7, 0, sync_info)).unwrap_err();
         assert!(invalid_map.to_string().contains("fewer than two channels"));
+    }
+
+    #[test]
+    fn schedules_quantized_auxiliary_reception_windows() {
+        let pointer_30 = AuxiliaryPointer {
+            channel: BleChannel::new(20).unwrap(),
+            clock_accuracy: AuxiliaryClockAccuracy::Ppm500,
+            offset_units_us: 30,
+            offset: 20,
+            phy: LePhy::Le2M,
+        };
+        let parent = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x10,
+            &aux_pointer(20, AuxiliaryClockAccuracy::Ppm500, 30, 20, LePhy::Le2M),
+            &[],
+        );
+        assert_eq!(
+            pointer_30
+                .reception_window(
+                    &parent,
+                    LePhy::Le1M,
+                    1_000,
+                    4_000_000,
+                    20,
+                    ExtendedAdvertisingPduKind::AuxAdvInd,
+                )
+                .unwrap(),
+            AuxiliaryReceptionWindow {
+                expected_kind: ExtendedAdvertisingPduKind::AuxAdvInd,
+                channel: BleChannel::new(20).unwrap(),
+                phy: LePhy::Le2M,
+                represented_earliest_sample: 3_400,
+                represented_latest_sample: 3_520,
+                earliest_sample: 3_398,
+                latest_sample: 3_522,
+                quantization_width_us: 30,
+                quantization_width_samples: 120,
+                widening_samples: 2,
+            }
+        );
+
+        let pointer_300 = AuxiliaryPointer {
+            channel: BleChannel::new(20).unwrap(),
+            clock_accuracy: AuxiliaryClockAccuracy::Ppm50,
+            offset_units_us: 300,
+            offset: 291,
+            phy: LePhy::Le1M,
+        };
+        let window = pointer_300
+            .reception_window(
+                &parent,
+                LePhy::Le1M,
+                1_000,
+                4_000_000,
+                20,
+                ExtendedAdvertisingPduKind::AuxAdvInd,
+            )
+            .unwrap();
+        assert_eq!(window.represented_earliest_sample, 350_200);
+        assert_eq!(window.represented_latest_sample, 351_400);
+        assert_eq!(window.quantization_width_samples, 1_200);
+        assert_eq!(window.widening_samples, 25);
+        assert_eq!(window.earliest_sample, 350_175);
+        assert_eq!(window.latest_sample, 351_425);
+
+        let wide_clock = AuxiliaryPointer {
+            clock_accuracy: AuxiliaryClockAccuracy::Ppm500,
+            ..pointer_300
+        }
+        .reception_window(
+            &parent,
+            LePhy::Le1M,
+            1_000,
+            4_000_000,
+            20,
+            ExtendedAdvertisingPduKind::AuxAdvInd,
+        )
+        .unwrap();
+        assert_eq!(wide_clock.widening_samples, 182);
+    }
+
+    #[test]
+    fn schedules_from_le_2m_and_adjusts_for_coded_child_preamble() {
+        let parent = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x10,
+            &aux_pointer(21, AuxiliaryClockAccuracy::Ppm50, 30, 20, LePhy::Le1M),
+            &[1, 2, 3],
+        );
+        let base_pointer = AuxiliaryPointer {
+            channel: BleChannel::new(21).unwrap(),
+            clock_accuracy: AuxiliaryClockAccuracy::Ppm50,
+            offset_units_us: 30,
+            offset: 20,
+            phy: LePhy::Le1M,
+        };
+        let uncoded = base_pointer
+            .reception_window(
+                &parent,
+                LePhy::Le2M,
+                10_000,
+                4_000_000,
+                20,
+                ExtendedAdvertisingPduKind::AuxChainInd,
+            )
+            .unwrap();
+        assert_eq!(uncoded.represented_earliest_sample, 12_400);
+
+        let coded = AuxiliaryPointer {
+            phy: LePhy::LeCoded,
+            ..base_pointer
+        }
+        .reception_window(
+            &parent,
+            LePhy::Le2M,
+            10_000,
+            4_000_000,
+            20,
+            ExtendedAdvertisingPduKind::AuxChainInd,
+        )
+        .unwrap();
+        assert_eq!(
+            coded.represented_earliest_sample - uncoded.represented_earliest_sample,
+            288
+        );
+        assert_eq!(
+            coded.represented_latest_sample - uncoded.represented_latest_sample,
+            288
+        );
+    }
+
+    #[test]
+    fn rejects_unschedulable_auxiliary_offsets_and_invalid_clock_inputs() {
+        let parent = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0,
+            &[],
+            &[],
+        );
+        let pointer = AuxiliaryPointer {
+            channel: BleChannel::new(20).unwrap(),
+            clock_accuracy: AuxiliaryClockAccuracy::Ppm500,
+            offset_units_us: 30,
+            offset: 0,
+            phy: LePhy::Le1M,
+        };
+        assert!(
+            pointer
+                .reception_window(
+                    &parent,
+                    LePhy::Le1M,
+                    0,
+                    4_000_000,
+                    20,
+                    ExtendedAdvertisingPduKind::AuxAdvInd,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("offset zero")
+        );
+        assert!(
+            AuxiliaryPointer {
+                offset: 10,
+                ..pointer
+            }
+            .reception_window(
+                &parent,
+                LePhy::Le1M,
+                0,
+                4_000_000,
+                20,
+                ExtendedAdvertisingPduKind::AuxAdvInd,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("300 us MAFS")
+        );
+        assert!(
+            AuxiliaryPointer {
+                offset: 20,
+                ..pointer
+            }
+            .reception_window(
+                &parent,
+                LePhy::Le1M,
+                0,
+                4_000_000,
+                1_000_001,
+                ExtendedAdvertisingPduKind::AuxAdvInd,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("1000000")
+        );
+    }
+
+    #[test]
+    fn tracks_and_reassembles_an_auxiliary_advertising_chain() {
+        let identity = adi(0x0abc, 0x0d);
+        let first_pointer = aux_pointer(20, AuxiliaryClockAccuracy::Ppm50, 30, 20, LePhy::Le2M);
+        let primary_fields = [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            identity[0],
+            identity[1],
+            first_pointer[0],
+            first_pointer[1],
+            first_pointer[2],
+        ];
+        let primary = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x19,
+            &primary_fields,
+            &[],
+        );
+        let mut tracker = chain_tracker(64);
+        let ExtendedAdvertisingChainProgress::Awaiting { window, .. } =
+            tracker.begin(&primary, LePhy::Le1M, 1_000).unwrap()
+        else {
+            panic!("expected AUX_ADV_IND window");
+        };
+        assert_eq!(window.expected_kind, ExtendedAdvertisingPduKind::AuxAdvInd);
+        assert_eq!(window.channel.index(), 20);
+        assert_eq!(window.phy, LePhy::Le2M);
+
+        let second_pointer = aux_pointer(21, AuxiliaryClockAccuracy::Ppm500, 30, 20, LePhy::Le1M);
+        let aux_adv_fields = [
+            identity[0],
+            identity[1],
+            second_pointer[0],
+            second_pointer[1],
+            second_pointer[2],
+        ];
+        let aux_adv = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x18,
+            &aux_adv_fields,
+            &[1, 2, 3],
+        );
+        let ExtendedAdvertisingChainProgress::Awaiting {
+            window: chain_window,
+            fragment_count,
+            advertising_data_octets,
+        } = tracker
+            .observe(&aux_adv, LePhy::Le2M, window.represented_earliest_sample)
+            .unwrap()
+        else {
+            panic!("expected AUX_CHAIN_IND window");
+        };
+        assert_eq!(
+            chain_window.expected_kind,
+            ExtendedAdvertisingPduKind::AuxChainInd
+        );
+        assert_eq!(fragment_count, 1);
+        assert_eq!(advertising_data_octets, 3);
+
+        let aux_chain = extended_pdu(
+            21,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x08,
+            &identity,
+            &[4, 5, 6, 7],
+        );
+        let ExtendedAdvertisingChainProgress::Complete(chain) = tracker
+            .observe(
+                &aux_chain,
+                LePhy::Le1M,
+                chain_window.represented_earliest_sample,
+            )
+            .unwrap()
+        else {
+            panic!("expected complete chain");
+        };
+        assert_eq!(chain.advertiser_address.unwrap().0, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(chain.advertiser_address_kind, Some(AddressKind::Public));
+        assert_eq!(
+            chain.advertising_data_info,
+            Some(AdvertisingDataInfo {
+                data_id: 0x0abc,
+                advertising_set_id: 0x0d,
+            })
+        );
+        assert_eq!(chain.advertising_data, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(chain.fragment_count, 2);
+        assert_eq!(
+            tracker.progress(),
+            Some(ExtendedAdvertisingChainProgress::Complete(chain))
+        );
+        tracker.reset();
+        assert_eq!(tracker.progress(), None);
+    }
+
+    #[test]
+    fn chain_rejections_do_not_mutate_tracker_state() {
+        let identity = adi(1, 2);
+        let pointer = aux_pointer(20, AuxiliaryClockAccuracy::Ppm50, 30, 20, LePhy::Le1M);
+        let fields = [identity[0], identity[1], pointer[0], pointer[1], pointer[2]];
+        let primary = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x18,
+            &fields,
+            &[],
+        );
+        let mut tracker = chain_tracker(3);
+        let initial = tracker.begin(&primary, LePhy::Le1M, 1_000).unwrap();
+        let wrong_channel = extended_pdu(
+            19,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x08,
+            &identity,
+            &[1],
+        );
+        assert!(
+            tracker
+                .observe(&wrong_channel, LePhy::Le1M, 3_400)
+                .unwrap_err()
+                .to_string()
+                .contains("expected channel 20")
+        );
+        assert_eq!(tracker.progress(), Some(initial.clone()));
+
+        let matching_channel = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x08,
+            &identity,
+            &[1],
+        );
+        assert!(
+            tracker
+                .observe(&matching_channel, LePhy::Le2M, 3_400)
+                .unwrap_err()
+                .to_string()
+                .contains("expected PHY LE-1M")
+        );
+        assert_eq!(tracker.progress(), Some(initial.clone()));
+        assert!(
+            tracker
+                .observe(&matching_channel, LePhy::Le1M, 4_000)
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+        assert_eq!(tracker.progress(), Some(initial.clone()));
+
+        let oversized = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x08,
+            &identity,
+            &[1, 2, 3, 4],
+        );
+        assert!(
+            tracker
+                .observe(&oversized, LePhy::Le1M, 3_400)
+                .unwrap_err()
+                .to_string()
+                .contains("configured maximum 3")
+        );
+        assert_eq!(tracker.progress(), Some(initial));
+    }
+
+    #[test]
+    fn enforces_adi_and_contextual_auxiliary_chain_invariants() {
+        let identity = adi(1, 2);
+        let pointer = aux_pointer(20, AuxiliaryClockAccuracy::Ppm50, 30, 20, LePhy::Le1M);
+        let primary_fields = [identity[0], identity[1], pointer[0], pointer[1], pointer[2]];
+        let primary = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x18,
+            &primary_fields,
+            &[],
+        );
+
+        let mut mismatch_tracker = chain_tracker(64);
+        mismatch_tracker
+            .begin(&primary, LePhy::Le1M, 1_000)
+            .unwrap();
+        let mismatched_adi = adi(2, 2);
+        let mismatched = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x08,
+            &mismatched_adi,
+            &[],
+        );
+        assert!(
+            mismatch_tracker
+                .observe(&mismatched, LePhy::Le1M, 3_400)
+                .unwrap_err()
+                .to_string()
+                .contains("ADI SID/DID")
+        );
+
+        let next_pointer = aux_pointer(21, AuxiliaryClockAccuracy::Ppm50, 30, 20, LePhy::Le1M);
+        let continuing_fields = [
+            identity[0],
+            identity[1],
+            next_pointer[0],
+            next_pointer[1],
+            next_pointer[2],
+        ];
+        let connectable = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::ConnectableNonScannable,
+            0x18,
+            &continuing_fields,
+            &[],
+        );
+        assert!(
+            mismatch_tracker
+                .observe(&connectable, LePhy::Le1M, 3_400)
+                .unwrap_err()
+                .to_string()
+                .contains("reserves AuxPtr")
+        );
+
+        let mut contextual_tracker = chain_tracker(64);
+        let ExtendedAdvertisingChainProgress::Awaiting { window, .. } = contextual_tracker
+            .begin(&primary, LePhy::Le1M, 1_000)
+            .unwrap()
+        else {
+            panic!("expected first window");
+        };
+        let continuing = extended_pdu(
+            20,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x18,
+            &continuing_fields,
+            &[],
+        );
+        let ExtendedAdvertisingChainProgress::Awaiting {
+            window: chain_window,
+            ..
+        } = contextual_tracker
+            .observe(&continuing, LePhy::Le1M, window.represented_earliest_sample)
+            .unwrap()
+        else {
+            panic!("expected chain window");
+        };
+        let chain_with_adva = extended_pdu(
+            21,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0x09,
+            &[7, 8, 9, 10, 11, 12, identity[0], identity[1]],
+            &[],
+        );
+        assert!(
+            contextual_tracker
+                .observe(
+                    &chain_with_adva,
+                    LePhy::Le1M,
+                    chain_window.represented_earliest_sample,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("reserves AdvA")
+        );
+        let chain_with_mode = extended_pdu(
+            21,
+            ExtendedAdvertisingMode::NonConnectableScannable,
+            0x08,
+            &identity,
+            &[],
+        );
+        assert!(
+            contextual_tracker
+                .observe(
+                    &chain_with_mode,
+                    LePhy::Le1M,
+                    chain_window.represented_earliest_sample,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("requires non-connectable")
+        );
+    }
+
+    #[test]
+    fn bounded_auxiliary_scheduling_inputs_remain_panic_free() {
+        let parent = extended_pdu(
+            37,
+            ExtendedAdvertisingMode::NonConnectableNonScannable,
+            0,
+            &[],
+            &[],
+        );
+        for offset in [0, 1, 10, 20, 0x1fff] {
+            for units in [30, 300] {
+                for phy in [LePhy::Le1M, LePhy::Le2M, LePhy::LeCoded] {
+                    let pointer = AuxiliaryPointer {
+                        channel: BleChannel::new(36).unwrap(),
+                        clock_accuracy: AuxiliaryClockAccuracy::Ppm500,
+                        offset_units_us: units,
+                        offset,
+                        phy,
+                    };
+                    let _ = pointer.reception_window(
+                        &parent,
+                        LePhy::Le1M,
+                        u64::MAX / 2,
+                        u32::MAX,
+                        1_000_000,
+                        ExtendedAdvertisingPduKind::AuxAdvInd,
+                    );
+                }
+            }
+        }
     }
 
     #[test]

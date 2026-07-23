@@ -15,6 +15,10 @@ The repository now contains a dependency-free, buildable receive core with:
 - Fixed-channel secondary advertising decode on channels 0 through 36 with
   asserted LE 1M/2M PHY, full eight-bit Length framing, semantic extended
   headers, and PHY-correct PCAPNG output.
+- AuxPtr-driven offline receive-window planning with 30/300 microsecond
+  quantization, combined advertiser/receiver clock widening, contextual
+  AUX_ADV_IND/AUX_CHAIN_IND validation, ADI-bound chain state, and bounded
+  advertising-data reassembly.
 - Configurable CRC-gated LE 1M and LE 2M data-channel decoding for a known
   connection access address, CRC initializer, logical channel, and asserted
   PHY.
@@ -124,10 +128,10 @@ CRC-valid primary `ADV_EXT_IND` packets receive strict bounded decoding of the
 common extended header. The decoder reports typed advertiser and target
 addresses, CTEInfo, ADI set/data identifiers, AuxPtr channel/timing/PHY,
 periodic SyncInfo, signed transmit power, and exact residual ACAD and
-advertising-data lengths. An AuxPtr is descriptive only: `decode` does not
-retune to or receive the secondary advertising channel, reassemble chained
-advertising data, or establish periodic synchronization state. LE Coded may be
-represented by an AuxPtr but is not demodulated.
+advertising-data lengths. `decode` itself does not retune to the secondary
+channel, but the offline planner described below can turn its packet metadata
+into a bounded auxiliary receive window. LE Coded may be represented and
+scheduled by an AuxPtr but is not demodulated.
 
 The decoder processes the file in bounded blocks and retains enough overlap to
 recover maximum-length primary advertisements split between reads. Repeated
@@ -154,11 +158,43 @@ the full eight-bit secondary advertising Length field, allowing payloads up to
 decode as primary `ADV_EXT_IND`; other secondary advertising PDU types remain
 lossless raw payloads instead of being assigned legacy primary meanings.
 
-The command decodes one already selected channel and PHY. It does not infer
-whether a type-`0x07` packet is AUX_ADV_IND, AUX_CHAIN_IND, AUX_SYNC_IND, or
-AUX_SCAN_RSP because that name depends on scheduling context. It does not
-follow AuxPtr, retune, combine channels, reassemble chains, maintain periodic
-synchronization state, or demodulate LE Coded.
+The command decodes one already selected channel and PHY. In isolation it
+does not infer whether a type-`0x07` packet is AUX_ADV_IND, AUX_CHAIN_IND,
+AUX_SYNC_IND, or AUX_SCAN_RSP because that name depends on scheduling context.
+It does not retune, combine channels, maintain periodic synchronization state,
+or demodulate LE Coded.
+
+Plan and validate a timestamp-aligned extended-advertising sequence offline:
+
+```text
+cargo run --release -- extended-advertising-plan \
+  --sample-rate 4000000 \
+  --receiver-ppm 20 \
+  --packet 37:1m:1000:47070618bc2a541400 \
+  --packet 20:1m:3400:470a0618bc2a551400010203 \
+  --packet 21:1m:5800:47060308bc2a0405
+```
+
+Each `--packet` is
+`CHANNEL:PHY:ACCESS_ADDRESS_SAMPLE:HEADER_AND_PAYLOAD_HEX` and is assumed to
+have already passed CRC validation. The first packet must be a primary LE 1M
+`ADV_EXT_IND`. Its AuxPtr schedules `AUX_ADV_IND`; a continuation AuxPtr from
+that packet or an `AUX_CHAIN_IND` schedules another `AUX_CHAIN_IND`.
+
+The planner reports the represented quantization interval and the
+clock-widened earliest/latest access-address samples, expected channel, PHY,
+and center frequency. It enforces parent airtime plus the 300 microsecond
+minimum auxiliary frame spacing, rejects zero AuxOffset, combines the AuxPtr
+50/500 ppm class with `--receiver-ppm`, and accounts for the longer LE Coded
+preamble when converting packet-start timing to access-address timing.
+
+Chain observations must match the pending channel, PHY, and sample window.
+ADI SID/DID identifies continuing fragments; `AUX_CHAIN_IND` must use
+non-connectable/non-scannable mode and omit AdvA/TargetA. Advertising data is
+accumulated losslessly through the configured `--max-data` bound, and a
+fragment without AuxPtr completes the chain. A rejected observation does not
+alter tracker state. This is an offline workflow over a shared exact sample
+coordinate system, not a claim that current SDR backends can retune in time.
 
 Decode a recording from a known LE connection data channel:
 
@@ -610,13 +646,14 @@ PDU reassembly are now present. Fixed-channel live data observations are also
 available; the next receive stages are wideband channelization or timed
 retuning, routing those observations into connection-event state, applying
 tracked PHY transitions to demodulator selection, and full live BLE connection
-following. Full packet decode is a project requirement: AuxPtr-driven
-secondary-channel following, extended-advertising chain reassembly, periodic
-advertising synchronization, complete LL procedure state, automatic pairing
-and LTK selection, bidirectional encryption-state tracking, L2CAP channel
-state, stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth
-Classic BR/EDR layers will be added incrementally while retaining undecoded
-packet bytes losslessly.
+following. Offline AuxPtr scheduling and extended-advertising chain
+reassembly are present; live AuxPtr-driven secondary-channel capture still
+requires timestamp-preserving timed retuning or channelization. Full packet
+decode remains a project requirement: periodic advertising synchronization,
+complete LL procedure state, automatic pairing and LTK selection,
+bidirectional encryption-state tracking, L2CAP channel state, stateful GATT
+reconstruction, LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers
+will be added incrementally while retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

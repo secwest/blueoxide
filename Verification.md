@@ -1394,6 +1394,98 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## AuxPtr scheduling and extended-advertising chain verification
+
+Timing behavior was checked directly against Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4`:
+
+- `lll_scan_aux.h` accepts an AuxPtr only when
+  `offset_us + window_size_us >= parent_pdu_us + EVENT_MAFS_US`.
+- `pdu.h` defines `EVENT_MAFS_US` as 300 microseconds.
+- `lll_scan_aux.c` rejects zero offset, selects a 30- or 300-microsecond
+  receive-window size, calculates `offset * window_size`, and calculates
+  50/500 ppm clock drift from that AuxOffset separately from the quantization
+  width.
+- `PDU_AC_US` accounts for preamble, access address, two-octet advertising
+  header, payload, and CRC. The Blueoxide tests exercise both uncoded parent
+  airtime formulas.
+
+Contextual subtype and reassembly behavior was checked against Wireshark
+commit `403c9a36ea7fa8f2d69a449be1f4fa97c52817c0`,
+`epan/dissectors/packet-btle.c`. Its external AUX context maps values 0 through
+3 to AUX_ADV_IND, AUX_CHAIN_IND, AUX_SYNC_IND, and AUX_SCAN_RSP. It starts
+Host Advertising Data reassembly when AUX_ADV_IND has AuxPtr, keys the chain
+by ADI, appends AUX_CHAIN_IND fragments, treats a chain fragment without
+AuxPtr as final, and preserves the advertiser address for later fragments that
+omit it.
+
+Zephyr `ull_adv_aux.c` independently confirms that generated AUX_CHAIN_IND
+packets clear TxAdd/RxAdd and copy ADI when the superior PDU has ADI. The
+Blueoxide tracker additionally rejects a continuing chain without ADI, checks
+SID/DID equality, enforces non-connectable/non-scannable chain mode, and
+rejects AdvA/TargetA in chain context.
+
+The primary exact timing vector used by both library and CLI tests is:
+
+```text
+Sample rate:       4,000,000 samples/s
+Receiver accuracy: 20 ppm
+ADV_EXT_IND:       channel 37, LE 1M, sample 1000
+PDU:               47070618bc2a541400
+ADI:               SID 2, DID 2748
+AuxPtr:            channel 20, LE 1M, 50 ppm, offset 20 * 30 us
+Represented child: samples 3400 through 3520
+Clock widening:    1 sample per side
+Receive window:    samples 3399 through 3521
+```
+
+The next packet at sample 3400 is:
+
+```text
+AUX_ADV_IND PDU:   470a0618bc2a551400010203
+Next AuxPtr:       channel 21, LE 1M, 50 ppm, offset 20 * 30 us
+Advertising data:  010203
+```
+
+The final packet at sample 5800 is:
+
+```text
+AUX_CHAIN_IND PDU: 47060308bc2a0405
+Advertising data:  0405
+Reassembled data:  0102030405
+```
+
+Focused timing tests cover 30- and 300-microsecond units, 50- and 500-ppm
+advertiser classes combined with receiver error, LE 1M and LE 2M parents,
+LE 1M/2M/Coded child PHYs, the 72-microsecond LE Coded preamble adjustment,
+zero offset, insufficient MAFS, invalid receiver accuracy, checked sample
+overflow, and bounded arbitrary inputs. The long 87,300-microsecond vector
+distinguishes widening based on AuxOffset (182 samples at 520 ppm and 4 Msps)
+from incorrectly widening over the extra quantization unit.
+
+Focused state tests cover channel, PHY, and timing mismatch; ADI mismatch or
+omission; connectable/scannable AUX_ADV_IND with a reserved continuation
+AuxPtr; invalid AUX_CHAIN_IND mode and address fields; advertiser inheritance;
+maximum assembled size; valid multi-fragment completion; explicit reset; and
+non-mutating rejection. The CLI tests cover the full contextual sequence and
+an out-of-window observation.
+
+Final local gate for this increment:
+
+```text
+186 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+6 advertising decode/planning/reassembly CLI integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1404,9 +1496,10 @@ git diff --check
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
-- Differential tests for AuxPtr-driven/chained extended advertising, periodic
-  advertising synchronization, data-channel following, stateful GATT, EATT,
-  pairing and automatic LTK selection, full LL encryption activation/pause
-  state, automatic bidirectional encryption state, automatic capture-driven
-  PHY transition delivery and demodulator switching, LE Coded PHY
-  demodulation, and Bluetooth Classic as those layers are added.
+- Recorded multi-channel or timed-retune validation for live AuxPtr-driven
+  extended advertising, plus differential tests for periodic advertising
+  synchronization, data-channel following, stateful GATT, EATT, pairing and
+  automatic LTK selection, full LL encryption activation/pause state,
+  automatic bidirectional encryption state, automatic capture-driven PHY
+  transition delivery and demodulator switching, LE Coded PHY demodulation,
+  and Bluetooth Classic as those layers are added.

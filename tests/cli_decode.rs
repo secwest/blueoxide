@@ -311,3 +311,68 @@ fn cli_rejects_invalid_secondary_advertising_configuration_before_input_open() {
             .contains("--block-samples must be greater than zero")
     );
 }
+
+#[test]
+fn cli_plans_and_reassembles_contextual_extended_advertising() {
+    // AuxOffset timing and contextual AUX subtype behavior are fixed from the
+    // pinned Zephyr and Wireshark implementations documented in Verification.md.
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "extended-advertising-plan",
+            "--sample-rate",
+            "4000000",
+            "--receiver-ppm",
+            "20",
+            "--packet",
+            "37:1m:1000:47070618bc2a541400",
+            "--packet",
+            "20:1m:3400:470a0618bc2a551400010203",
+            "--packet",
+            "21:1m:5800:47060308bc2a0405",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    for expected in [
+        "packet=0 kind=ADV_EXT_IND channel=37 phy=LE-1M sample=1000 status=awaiting",
+        "next_kind=AUX_ADV_IND next_channel=20",
+        "represented_earliest_sample=3400 represented_latest_sample=3520 earliest_sample=3399 latest_sample=3521",
+        "packet=1 kind=AUX_ADV_IND channel=20 phy=LE-1M sample=3400 status=awaiting fragments=1 advertising_data_octets=3",
+        "next_kind=AUX_CHAIN_IND next_channel=21",
+        "packet=2 kind=AUX_CHAIN_IND channel=21 phy=LE-1M sample=5800 status=complete",
+        "adi=sid:2:did:2748",
+        "fragments=2",
+        "advertising_data_octets=5 advertising_data=0102030405",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn cli_rejects_extended_advertising_observation_outside_window() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "extended-advertising-plan",
+            "--sample-rate",
+            "4000000",
+            "--packet",
+            "37:1m:1000:47070618bc2a541400",
+            "--packet",
+            "20:1m:4000:47060308bc2a0102",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("AUX_ADV_IND sample 4000 is outside 3399..=3521")
+    );
+}

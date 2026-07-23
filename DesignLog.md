@@ -1277,3 +1277,68 @@ advertising chains, establish periodic synchronization state, or demodulate LE
 Coded. Those capabilities require timing provenance and cross-packet state;
 fixed-channel secondary decode establishes the framing and packet-delivery
 layer they can build on.
+
+## 2026-07-23: Follow AuxPtr in offline sample coordinates before radio retuning
+
+### Quantized timing model
+
+AuxOffset is measured from the beginning of the parent packet, while Blueoxide
+observations identify the beginning of the access address. For uncoded LE 1M
+and LE 2M the preamble is eight microseconds on both PHYs, so an uncoded
+parent-to-child access-address delta uses the AuxOffset directly. An LE Coded
+child has an 80-microsecond preamble, so its represented access-address window
+is shifted 72 microseconds later. Scheduling from an LE Coded parent remains
+unsupported because its complete packet airtime depends on coded-PHY details
+that the receive core does not yet model.
+
+An encoded offset does not identify one exact instant. It represents the
+interval beginning at `offset * unit` and spanning one 30- or 300-microsecond
+unit. The public window therefore retains represented earliest/latest samples
+instead of inventing a midpoint. Integer conversion floors the lower bound,
+ceils the upper bound, and uses checked arithmetic. The widened bounds add the
+ceiling of:
+
+```text
+AuxOffset_us * (AuxPtr_CA_ppm + receiver_ppm) * sample_rate_hz / 1e12
+```
+
+The quantization interval and clock widening remain separate. This follows the
+Zephyr scanner model, which calculates drift from AuxOffset and independently
+extends reception by the offset-unit window. Zero AuxOffset is not
+schedulable. The represented interval must also reach at least the complete
+uncoded parent airtime plus the 300-microsecond minimum auxiliary frame space.
+
+### Context supplies the AUX subtype
+
+PDU type `0x07` does not encode AUX_ADV_IND versus AUX_CHAIN_IND. A primary
+ADV_EXT_IND AuxPtr establishes AUX_ADV_IND as the first expectation. An
+AuxPtr in that AUX_ADV_IND or any later AUX_CHAIN_IND establishes
+AUX_CHAIN_IND as the next expectation. Each observation must match the pending
+channel, PHY, and widened sample window before its extended header is allowed
+to affect state.
+
+ADI SID/DID is the chain identity. When the initiating ADV_EXT_IND supplies
+ADI, every auxiliary fragment must match it; a continuing sequence may
+establish ADI at AUX_ADV_IND only when the primary omitted it. Any fragment
+that points onward must have ADI. AUX_CHAIN_IND is restricted to
+non-connectable/non-scannable mode and may not contain AdvA or TargetA.
+Connectable or scannable AUX_ADV_IND may not carry a continuation AuxPtr.
+Advertiser identity is retained when later chain fragments omit AdvA.
+
+### Transactional reassembly and discontinuities
+
+The tracker validates a cloned candidate and commits it only after all timing,
+identity, contextual-field, and configured-size checks pass. A rejected
+candidate therefore cannot consume the pending window or append partial data.
+Advertising data is accumulated byte-for-byte through a caller-selected
+maximum, and the first valid auxiliary fragment without AuxPtr completes the
+result. `reset` explicitly discards active or completed state for a sample
+discontinuity or a new sequence.
+
+`extended-advertising-plan` exposes this state machine over repeated
+CRC-validated header/payload observations sharing one exact sample coordinate
+system. It is deliberately separate from `decode` and `decode-secondary`.
+Current `IqSource` backends do not prove stop/retune/start timing continuity
+and reject reconfiguration while streaming, so this increment does not claim
+live AuxPtr following. Timed radio control or timestamp-preserving
+channelization is still required to connect the scheduler to hardware.

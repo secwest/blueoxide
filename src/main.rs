@@ -1,4 +1,8 @@
-use blueoxide::advertising::{ConnectRequest, FirstCentralTransmission, decode_advertising_pdu};
+use blueoxide::advertising::{
+    ConnectRequest, ExtendedAdvertisingChainConfig, ExtendedAdvertisingChainProgress,
+    ExtendedAdvertisingChainTracker, ExtendedAdvertisingPduKind, FirstCentralTransmission,
+    decode_advertising_pdu,
+};
 use blueoxide::att::{AttPdu, AttUuid, DecodedAttPdu};
 use blueoxide::backends::bladerf::{BladeRfOptions, BladeRfSource};
 use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
@@ -164,6 +168,21 @@ struct ConnectionObservationArg {
     access_address_sample: u64,
 }
 
+#[derive(Debug)]
+struct ExtendedAdvertisingPlanArgs {
+    sample_rate_hz: u32,
+    receiver_clock_accuracy_ppm: u32,
+    maximum_advertising_data_length: usize,
+    packets: Vec<ExtendedAdvertisingPacketArg>,
+}
+
+#[derive(Clone, Debug)]
+struct ExtendedAdvertisingPacketArg {
+    pdu: blueoxide::ble::AdvertisingPdu,
+    phy: LePhy,
+    access_address_sample: u64,
+}
+
 fn usage() -> &'static str {
     "blueoxide - Bluetooth/BLE SDR receive and capture tools
 
@@ -182,6 +201,8 @@ USAGE:
   blueoxide connection-acquire --access-address 0xNNNNNNNN \
     --channel-map HEX --csa 1|2 --hop N --interval N --sample-rate HZ \
     --connect-sample N --central-observe CHANNEL:SAMPLE [OPTIONS]
+  blueoxide extended-advertising-plan --sample-rate HZ \
+    --packet CHANNEL:PHY:SAMPLE:PDUHEX [--packet ...]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
   blueoxide capture-data --device bladerf|limesdr|xtrx --channel 0..36 \
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
@@ -241,6 +262,14 @@ CONNECTION-PLAN OPTIONS:
   --window-size N         CONNECT_IND WinSize in 1.25 ms units (default: 1)
   --window-offset N       CONNECT_IND WinOffset in 1.25 ms units (default: 0)
   --connect-sample N      CONNECT_IND access-address sample for acquisition
+
+EXTENDED-ADVERTISING-PLAN OPTIONS:
+  --sample-rate HZ        Shared exact sample-coordinate rate
+  --receiver-ppm N        Receiver sample-clock error bound (default: 20)
+  --max-data N            Maximum assembled advertising data (default: 1650)
+  --packet C:P:S:HEX      CRC-valid header+payload at channel, PHY, and sample;
+                          repeat in ADV_EXT_IND/AUX_ADV_IND/AUX_CHAIN_IND order
+                          PHY is 1m, 2m, or coded
 
 CAPTURE OPTIONS:
   --identifier STRING     Native backend device identifier
@@ -321,6 +350,25 @@ fn parse_fixed_hex<const OCTETS: usize>(value: &str, option: &str) -> Result<[u8
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).map_err(|_| {
             Error::InvalidConfiguration(format!("invalid value {value:?} for {option}"))
         })?;
+    }
+    Ok(bytes)
+}
+
+fn parse_hex_bytes(value: &str, option: &str) -> Result<Vec<u8>> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected an even number of hexadecimal digits"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for index in (0..hex.len()).step_by(2) {
+        bytes.push(u8::from_str_radix(&hex[index..index + 2], 16).map_err(|_| {
+            Error::InvalidConfiguration(format!("invalid value {value:?} for {option}"))
+        })?);
     }
     Ok(bytes)
 }
@@ -438,6 +486,127 @@ fn parse_connection_observation(value: &str, option: &str) -> Result<ConnectionO
         channel,
         access_address_sample: parse_number(sample, &format!("{option} sample"))?,
     })
+}
+
+fn parse_extended_advertising_packet(value: &str) -> Result<ExtendedAdvertisingPacketArg> {
+    let mut fields = value.splitn(4, ':');
+    let channel = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
+        )
+    })?;
+    let phy = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
+        )
+    })?;
+    let sample = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
+        )
+    })?;
+    let bytes = parse_hex_bytes(
+        fields.next().ok_or_else(|| {
+            Error::InvalidConfiguration(
+                "invalid --packet; expected CHANNEL:PHY:SAMPLE:PDUHEX".to_owned(),
+            )
+        })?,
+        "--packet PDUHEX",
+    )?;
+    if bytes.len() < 2 {
+        return Err(Error::InvalidConfiguration(
+            "--packet PDUHEX must contain the two-octet advertising header".to_owned(),
+        ));
+    }
+    let channel = BleChannel::new(parse_number(channel, "--packet channel")?)?;
+    let header = [bytes[0], bytes[1]];
+    let declared_length = if channel.is_primary_advertising() {
+        usize::from(header[1] & 0x3f)
+    } else {
+        usize::from(header[1])
+    };
+    if bytes.len() != 2 + declared_length {
+        return Err(Error::InvalidConfiguration(format!(
+            "--packet PDUHEX declares {declared_length} payload octets but contains {}",
+            bytes.len() - 2
+        )));
+    }
+    Ok(ExtendedAdvertisingPacketArg {
+        pdu: blueoxide::ble::AdvertisingPdu {
+            channel,
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header,
+            payload: bytes[2..].to_vec(),
+            crc: [0; 3],
+        },
+        phy: parse_connection_phy(phy, "--packet PHY")?,
+        access_address_sample: parse_u64(sample, "--packet sample")?,
+    })
+}
+
+fn parse_extended_advertising_plan_args(args: &[String]) -> Result<ExtendedAdvertisingPlanArgs> {
+    let mut sample_rate_hz = None;
+    let mut receiver_clock_accuracy_ppm = 20u32;
+    let mut maximum_advertising_data_length = 1_650usize;
+    let mut packets = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sample-rate" => {
+                sample_rate_hz = Some(parse_number(
+                    &value_after(args, &mut index, "--sample-rate")?,
+                    "--sample-rate",
+                )?);
+            }
+            "--receiver-ppm" => {
+                receiver_clock_accuracy_ppm = parse_number(
+                    &value_after(args, &mut index, "--receiver-ppm")?,
+                    "--receiver-ppm",
+                )?;
+            }
+            "--max-data" => {
+                maximum_advertising_data_length =
+                    parse_number(&value_after(args, &mut index, "--max-data")?, "--max-data")?;
+            }
+            "--packet" => packets.push(parse_extended_advertising_packet(&value_after(
+                args, &mut index, "--packet",
+            )?)?),
+            "-h" | "--help" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown extended-advertising-plan option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if packets.is_empty() {
+        return Err(Error::InvalidConfiguration(
+            "extended-advertising-plan requires at least one --packet".to_owned(),
+        ));
+    }
+    let plan = ExtendedAdvertisingPlanArgs {
+        sample_rate_hz: sample_rate_hz.ok_or_else(|| {
+            Error::InvalidConfiguration(
+                "extended-advertising-plan requires --sample-rate HZ".to_owned(),
+            )
+        })?,
+        receiver_clock_accuracy_ppm,
+        maximum_advertising_data_length,
+        packets,
+    };
+    ExtendedAdvertisingChainConfig {
+        sample_rate_hz: plan.sample_rate_hz,
+        receiver_clock_accuracy_ppm: plan.receiver_clock_accuracy_ppm,
+        maximum_advertising_data_length: plan.maximum_advertising_data_length,
+    }
+    .validate()?;
+    Ok(plan)
 }
 
 fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
@@ -3353,6 +3522,108 @@ fn connection_acquire(args: ConnectionPlanArgs) -> Result<()> {
     Ok(())
 }
 
+fn print_extended_advertising_progress(
+    packet_index: usize,
+    kind: ExtendedAdvertisingPduKind,
+    packet: &ExtendedAdvertisingPacketArg,
+    progress: &ExtendedAdvertisingChainProgress,
+) {
+    match progress {
+        ExtendedAdvertisingChainProgress::Awaiting {
+            window,
+            fragment_count,
+            advertising_data_octets,
+        } => println!(
+            "packet={} kind={} channel={} phy={} sample={} status=awaiting fragments={} advertising_data_octets={} next_kind={} next_channel={} next_frequency_hz={} next_phy={} represented_earliest_sample={} represented_latest_sample={} earliest_sample={} latest_sample={} quantization_width_us={} quantization_width_samples={} widening_samples={}",
+            packet_index,
+            kind,
+            packet.pdu.channel.index(),
+            packet.phy,
+            packet.access_address_sample,
+            fragment_count,
+            advertising_data_octets,
+            window.expected_kind,
+            window.channel.index(),
+            window.channel.center_frequency_hz(),
+            window.phy,
+            window.represented_earliest_sample,
+            window.represented_latest_sample,
+            window.earliest_sample,
+            window.latest_sample,
+            window.quantization_width_us,
+            window.quantization_width_samples,
+            window.widening_samples,
+        ),
+        ExtendedAdvertisingChainProgress::Complete(chain) => {
+            let advertiser = chain
+                .advertiser_address
+                .map(|address| address.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let advertiser_kind = chain
+                .advertiser_address_kind
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let adi = chain
+                .advertising_data_info
+                .map(|info| format!("sid:{}:did:{}", info.advertising_set_id, info.data_id))
+                .unwrap_or_else(|| "none".to_owned());
+            println!(
+                "packet={} kind={} channel={} phy={} sample={} status=complete mode={} advertiser={} advertiser_type={} adi={} fragments={} first_auxiliary_sample={} last_auxiliary_sample={} advertising_data_octets={} advertising_data={}",
+                packet_index,
+                kind,
+                packet.pdu.channel.index(),
+                packet.phy,
+                packet.access_address_sample,
+                chain.mode,
+                advertiser,
+                advertiser_kind,
+                adi,
+                chain.fragment_count,
+                chain.first_auxiliary_sample,
+                chain.last_auxiliary_sample,
+                chain.advertising_data.len(),
+                print_hex(&chain.advertising_data),
+            );
+        }
+    }
+}
+
+fn extended_advertising_plan(args: ExtendedAdvertisingPlanArgs) -> Result<()> {
+    let mut tracker = ExtendedAdvertisingChainTracker::new(ExtendedAdvertisingChainConfig {
+        sample_rate_hz: args.sample_rate_hz,
+        receiver_clock_accuracy_ppm: args.receiver_clock_accuracy_ppm,
+        maximum_advertising_data_length: args.maximum_advertising_data_length,
+    })?;
+    let mut packets = args.packets.into_iter();
+    let primary = packets.next().ok_or_else(|| {
+        Error::InvalidConfiguration(
+            "extended-advertising-plan requires at least one --packet".to_owned(),
+        )
+    })?;
+    let mut progress = tracker.begin(&primary.pdu, primary.phy, primary.access_address_sample)?;
+    print_extended_advertising_progress(
+        0,
+        ExtendedAdvertisingPduKind::AdvExtInd,
+        &primary,
+        &progress,
+    );
+
+    for (offset, packet) in packets.enumerate() {
+        let kind = match &progress {
+            ExtendedAdvertisingChainProgress::Awaiting { window, .. } => window.expected_kind,
+            ExtendedAdvertisingChainProgress::Complete(_) => {
+                return Err(Error::InvalidInput(format!(
+                    "packet {} follows an already complete extended advertising chain",
+                    offset + 1
+                )));
+            }
+        };
+        progress = tracker.observe(&packet.pdu, packet.phy, packet.access_address_sample)?;
+        print_extended_advertising_progress(offset + 1, kind, &packet, &progress);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -3362,6 +3633,9 @@ fn run() -> Result<()> {
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
         Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),
+        Some("extended-advertising-plan") => {
+            extended_advertising_plan(parse_extended_advertising_plan_args(&args[1..])?)
+        }
         Some("capture") => capture(parse_capture_args(&args[1..], CaptureCommand::Advertising)?),
         Some("capture-data") => capture(parse_capture_args(&args[1..], CaptureCommand::Data)?),
         Some("backends") => {
