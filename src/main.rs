@@ -6,6 +6,7 @@ use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
 use blueoxide::ble::{BleChannel, LeFrameConfig};
 use blueoxide::capture::{
     CaptureLimits, CaptureStats, CapturedAdvertisingPdu, CapturedDataChannelPdu,
+    FixedChannelCentralObservationConfig, FixedChannelCentralObservationTracker,
     capture_data_channel, capture_primary_advertising,
 };
 use blueoxide::demod::{
@@ -92,6 +93,7 @@ struct CaptureArgs {
     output_pcap: Option<PathBuf>,
     capture_start_ns: Option<u64>,
     frame: CaptureFrame,
+    central_observation_tracking: Option<FixedChannelCentralObservationConfig>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,7 +214,7 @@ CONNECTION-PLAN OPTIONS:
   --events N              Number of events to print (default: 10)
   --peer-sca N            CONNECT_IND sleep-clock accuracy, 0..=7 (default: 0)
   --receiver-ppm N        Receiver sample-clock error bound (default: 20)
-  --max-event-advance N   Events searched per observation (default: 32)
+  --max-event-advance N   Maximum event advancement searched (default: 32)
   --central-observe CHANNEL:SAMPLE
                           CRC-valid central transmission for event-0 acquisition
   --observe CHANNEL:SAMPLE
@@ -239,6 +241,18 @@ CAPTURE-DATA OPTIONS:
   --access-address HEX    Connection access address
   --crc-init HEX          24-bit connection CRC initialization value
   --phy 1m|2m             Uncoded LE data PHY (default: 1m)
+  --assert-central-observations
+                          Treat every decoded packet as a central anchor candidate
+  --first-event N         Event counter assigned to the first central observation
+  --channel-map HEX       Five connection map octets in over-the-air order
+  --csa 1|2               Connection channel selection algorithm
+  --hop N                 CSA#1 hop increment, 5..=16 (default: 5)
+  --interval N            Connection interval in 1.25 ms units
+  --latency N             Peripheral latency (default: 0)
+  --timeout N             Supervision timeout in 10 ms units (default: 3200)
+  --peer-sca N            Peer sleep-clock accuracy, 0..=7 (default: 0)
+  --receiver-ppm N        Receiver sample-clock error bound (default: 20)
+  --max-event-advance N   Maximum event advancement searched (default: 32)
 "
 }
 
@@ -356,6 +370,19 @@ fn parse_connection_phy_update(value: &str) -> Result<PhyUpdateInd> {
     )
 }
 
+fn parse_channel_selection_algorithm(
+    value: &str,
+    option: &str,
+) -> Result<ChannelSelectionAlgorithm> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "csa1" | "csa#1" => Ok(ChannelSelectionAlgorithm::Csa1),
+        "2" | "csa2" | "csa#2" => Ok(ChannelSelectionAlgorithm::Csa2),
+        _ => Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected 1 or 2"
+        ))),
+    }
+}
+
 fn parse_channel_map(value: &str) -> Result<DataChannelMap> {
     let hex = value
         .strip_prefix("0x")
@@ -433,15 +460,8 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
             }
             "--csa" => {
                 let value = value_after(args, &mut index, "--csa")?;
-                channel_selection_algorithm = Some(match value.to_ascii_lowercase().as_str() {
-                    "1" | "csa1" | "csa#1" => ChannelSelectionAlgorithm::Csa1,
-                    "2" | "csa2" | "csa#2" => ChannelSelectionAlgorithm::Csa2,
-                    _ => {
-                        return Err(Error::InvalidConfiguration(format!(
-                            "invalid value {value:?} for --csa; expected 1 or 2"
-                        )));
-                    }
-                });
+                channel_selection_algorithm =
+                    Some(parse_channel_selection_algorithm(&value, "--csa")?);
             }
             "--hop" => {
                 let value = value_after(args, &mut index, "--hop")?;
@@ -999,6 +1019,18 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
     let mut max_access_address_errors = 1u8;
     let mut output_pcap = None;
     let mut capture_start_ns = None;
+    let mut assert_central_observations = false;
+    let mut tracking_options_supplied = false;
+    let mut tracking_first_event_counter = None;
+    let mut tracking_channel_map = None;
+    let mut tracking_channel_selection_algorithm = None;
+    let mut tracking_hop_increment = 5u8;
+    let mut tracking_interval = None;
+    let mut tracking_latency = 0u16;
+    let mut tracking_supervision_timeout = 3_200u16;
+    let mut tracking_peer_clock_accuracy = SleepClockAccuracy::new(0)?;
+    let mut tracking_receiver_clock_accuracy_ppm = 20u32;
+    let mut tracking_maximum_event_advance = 32u16;
     let mut index = 0;
 
     while index < args.len() {
@@ -1020,6 +1052,65 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
             "--phy" if command == CaptureCommand::Data => {
                 let value = value_after(args, &mut index, "--phy")?;
                 phy = parse_uncoded_phy(&value, "--phy")?;
+            }
+            "--assert-central-observations" if command == CaptureCommand::Data => {
+                assert_central_observations = true;
+                tracking_options_supplied = true;
+            }
+            "--first-event" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--first-event")?;
+                tracking_first_event_counter = Some(parse_number(&value, "--first-event")?);
+                tracking_options_supplied = true;
+            }
+            "--channel-map" if command == CaptureCommand::Data => {
+                tracking_channel_map = Some(parse_channel_map(&value_after(
+                    args,
+                    &mut index,
+                    "--channel-map",
+                )?)?);
+                tracking_options_supplied = true;
+            }
+            "--csa" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--csa")?;
+                tracking_channel_selection_algorithm =
+                    Some(parse_channel_selection_algorithm(&value, "--csa")?);
+                tracking_options_supplied = true;
+            }
+            "--hop" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--hop")?;
+                tracking_hop_increment = parse_number(&value, "--hop")?;
+                tracking_options_supplied = true;
+            }
+            "--interval" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--interval")?;
+                tracking_interval = Some(parse_number(&value, "--interval")?);
+                tracking_options_supplied = true;
+            }
+            "--latency" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--latency")?;
+                tracking_latency = parse_number(&value, "--latency")?;
+                tracking_options_supplied = true;
+            }
+            "--timeout" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--timeout")?;
+                tracking_supervision_timeout = parse_number(&value, "--timeout")?;
+                tracking_options_supplied = true;
+            }
+            "--peer-sca" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--peer-sca")?;
+                tracking_peer_clock_accuracy =
+                    SleepClockAccuracy::new(parse_number(&value, "--peer-sca")?)?;
+                tracking_options_supplied = true;
+            }
+            "--receiver-ppm" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--receiver-ppm")?;
+                tracking_receiver_clock_accuracy_ppm = parse_number(&value, "--receiver-ppm")?;
+                tracking_options_supplied = true;
+            }
+            "--max-event-advance" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--max-event-advance")?;
+                tracking_maximum_event_advance = parse_number(&value, "--max-event-advance")?;
+                tracking_options_supplied = true;
             }
             "--sample-rate" => {
                 let value = value_after(args, &mut index, "--sample-rate")?;
@@ -1113,7 +1204,7 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
     };
     let channel = channel
         .ok_or_else(|| Error::InvalidConfiguration(format!("{command_name} requires --channel")))?;
-    let frame = match command {
+    let (frame, central_observation_tracking) = match command {
         CaptureCommand::Advertising => {
             if !channel.is_primary_advertising() {
                 return Err(Error::InvalidConfiguration(format!(
@@ -1126,7 +1217,7 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
                 max_access_address_errors,
             }
             .validate()?;
-            CaptureFrame::Advertising
+            (CaptureFrame::Advertising, None)
         }
         CaptureCommand::Data => {
             if channel.index() > 36 {
@@ -1150,11 +1241,63 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
                 max_access_address_errors,
             }
             .validate()?;
-            CaptureFrame::Data {
-                access_address,
-                crc_init,
-                phy,
-            }
+            let central_observation_tracking = if tracking_options_supplied {
+                if !assert_central_observations {
+                    return Err(Error::InvalidConfiguration(
+                        "connection-event tracking options require --assert-central-observations"
+                            .to_owned(),
+                    ));
+                }
+                let config = FixedChannelCentralObservationConfig {
+                    tracker: ConnectionTrackerConfig {
+                        access_address,
+                        channel_selection_algorithm: tracking_channel_selection_algorithm
+                            .ok_or_else(|| {
+                                Error::InvalidConfiguration(
+                                    "--assert-central-observations requires --csa 1|2".to_owned(),
+                                )
+                            })?,
+                        hop_increment: tracking_hop_increment,
+                        channel_map: tracking_channel_map.ok_or_else(|| {
+                            Error::InvalidConfiguration(
+                                "--assert-central-observations requires --channel-map HEX"
+                                    .to_owned(),
+                            )
+                        })?,
+                        parameters: ConnectionParameters::new(
+                            tracking_interval.ok_or_else(|| {
+                                Error::InvalidConfiguration(
+                                    "--assert-central-observations requires --interval N"
+                                        .to_owned(),
+                                )
+                            })?,
+                            tracking_latency,
+                            tracking_supervision_timeout,
+                        )?,
+                        sample_rate_hz,
+                    },
+                    first_event_counter: tracking_first_event_counter.ok_or_else(|| {
+                        Error::InvalidConfiguration(
+                            "--assert-central-observations requires --first-event N".to_owned(),
+                        )
+                    })?,
+                    peer_clock_accuracy: tracking_peer_clock_accuracy,
+                    receiver_clock_accuracy_ppm: tracking_receiver_clock_accuracy_ppm,
+                    maximum_event_advance: tracking_maximum_event_advance,
+                };
+                config.validate(channel)?;
+                Some(config)
+            } else {
+                None
+            };
+            (
+                CaptureFrame::Data {
+                    access_address,
+                    crc_init,
+                    phy,
+                },
+                central_observation_tracking,
+            )
         }
     };
     Ok(CaptureArgs {
@@ -1176,6 +1319,7 @@ fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<Captur
         output_pcap,
         capture_start_ns,
         frame,
+        central_observation_tracking,
     })
 }
 
@@ -2686,6 +2830,13 @@ fn capture_from_source<S: IqSource>(
         Some(path) => Some(PcapNgWriter::new(BufWriter::new(File::create(path)?))?),
         None => None,
     };
+    let mut central_observation_tracker = args
+        .central_observation_tracking
+        .clone()
+        .map(|config| FixedChannelCentralObservationTracker::new(args.channel, config))
+        .transpose()?;
+    let mut central_observation_matches = 0u64;
+    let mut central_observation_errors = 0u64;
 
     let limits = CaptureLimits {
         maximum_samples: None,
@@ -2740,6 +2891,35 @@ fn capture_from_source<S: IqSource>(
                         captured.observation.access_address_sample
                     );
                 }
+                if let Some(tracker) = &mut central_observation_tracker {
+                    match tracker.observe_central(captured.observation.access_address_sample) {
+                        Ok(observation) => {
+                            central_observation_matches =
+                                central_observation_matches.checked_add(1).ok_or_else(|| {
+                                    Error::InvalidState(
+                                        "central observation match count overflow".to_owned(),
+                                    )
+                                })?;
+                            print_live_central_observation(
+                                captured.observation.access_address_sample,
+                                observation,
+                            );
+                        }
+                        Err(error) => {
+                            central_observation_errors =
+                                central_observation_errors.checked_add(1).ok_or_else(|| {
+                                    Error::InvalidState(
+                                        "central observation error count overflow".to_owned(),
+                                    )
+                                })?;
+                            eprintln!(
+                                "central connection observation rejected: channel={} sample={} error={error}",
+                                data.channel.index(),
+                                captured.observation.access_address_sample
+                            );
+                        }
+                    }
+                }
                 if let Some(writer) = &mut pcap {
                     let timestamp = sample_timestamp_ns(
                         capture_start_ns,
@@ -2754,6 +2934,11 @@ fn capture_from_source<S: IqSource>(
     };
     if let Some(writer) = pcap {
         writer.into_inner().flush()?;
+    }
+    if args.central_observation_tracking.is_some() {
+        eprintln!(
+            "central connection observations: matched={central_observation_matches} rejected={central_observation_errors}"
+        );
     }
     Ok(stats)
 }
@@ -2868,11 +3053,7 @@ fn print_synchronized_observation(
     observation: blueoxide::link_layer::ConnectionObservation,
 ) {
     let missed_events = observation.advanced_events.saturating_sub(1);
-    let timing = match observation.timing_error {
-        SampleTimingError::Early(samples) => format!("early:{samples}"),
-        SampleTimingError::OnTime => "on-time:0".to_owned(),
-        SampleTimingError::Late(samples) => format!("late:{samples}"),
-    };
+    let timing = describe_sample_timing(observation.timing_error);
     println!(
         "event={} channel={} central_to_peripheral_phy={} peripheral_to_central_phy={} observed_sample={} advanced_events={} missed_events={} expected_sample={} timing={} earliest_sample={} latest_sample={} widening_samples={}",
         observation.event.event_counter,
@@ -2884,6 +3065,34 @@ fn print_synchronized_observation(
         missed_events,
         observation.timing_window.expected_sample,
         timing,
+        observation.timing_window.earliest_sample,
+        observation.timing_window.latest_sample,
+        observation.timing_window.widening_samples
+    );
+}
+
+fn describe_sample_timing(timing_error: SampleTimingError) -> String {
+    match timing_error {
+        SampleTimingError::Early(samples) => format!("early:{samples}"),
+        SampleTimingError::OnTime => "on-time:0".to_owned(),
+        SampleTimingError::Late(samples) => format!("late:{samples}"),
+    }
+}
+
+fn print_live_central_observation(
+    observed_sample: u64,
+    observation: blueoxide::link_layer::ConnectionObservation,
+) {
+    let missed_events = observation.advanced_events.saturating_sub(1);
+    println!(
+        "central_connection_event event={} channel={} observed_sample={} advanced_events={} missed_events={} expected_sample={} timing={} earliest_sample={} latest_sample={} widening_samples={}",
+        observation.event.event_counter,
+        observation.event.channel.index(),
+        observed_sample,
+        observation.advanced_events,
+        missed_events,
+        observation.timing_window.expected_sample,
+        describe_sample_timing(observation.timing_error),
         observation.timing_window.earliest_sample,
         observation.timing_window.latest_sample,
         observation.timing_window.widening_samples

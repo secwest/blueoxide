@@ -154,6 +154,10 @@
 - `blueoxide capture-data` for fixed-channel live LE 1M/2M connection traffic
   with caller-supplied access address and CRC initializer, lossless data/CTE
   output, and PHY-tagged BLE PCAPNG.
+- Opt-in `capture-data --assert-central-observations` association of live
+  packet timestamps with connection events, including first-event channel
+  validation, bounded missed-event recovery, clock-widened timing reports, and
+  nonfatal candidate rejection that preserves raw packet and PCAPNG output.
 - Live CLI validation for duration overflow, zero-sized reads, zero timeouts,
   unsupported devices, and missing native libraries.
 - Unit tests for channel mapping, whitening, CRC, PDU validation, GFSK
@@ -185,12 +189,12 @@
 - The uncoded demodulator requires 2 through 64 samples per symbol and an
   integer multiple of the selected 1 MHz or 2 MHz symbol rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
-  multi-channel connection following and retuning, automatic routing of live
-  observations into connection state, extended advertising,
-  automatic direction/counter inference, LTK selection from pairing state,
-  LL encryption start/pause state, bidirectional encryption tracking, stateful
-  L2CAP channels, GATT/EATT and pairing state, capture-driven PHY transition
-  delivery/demodulator switching, Bluetooth Classic, and LE Coded PHY
-  demodulation remain to be implemented.
+  multi-channel connection following and retuning, automatic direction
+  classification and unasserted routing of live observations, extended
+  advertising, automatic direction/counter inference, LTK selection from
+  pairing state, LL encryption start/pause state, bidirectional encryption
+  tracking, stateful L2CAP channels, GATT/EATT and pairing state,
+  capture-driven PHY transition delivery/demodulator switching, Bluetooth
+  Classic, and LE Coded PHY demodulation remain to be implemented.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

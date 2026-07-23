@@ -148,6 +148,50 @@ fn capture_data_validates_connection_before_loading_library() {
         String::from_utf8_lossy(&output.stderr)
             .contains("capture-data device \"unknown\" is not implemented")
     );
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "12",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+        "--channel-map",
+        "ffffffff1f",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("require --assert-central-observations")
+    );
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "12",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+        "--assert-central-observations",
+        "--first-event",
+        "0",
+        "--channel-map",
+        "ffffffff1f",
+        "--csa",
+        "2",
+        "--interval",
+        "24",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("event 0 uses channel 31, not tuned channel 12")
+    );
 }
 
 #[test]
@@ -159,7 +203,7 @@ fn capture_data_valid_configuration_reaches_native_backend() {
             "--device",
             "bladerf",
             "--channel",
-            "12",
+            "31",
             "--access-address",
             "0x12345678",
             "--crc-init",
@@ -168,6 +212,15 @@ fn capture_data_valid_configuration_reaches_native_backend() {
             "2m",
             "--sample-rate",
             "8000000",
+            "--assert-central-observations",
+            "--first-event",
+            "0",
+            "--channel-map",
+            "ffffffff1f",
+            "--csa",
+            "2",
+            "--interval",
+            "24",
             "--seconds",
             "0.001",
         ])

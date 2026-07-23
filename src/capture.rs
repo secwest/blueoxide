@@ -4,6 +4,10 @@ use crate::demod::{
     Le1mDemodConfig, Le1mStreamDecoder, LeUncodedDemodConfig, LeUncodedPacketStreamDecoder,
     ReceivedAdvertisingPdu, ReceivedLePdu, SampleDiscontinuity,
 };
+use crate::link_layer::{
+    ConnectionObservation, ConnectionTracker, ConnectionTrackerConfig, SampleTimingError,
+    SleepClockAccuracy,
+};
 use crate::sdr::{IqSource, SdrConfig};
 use crate::{Error, Result};
 use std::time::{Duration, Instant};
@@ -68,6 +72,111 @@ pub struct CaptureStats {
     pub discontinuities: u64,
     pub first_hardware_sample: Option<u64>,
     pub last_hardware_sample: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FixedChannelCentralObservationConfig {
+    pub tracker: ConnectionTrackerConfig,
+    pub first_event_counter: u16,
+    pub peer_clock_accuracy: SleepClockAccuracy,
+    pub receiver_clock_accuracy_ppm: u32,
+    pub maximum_event_advance: u16,
+}
+
+impl FixedChannelCentralObservationConfig {
+    pub fn validate(&self, capture_channel: BleChannel) -> Result<()> {
+        if capture_channel.index() > 36 {
+            return Err(Error::InvalidConfiguration(format!(
+                "fixed-channel connection observations require a data channel in 0..=36; got {}",
+                capture_channel.index()
+            )));
+        }
+        let probe = ConnectionTracker::new(self.tracker.clone(), self.first_event_counter, 0)?;
+        let first_event = probe.current_event()?;
+        if first_event.channel != capture_channel {
+            return Err(Error::InvalidConfiguration(format!(
+                "asserted first central event {} uses channel {}, not tuned channel {}",
+                self.first_event_counter,
+                first_event.channel.index(),
+                capture_channel.index()
+            )));
+        }
+        probe
+            .current_timing_window(self.peer_clock_accuracy, self.receiver_clock_accuracy_ppm)?
+            .ok_or_else(|| {
+                Error::InvalidConfiguration(
+                    "fixed-channel central observation tracker requires a known timing anchor"
+                        .to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FixedChannelCentralObservationTracker {
+    capture_channel: BleChannel,
+    config: FixedChannelCentralObservationConfig,
+    tracker: Option<ConnectionTracker>,
+}
+
+impl FixedChannelCentralObservationTracker {
+    pub fn new(
+        capture_channel: BleChannel,
+        config: FixedChannelCentralObservationConfig,
+    ) -> Result<Self> {
+        config.validate(capture_channel)?;
+        Ok(Self {
+            capture_channel,
+            config,
+            tracker: None,
+        })
+    }
+
+    pub const fn is_anchored(&self) -> bool {
+        self.tracker.is_some()
+    }
+
+    /// Associates a caller-asserted central transmission with a connection event.
+    ///
+    /// A fixed-channel receiver cannot infer packet direction. Callers must not
+    /// pass peripheral responses as central observations.
+    pub fn observe_central(&mut self, access_address_sample: u64) -> Result<ConnectionObservation> {
+        if let Some(tracker) = &mut self.tracker {
+            return tracker.synchronize_observation(
+                self.capture_channel,
+                access_address_sample,
+                self.config.peer_clock_accuracy,
+                self.config.receiver_clock_accuracy_ppm,
+                self.config.maximum_event_advance,
+            );
+        }
+
+        let tracker = ConnectionTracker::new(
+            self.config.tracker.clone(),
+            self.config.first_event_counter,
+            access_address_sample,
+        )?;
+        let event = tracker.current_event()?;
+        let timing_window = tracker
+            .current_timing_window(
+                self.config.peer_clock_accuracy,
+                self.config.receiver_clock_accuracy_ppm,
+            )?
+            .ok_or_else(|| {
+                Error::InvalidState(
+                    "new fixed-channel central observation tracker has no timing anchor".to_owned(),
+                )
+            })?;
+        let observation = ConnectionObservation {
+            event,
+            timing_window,
+            advanced_events: 0,
+            timing_error: SampleTimingError::OnTime,
+        };
+        self.tracker = Some(tracker);
+        Ok(observation)
+    }
 }
 
 trait CaptureObservation {
@@ -343,6 +452,7 @@ mod tests {
     use crate::ble::{
         LE_ADV_ACCESS_ADDRESS, LE_ADV_CRC_INIT, bytes_to_bits_lsb, crc24_bytes, whiten_bits,
     };
+    use crate::link_layer::{ChannelSelectionAlgorithm, ConnectionParameters, DataChannelMap};
     use crate::sdr::{ReadMetadata, SdrCapabilities, SdrKind};
     use std::collections::VecDeque;
     use std::f32::consts::TAU;
@@ -463,6 +573,64 @@ mod tests {
             }
         }
         samples
+    }
+
+    fn fixed_channel_tracking_config() -> FixedChannelCentralObservationConfig {
+        FixedChannelCentralObservationConfig {
+            tracker: ConnectionTrackerConfig {
+                access_address: 0x1234_5678,
+                channel_selection_algorithm: ChannelSelectionAlgorithm::Csa2,
+                hop_increment: 5,
+                channel_map: DataChannelMap::new([0xff, 0xff, 0xff, 0xff, 0x1f]).unwrap(),
+                parameters: ConnectionParameters::new(24, 0, 100).unwrap(),
+                sample_rate_hz: 4_000_000,
+            },
+            first_event_counter: 0,
+            peer_clock_accuracy: SleepClockAccuracy::new(0).unwrap(),
+            receiver_clock_accuracy_ppm: 20,
+            maximum_event_advance: 32,
+        }
+    }
+
+    #[test]
+    fn fixed_channel_central_observations_anchor_and_recover_missed_events() {
+        let mut tracker = FixedChannelCentralObservationTracker::new(
+            BleChannel::new(31).unwrap(),
+            fixed_channel_tracking_config(),
+        )
+        .unwrap();
+        assert!(!tracker.is_anchored());
+
+        let first = tracker.observe_central(1_000).unwrap();
+        assert!(tracker.is_anchored());
+        assert_eq!(first.event.event_counter, 0);
+        assert_eq!(first.event.channel, BleChannel::new(31).unwrap());
+        assert_eq!(first.advanced_events, 0);
+        assert_eq!(first.timing_error, SampleTimingError::OnTime);
+
+        assert!(tracker.observe_central(1_600).is_err());
+        let recovered = tracker.observe_central(841_050).unwrap();
+        assert_eq!(recovered.event.event_counter, 7);
+        assert_eq!(recovered.event.channel, BleChannel::new(31).unwrap());
+        assert_eq!(recovered.advanced_events, 7);
+        assert_eq!(recovered.timing_error, SampleTimingError::Late(50));
+    }
+
+    #[test]
+    fn fixed_channel_central_observations_require_the_first_selected_channel() {
+        let error = FixedChannelCentralObservationTracker::new(
+            BleChannel::new(20).unwrap(),
+            fixed_channel_tracking_config(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("event 0 uses channel 31"));
+
+        let mut invalid_clock = fixed_channel_tracking_config();
+        invalid_clock.receiver_clock_accuracy_ppm = 1_000_001;
+        assert!(
+            FixedChannelCentralObservationTracker::new(BleChannel::new(31).unwrap(), invalid_clock)
+                .is_err()
+        );
     }
 
     #[test]

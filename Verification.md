@@ -1212,6 +1212,58 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Fixed-channel live event-association verification
+
+The live bridge reuses the already independently checked CSA#2 and
+clock-window implementations. Its focused integration vector uses:
+
+```text
+Access address:       0x12345678
+Channel map:          ffffffff1f
+CSA:                  2
+Connection interval:  24 (30 ms)
+Sample rate:          4000000
+First event/sample:   0 / 1000
+Tuned channel:        31
+```
+
+Under this state, event 0 selects channel 31 and the next recurrence on channel
+31 is event 7. Seven intervals advance the expected sample by 840,000, so an
+observation at sample 841,050 is accepted as event 7 with a 50-sample late
+timing error and `advanced_events=7`. A same-event candidate at sample 1,600 is
+first rejected; the subsequent event-7 match proves that rejection did not
+mutate tracker state.
+
+CLI integration separately verifies that tracking options without
+`--assert-central-observations` fail before backend loading, that asserting
+event 0 while tuned to channel 12 reports the independently established
+channel-31 mismatch, and that a complete channel-31 configuration reaches the
+native backend loader. This is integration coverage of pinned CSA#2 behavior,
+not a new independent channel-selection oracle.
+
+The capture path always prints a decoded packet before attempting event
+association and performs PCAPNG serialization after either a match or a
+nonfatal rejection. The implementation review and tracker-state test therefore
+cover the contract that an unmatched candidate cannot suppress raw capture or
+stop later association attempts. Over-the-air verification still requires an
+attached SDR and a direction-classified connection fixture.
+
+Final local gate for this increment:
+
+```text
+166 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.

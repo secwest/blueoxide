@@ -466,11 +466,42 @@ lossless packet and plaintext-hint fields as offline `decode-data`, and records
 the asserted PHY in PCAPNG. Access address, CRC initialization, channel, and
 PHY are caller-supplied connection state.
 
+When an external observer can assert that every decoded packet is a central
+transmission, the same fixed-channel capture can associate packet timestamps
+with connection events:
+
+```text
+cargo run --release -- capture-data \
+  --device bladerf \
+  --channel 31 \
+  --sample-rate 4000000 \
+  --bandwidth 2000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --assert-central-observations \
+  --first-event 0 \
+  --channel-map ffffffff1f \
+  --csa 2 \
+  --interval 24 \
+  --seconds 30
+```
+
+`--assert-central-observations` is a caller assertion, not packet-direction
+detection. A peripheral response must not be supplied as an event anchor. The
+configured first event must select the tuned channel; later candidates are
+searched from the current event through at most `--max-event-advance` event
+advances using the asserted channel map, CSA state, connection interval, peer
+sleep-clock accuracy, and receiver clock-error bound. Matches produce
+`central_connection_event` records with event, timing-window, and missed-event
+details. Rejected candidates are reported but do not mutate event state,
+suppress the raw packet, stop capture, or prevent PCAPNG output.
+
 This command remains tuned to one channel for the full capture. It does not
 follow the connection hop sequence, infer packet direction, decrypt traffic,
-reassemble L2CAP, or apply tracked channel/PHY changes to the radio. Its output
-is authoritative for packets received on that tuned channel, not for the
-complete connection when transmissions occur elsewhere.
+reassemble L2CAP, automatically apply decoded LL control procedures, or apply
+tracked channel/PHY changes to the radio. Its output is authoritative for
+packets received on that tuned channel, not for the complete connection when
+transmissions occur elsewhere.
 
 The bladeRF backend loads the vendor library at runtime, so the project still
 builds and its DSP/protocol tests run without an installed SDR SDK. The default

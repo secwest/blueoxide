@@ -1158,3 +1158,41 @@ Raw CRC-valid packets are printed and written to PCAPNG with their asserted
 PHY. As in undecrypted offline decoding, LL control and L2CAP interpretations
 are labeled plaintext hints; malformed semantic views are reported without
 stopping lossless capture.
+
+## 2026-07-22: Associate asserted live central packets with fixed-channel events
+
+### Direction boundary
+
+A receiver tuned to one data channel cannot determine central-to-peripheral
+direction from an isolated CRC-valid PDU. Live event association is therefore
+disabled unless the caller supplies `--assert-central-observations`. Under that
+option every decoded packet is treated as a central-transmission candidate; a
+peripheral response must not be passed through this mode as an anchor.
+
+The caller also supplies the first event counter, channel map, CSA selection,
+connection interval, and optional timing/search bounds. Configuration is
+rejected before native-library loading unless the asserted first event selects
+the tuned channel. This prevents the first arbitrary packet from anchoring an
+internally inconsistent hopping sequence.
+
+### State and failure policy
+
+The first asserted candidate anchors the supplied event counter at its exact
+access-address sample. Later candidates use the existing clock-widened,
+bounded `ConnectionTracker::synchronize_observation` search. That search works
+on cloned tracker state and commits only a unique match, so a rejected
+same-event packet, wrong-time candidate, or unmatched recurrence cannot advance
+or re-anchor the live tracker.
+
+Raw packet delivery remains the primary capture contract. Event-association
+failure is counted and reported, but it does not suppress packet text, skip
+PCAPNG serialization, terminate the SDR stream, or discard later candidates.
+Successful matches report the event counter, selected channel, expected and
+observed samples, timing error, clock-widened bounds, and skipped-event count.
+
+### Deliberate limits
+
+This bridge does not infer direction, retune among hop channels, switch the
+demodulator PHY, or automatically schedule decoded channel-map, connection-
+parameter, or PHY control procedures. Those require direction-aware packet
+routing and timed radio control beyond a fixed-channel receive stream.
