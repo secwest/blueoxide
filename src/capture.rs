@@ -1,7 +1,8 @@
-use crate::ble::BleChannel;
+use crate::ble::{BleChannel, LeFrameConfig, LePduLayout};
 use crate::complex::Complex32;
 use crate::demod::{
-    Le1mDemodConfig, Le1mStreamDecoder, ReceivedAdvertisingPdu, SampleDiscontinuity,
+    Le1mDemodConfig, Le1mStreamDecoder, LeUncodedDemodConfig, LeUncodedPacketStreamDecoder,
+    ReceivedAdvertisingPdu, ReceivedLePdu, SampleDiscontinuity,
 };
 use crate::sdr::{IqSource, SdrConfig};
 use crate::{Error, Result};
@@ -52,6 +53,12 @@ pub struct CapturedAdvertisingPdu {
     pub relative_sample_index: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct CapturedDataChannelPdu {
+    pub observation: ReceivedLePdu,
+    pub relative_sample_index: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CaptureStats {
     pub samples_received: u64,
@@ -61,6 +68,69 @@ pub struct CaptureStats {
     pub discontinuities: u64,
     pub first_hardware_sample: Option<u64>,
     pub last_hardware_sample: Option<u64>,
+}
+
+trait CaptureObservation {
+    fn access_address_sample(&self) -> u64;
+}
+
+impl CaptureObservation for ReceivedAdvertisingPdu {
+    fn access_address_sample(&self) -> u64 {
+        self.access_address_sample
+    }
+}
+
+impl CaptureObservation for ReceivedLePdu {
+    fn access_address_sample(&self) -> u64 {
+        self.access_address_sample
+    }
+}
+
+struct CaptureDecodeBatch<T> {
+    packets: Vec<T>,
+    discontinuity: Option<SampleDiscontinuity>,
+}
+
+trait CaptureStreamDecoder {
+    type Observation: CaptureObservation;
+
+    fn push_capture(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<CaptureDecodeBatch<Self::Observation>>;
+}
+
+impl CaptureStreamDecoder for Le1mStreamDecoder {
+    type Observation = ReceivedAdvertisingPdu;
+
+    fn push_capture(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<CaptureDecodeBatch<Self::Observation>> {
+        let batch = self.push(first_sample_index, input)?;
+        Ok(CaptureDecodeBatch {
+            packets: batch.packets,
+            discontinuity: batch.discontinuity,
+        })
+    }
+}
+
+impl CaptureStreamDecoder for LeUncodedPacketStreamDecoder {
+    type Observation = ReceivedLePdu;
+
+    fn push_capture(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<CaptureDecodeBatch<Self::Observation>> {
+        let batch = self.push(first_sample_index, input)?;
+        Ok(CaptureDecodeBatch {
+            packets: batch.packets,
+            discontinuity: batch.discontinuity,
+        })
+    }
 }
 
 pub fn capture_primary_advertising<S, F>(
@@ -75,21 +145,88 @@ where
     S: IqSource,
     F: FnMut(&CapturedAdvertisingPdu) -> Result<()>,
 {
-    limits.validate()?;
-    if radio_config.sample_rate_hz != demod_config.sample_rate_hz {
+    let decoder = Le1mStreamDecoder::new(ble_channel, demod_config)?;
+    capture_with_decoder(
+        source,
+        radio_config,
+        demod_config.sample_rate_hz,
+        decoder,
+        limits,
+        |observation, relative_sample_index| {
+            on_packet(&CapturedAdvertisingPdu {
+                observation,
+                relative_sample_index,
+            })
+        },
+    )
+}
+
+pub fn capture_data_channel<S, F>(
+    source: &mut S,
+    radio_config: &SdrConfig,
+    ble_channel: BleChannel,
+    frame_config: LeFrameConfig,
+    demod_config: LeUncodedDemodConfig,
+    limits: CaptureLimits,
+    mut on_packet: F,
+) -> Result<CaptureStats>
+where
+    S: IqSource,
+    F: FnMut(&CapturedDataChannelPdu) -> Result<()>,
+{
+    if ble_channel.index() > 36 {
         return Err(Error::InvalidConfiguration(format!(
-            "radio sample rate {} does not match demodulator sample rate {}",
-            radio_config.sample_rate_hz, demod_config.sample_rate_hz
+            "data capture requires a channel in 0..=36; got {}",
+            ble_channel.index()
         )));
     }
-    let decoder = Le1mStreamDecoder::new(ble_channel, demod_config)?;
+    if frame_config.layout != LePduLayout::Data {
+        return Err(Error::InvalidConfiguration(
+            "data capture requires LE data-channel frame configuration".to_owned(),
+        ));
+    }
+    let decoder = LeUncodedPacketStreamDecoder::new(ble_channel, frame_config, demod_config)?;
+    capture_with_decoder(
+        source,
+        radio_config,
+        demod_config.sample_rate_hz,
+        decoder,
+        limits,
+        |observation, relative_sample_index| {
+            on_packet(&CapturedDataChannelPdu {
+                observation,
+                relative_sample_index,
+            })
+        },
+    )
+}
+
+fn capture_with_decoder<S, D, F>(
+    source: &mut S,
+    radio_config: &SdrConfig,
+    demodulator_sample_rate_hz: u32,
+    decoder: D,
+    limits: CaptureLimits,
+    mut on_packet: F,
+) -> Result<CaptureStats>
+where
+    S: IqSource,
+    D: CaptureStreamDecoder,
+    F: FnMut(D::Observation, u64) -> Result<()>,
+{
+    limits.validate()?;
+    if radio_config.sample_rate_hz != demodulator_sample_rate_hz {
+        return Err(Error::InvalidConfiguration(format!(
+            "radio sample rate {} does not match demodulator sample rate {demodulator_sample_rate_hz}",
+            radio_config.sample_rate_hz
+        )));
+    }
     source.configure(radio_config)?;
     if let Some(applied_sample_rate_hz) = source.applied_sample_rate_hz()
-        && applied_sample_rate_hz != demod_config.sample_rate_hz
+        && applied_sample_rate_hz != demodulator_sample_rate_hz
     {
         return Err(Error::InvalidConfiguration(format!(
-            "SDR applied sample rate {applied_sample_rate_hz} Hz does not match demodulator sample rate {} Hz",
-            demod_config.sample_rate_hz
+            "SDR applied sample rate {applied_sample_rate_hz} Hz does not match demodulator sample rate {demodulator_sample_rate_hz} Hz"
         )));
     }
     source.start()?;
@@ -103,15 +240,16 @@ where
     }
 }
 
-fn capture_loop<S, F>(
+fn capture_loop<S, D, F>(
     source: &mut S,
-    mut decoder: Le1mStreamDecoder,
+    mut decoder: D,
     limits: CaptureLimits,
     on_packet: &mut F,
 ) -> Result<CaptureStats>
 where
     S: IqSource,
-    F: FnMut(&CapturedAdvertisingPdu) -> Result<()>,
+    D: CaptureStreamDecoder,
+    F: FnMut(D::Observation, u64) -> Result<()>,
 {
     let mut buffer = vec![Complex32::ZERO; limits.block_samples];
     let started = Instant::now();
@@ -163,24 +301,21 @@ where
             .checked_add(count as u64)
             .and_then(|value| value.checked_sub(1));
 
-        let batch = decoder.push(metadata.first_sample_index, &buffer[..count])?;
+        let batch = decoder.push_capture(metadata.first_sample_index, &buffer[..count])?;
         if batch.discontinuity.is_some() {
             stats.discontinuities += 1;
         }
         for observation in batch.packets {
-            let relative_sample_index = observation
-                .access_address_sample
+            let access_address_sample = observation.access_address_sample();
+            let relative_sample_index = access_address_sample
                 .checked_sub(first_hardware_sample)
                 .ok_or_else(|| {
                     Error::InvalidInput(format!(
                         "hardware sample counter moved before capture origin: {} < {}",
-                        observation.access_address_sample, first_hardware_sample
+                        access_address_sample, first_hardware_sample
                     ))
                 })?;
-            on_packet(&CapturedAdvertisingPdu {
-                observation,
-                relative_sample_index,
-            })?;
+            on_packet(observation, relative_sample_index)?;
             stats.packets_decoded += 1;
         }
     }
@@ -282,12 +417,47 @@ mod tests {
         bits.extend(bytes_to_bits_lsb(&LE_ADV_ACCESS_ADDRESS.to_le_bytes()));
         bits.extend(body);
 
+        modulate_uncoded(&bits, 4, 250_000.0, 4_000_000.0)
+    }
+
+    fn modulated_data_channel_packet() -> Vec<Complex32> {
+        let channel = BleChannel::new(12).unwrap();
+        // Scapy commit de3399269bad8c9a6bfb1dc181c3876340c198b8
+        // independently produced CRC 421893 for this CTE-bearing body.
+        let mut pdu = vec![
+            0x3e, 0x09, 0x85, 0x05, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00, 0x02, 0x00,
+        ];
+        pdu.extend_from_slice(&[0x42, 0x18, 0x93]);
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+        let mut bits = bytes_to_bits_lsb(&[0xaa]);
+        bits.extend(bytes_to_bits_lsb(&0x1234_5678u32.to_le_bytes()));
+        bits.extend(body);
+        modulate_uncoded(&bits, 4, 250_000.0, 4_000_000.0)
+    }
+
+    fn modulated_le_2m_data_channel_packet() -> Vec<Complex32> {
+        // BTLE commit 85401861e8f4b04b90cbaa0394c0f9d45ed02f18
+        // independently generated these complete channel-12 over-air bytes.
+        let over_air = [
+            0xaa, 0xaa, 0x78, 0x56, 0x34, 0x12, 0x2e, 0xe8, 0xf3, 0xc7, 0x89, 0xd2, 0x5d, 0xa0,
+            0x3d, 0x55, 0xe5, 0x3c,
+        ];
+        modulate_uncoded(&bytes_to_bits_lsb(&over_air), 4, 500_000.0, 8_000_000.0)
+    }
+
+    fn modulate_uncoded(
+        bits: &[bool],
+        samples_per_symbol: usize,
+        deviation_hz: f32,
+        sample_rate_hz: f32,
+    ) -> Vec<Complex32> {
         let mut phase = 0.0f32;
         let mut samples = vec![Complex32::new(1.0, 0.0); 7];
         for bit in bits {
-            let frequency = if bit { 250_000.0 } else { -250_000.0 };
-            let step = TAU * frequency / 4_000_000.0;
-            for _ in 0..4 {
+            let frequency = if *bit { deviation_hz } else { -deviation_hz };
+            let step = TAU * frequency / sample_rate_hz;
+            for _ in 0..samples_per_symbol {
                 phase += step;
                 samples.push(Complex32::new(phase.cos(), phase.sin()));
             }
@@ -355,6 +525,142 @@ mod tests {
         assert_eq!(stats.packets_decoded, 1);
         assert_eq!(packets.len(), 1);
         assert!(packets[0].relative_sample_index < total_samples);
+    }
+
+    #[test]
+    fn captures_cte_bearing_data_packet_across_backend_blocks() {
+        let samples = modulated_data_channel_packet();
+        let split = samples.len() / 4;
+        let chunks = [
+            samples[..split].to_vec(),
+            samples[split..split * 2].to_vec(),
+            samples[split * 2..split * 3].to_vec(),
+            samples[split * 3..].to_vec(),
+        ];
+        let mut next = 70_000u64;
+        let mut blocks = VecDeque::new();
+        for chunk in chunks {
+            let metadata = ReadMetadata {
+                first_sample_index: next,
+                dropped_samples_before: 0,
+                overrun: false,
+            };
+            next += chunk.len() as u64;
+            blocks.push_back((metadata.first_sample_index, chunk, metadata));
+        }
+        let total_samples = samples.len() as u64;
+        let mut source = MockSource {
+            blocks,
+            configured: false,
+            running: false,
+            stopped: false,
+            applied_sample_rate_hz: None,
+        };
+        let mut packets = Vec::new();
+        let stats = capture_data_channel(
+            &mut source,
+            &SdrConfig {
+                center_frequency_hz: 2_430_000_000,
+                sample_rate_hz: 4_000_000,
+                bandwidth_hz: 2_000_000,
+                gain_db: 20.0,
+                channel: 0,
+            },
+            BleChannel::new(12).unwrap(),
+            LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap(),
+            LeUncodedDemodConfig {
+                phy: crate::demod::LeUncodedPhy::Le1M,
+                sample_rate_hz: 4_000_000,
+                max_access_address_errors: 0,
+            },
+            CaptureLimits {
+                maximum_samples: Some(total_samples),
+                maximum_duration: None,
+                read_timeout: Duration::from_millis(100),
+                block_samples: samples.len(),
+            },
+            |packet| {
+                packets.push(packet.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(source.stopped);
+        assert_eq!(stats.samples_received, total_samples);
+        assert_eq!(stats.packets_decoded, 1);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].observation.pdu.header, [0x3e, 0x09]);
+        assert_eq!(packets[0].observation.pdu.cte_info, Some(0x85));
+        assert_eq!(
+            packets[0].observation.pdu.payload,
+            [0x05, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00, 0x02, 0x00]
+        );
+        assert_eq!(packets[0].observation.pdu.crc, [0x42, 0x18, 0x93]);
+        assert!(packets[0].relative_sample_index < total_samples);
+    }
+
+    #[test]
+    fn captures_independent_le_2m_data_vector() {
+        let samples = modulated_le_2m_data_channel_packet();
+        let total_samples = samples.len() as u64;
+        let mut blocks = VecDeque::new();
+        blocks.push_back((
+            90_000,
+            samples,
+            ReadMetadata {
+                first_sample_index: 90_000,
+                dropped_samples_before: 0,
+                overrun: false,
+            },
+        ));
+        let mut source = MockSource {
+            blocks,
+            configured: false,
+            running: false,
+            stopped: false,
+            applied_sample_rate_hz: Some(8_000_000),
+        };
+        let mut packets = Vec::new();
+        let stats = capture_data_channel(
+            &mut source,
+            &SdrConfig {
+                center_frequency_hz: 2_430_000_000,
+                sample_rate_hz: 8_000_000,
+                bandwidth_hz: 4_000_000,
+                gain_db: 20.0,
+                channel: 0,
+            },
+            BleChannel::new(12).unwrap(),
+            LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap(),
+            LeUncodedDemodConfig {
+                phy: crate::demod::LeUncodedPhy::Le2M,
+                sample_rate_hz: 8_000_000,
+                max_access_address_errors: 0,
+            },
+            CaptureLimits {
+                maximum_samples: Some(total_samples),
+                maximum_duration: None,
+                read_timeout: Duration::from_millis(100),
+                block_samples: total_samples as usize,
+            },
+            |packet| {
+                packets.push(packet.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(source.stopped);
+        assert_eq!(stats.packets_decoded, 1);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].observation.phy, crate::demod::LeUncodedPhy::Le2M);
+        assert_eq!(packets[0].observation.pdu.header, [0x02, 0x07]);
+        assert_eq!(
+            packets[0].observation.pdu.payload,
+            [0x03, 0x00, 0x04, 0x00, 0x0a, 0x01, 0x00]
+        );
+        assert_eq!(packets[0].observation.pdu.crc, [0xf2, 0x83, 0x8c]);
     }
 
     #[test]
@@ -436,6 +742,77 @@ mod tests {
             |_| Ok(()),
         );
         assert!(result.unwrap_err().to_string().contains("37, 38, or 39"));
+        assert!(!source.configured);
+        assert!(!source.running);
+    }
+
+    #[test]
+    fn validates_data_channel_before_configuring_source() {
+        let mut source = MockSource {
+            blocks: VecDeque::new(),
+            configured: false,
+            running: false,
+            stopped: false,
+            applied_sample_rate_hz: None,
+        };
+        let result = capture_data_channel(
+            &mut source,
+            &SdrConfig {
+                center_frequency_hz: 2_402_000_000,
+                sample_rate_hz: 4_000_000,
+                bandwidth_hz: 2_000_000,
+                gain_db: 20.0,
+                channel: 0,
+            },
+            BleChannel::new(37).unwrap(),
+            LeFrameConfig::data(0x1234_5678, 0x00ab_cdef).unwrap(),
+            LeUncodedDemodConfig {
+                phy: crate::demod::LeUncodedPhy::Le1M,
+                sample_rate_hz: 4_000_000,
+                max_access_address_errors: 0,
+            },
+            CaptureLimits {
+                maximum_samples: Some(1),
+                maximum_duration: None,
+                read_timeout: Duration::from_millis(100),
+                block_samples: 1,
+            },
+            |_| Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("0..=36"));
+        assert!(!source.configured);
+        assert!(!source.running);
+
+        let result = capture_data_channel(
+            &mut source,
+            &SdrConfig {
+                center_frequency_hz: 2_430_000_000,
+                sample_rate_hz: 4_000_000,
+                bandwidth_hz: 2_000_000,
+                gain_db: 20.0,
+                channel: 0,
+            },
+            BleChannel::new(12).unwrap(),
+            LeFrameConfig::advertising(),
+            LeUncodedDemodConfig {
+                phy: crate::demod::LeUncodedPhy::Le1M,
+                sample_rate_hz: 4_000_000,
+                max_access_address_errors: 0,
+            },
+            CaptureLimits {
+                maximum_samples: Some(1),
+                maximum_duration: None,
+                read_timeout: Duration::from_millis(100),
+                block_samples: 1,
+            },
+            |_| Ok(()),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("data-channel frame configuration")
+        );
         assert!(!source.configured);
         assert!(!source.running);
     }

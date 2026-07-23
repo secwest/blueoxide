@@ -1159,6 +1159,59 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Fixed-channel live data-capture verification
+
+The live data test uses the exact channel-12 body:
+
+```text
+Header + CTEInfo + payload: 3e0985050004000a01000200
+CRC init:                    abcdef
+Transmitted CRC:             421893
+```
+
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8` was loaded directly
+from the pinned source tree and independently returned `421893` from
+`BTLE.compute_crc`. The nearby historical `0c` ATT opcode vector remains a
+different body with CRC `d482c9`; the two fixtures are intentionally not
+interchanged.
+
+The fixed bytes use the independent CRC rather than a value produced by
+Blueoxide's CRC implementation, then are whitened and modulated into LE 1M I/Q.
+A mock SDR delivers the waveform in four hardware-timestamped blocks starting
+at sample 70000.
+`capture_data_channel` must recover exactly one packet, preserve header
+`3e09`, CTEInfo `85`, all nine Length-counted payload octets, and CRC `421893`,
+report a capture-relative packet position, account for every input sample, and
+stop the source.
+
+The same capture API also receives the complete independent LE 2M over-air
+vector from the earlier PHY section at 8 Msps. That test bypasses Blueoxide's
+CRC and whitening generation, requires PHY `LE-2M`, recovers header `0207`,
+the seven-octet ATT-bearing payload, and CRC `f2838c`, and verifies the
+hardware-applied 8 MHz rate before source start.
+
+Separate tests reject advertising channel 37, a missing access address, a CRC
+initializer wider than 24 bits, and an LE 2M sample rate not divisible by
+2 MHz before native-library loading. A valid 8 Msps LE 2M `capture-data`
+configuration reaches the bladeRF loader, where a deterministic missing-
+library override proves command dispatch without requiring attached hardware.
+
+Final local gate for this increment:
+
+```text
+164 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.

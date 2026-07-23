@@ -73,6 +73,114 @@ fn capture_validates_buffer_and_timeout_before_loading_library() {
 }
 
 #[test]
+fn capture_data_validates_connection_before_loading_library() {
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "37",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("data channel in 0..=36"));
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "12",
+        "--crc-init",
+        "0xabcdef",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires --access-address"));
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "12",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0x1000000",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds 24 bits"));
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "bladerf",
+        "--channel",
+        "12",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+        "--phy",
+        "2m",
+        "--sample-rate",
+        "3000000",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("integer multiple of 2000000 Hz"));
+
+    let output = run(&[
+        "capture-data",
+        "--device",
+        "unknown",
+        "--channel",
+        "12",
+        "--access-address",
+        "0x12345678",
+        "--crc-init",
+        "0xabcdef",
+    ]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("capture-data device \"unknown\" is not implemented")
+    );
+}
+
+#[test]
+fn capture_data_valid_configuration_reaches_native_backend() {
+    let missing = std::env::temp_dir().join("blueoxide-data-library-that-does-not-exist.dll");
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "capture-data",
+            "--device",
+            "bladerf",
+            "--channel",
+            "12",
+            "--access-address",
+            "0x12345678",
+            "--crc-init",
+            "0xabcdef",
+            "--phy",
+            "2m",
+            "--sample-rate",
+            "8000000",
+            "--seconds",
+            "0.001",
+        ])
+        .env("BLUEOXIDE_BLADERF_LIBRARY", &missing)
+        .output()
+        .expect("run blueoxide");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to load native library"));
+    assert!(stderr.contains(&missing.to_string_lossy().to_string()));
+}
+
+#[test]
 fn capture_missing_library_is_reported_as_an_error() {
     let missing = std::env::temp_dir().join("blueoxide-library-that-does-not-exist.dll");
     let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))

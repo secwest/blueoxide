@@ -5,7 +5,8 @@ use blueoxide::backends::limesdr::{LimeSdrOptions, LimeSdrSource};
 use blueoxide::backends::xtrx::{XtrxOptions, XtrxSource};
 use blueoxide::ble::{BleChannel, LeFrameConfig};
 use blueoxide::capture::{
-    CaptureLimits, CaptureStats, CapturedAdvertisingPdu, capture_primary_advertising,
+    CaptureLimits, CaptureStats, CapturedAdvertisingPdu, CapturedDataChannelPdu,
+    capture_data_channel, capture_primary_advertising,
 };
 use blueoxide::demod::{
     Le1mDemodConfig, Le1mStreamDecoder, LeUncodedDemodConfig, LeUncodedPacketStreamDecoder,
@@ -90,6 +91,32 @@ struct CaptureArgs {
     max_access_address_errors: u8,
     output_pcap: Option<PathBuf>,
     capture_start_ns: Option<u64>,
+    frame: CaptureFrame,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CaptureFrame {
+    Advertising,
+    Data {
+        access_address: u32,
+        crc_init: u32,
+        phy: LeUncodedPhy,
+    },
+}
+
+impl CaptureFrame {
+    const fn command_name(self) -> &'static str {
+        match self {
+            Self::Advertising => "capture",
+            Self::Data { .. } => "capture-data",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureCommand {
+    Advertising,
+    Data,
 }
 
 #[derive(Debug)]
@@ -139,6 +166,8 @@ USAGE:
     --channel-map HEX --csa 1|2 --hop N --interval N --sample-rate HZ \
     --connect-sample N --central-observe CHANNEL:SAMPLE [OPTIONS]
   blueoxide capture --device bladerf|limesdr|xtrx --channel 37|38|39 [OPTIONS]
+  blueoxide capture-data --device bladerf|limesdr|xtrx --channel 0..36 \
+    --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
 
 DECODE OPTIONS:
   --format f32le|s16le    Interleaved little-endian I/Q (default: f32le)
@@ -204,6 +233,12 @@ CAPTURE OPTIONS:
   --aa-errors N           Access-address bit errors, 0..=8 (default: 1)
   --output-pcap FILE      Write CRC-valid packets as BLE PCAPNG
   --capture-start-ns N    Override Unix capture start in nanoseconds
+
+CAPTURE-DATA OPTIONS:
+  Uses the CAPTURE OPTIONS above on one fixed data channel.
+  --access-address HEX    Connection access address
+  --crc-init HEX          24-bit connection CRC initialization value
+  --phy 1m|2m             Uncoded LE data PHY (default: 1m)
 "
 }
 
@@ -947,10 +982,13 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
     })
 }
 
-fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
+fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<CaptureArgs> {
     let mut device = None;
     let mut identifier = None;
     let mut channel = None;
+    let mut access_address = None;
+    let mut crc_init = None;
+    let mut phy = LeUncodedPhy::Le1M;
     let mut sample_rate_hz = 4_000_000u32;
     let mut bandwidth_hz = 2_000_000u32;
     let mut gain_db = 30.0f32;
@@ -970,6 +1008,18 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
             "--channel" => {
                 let value = value_after(args, &mut index, "--channel")?;
                 channel = Some(BleChannel::new(parse_number(&value, "--channel")?)?);
+            }
+            "--access-address" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--access-address")?;
+                access_address = Some(parse_u32(&value, "--access-address")?);
+            }
+            "--crc-init" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--crc-init")?;
+                crc_init = Some(parse_u32(&value, "--crc-init")?);
+            }
+            "--phy" if command == CaptureCommand::Data => {
+                let value = value_after(args, &mut index, "--phy")?;
+                phy = parse_uncoded_phy(&value, "--phy")?;
             }
             "--sample-rate" => {
                 let value = value_after(args, &mut index, "--sample-rate")?;
@@ -1031,7 +1081,11 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
             }
             unknown => {
                 return Err(Error::InvalidConfiguration(format!(
-                    "unknown capture option {unknown:?}"
+                    "unknown {} option {unknown:?}",
+                    match command {
+                        CaptureCommand::Advertising => "capture",
+                        CaptureCommand::Data => "capture-data",
+                    }
                 )));
             }
         }
@@ -1053,14 +1107,64 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
             "--gain must be finite".to_owned(),
         ));
     }
+    let command_name = match command {
+        CaptureCommand::Advertising => "capture",
+        CaptureCommand::Data => "capture-data",
+    };
+    let channel = channel
+        .ok_or_else(|| Error::InvalidConfiguration(format!("{command_name} requires --channel")))?;
+    let frame = match command {
+        CaptureCommand::Advertising => {
+            if !channel.is_primary_advertising() {
+                return Err(Error::InvalidConfiguration(format!(
+                    "capture requires BLE advertising channel 37, 38, or 39; got {}",
+                    channel.index()
+                )));
+            }
+            Le1mDemodConfig {
+                sample_rate_hz,
+                max_access_address_errors,
+            }
+            .validate()?;
+            CaptureFrame::Advertising
+        }
+        CaptureCommand::Data => {
+            if channel.index() > 36 {
+                return Err(Error::InvalidConfiguration(format!(
+                    "capture-data requires a data channel in 0..=36; got {}",
+                    channel.index()
+                )));
+            }
+            let access_address = access_address.ok_or_else(|| {
+                Error::InvalidConfiguration(
+                    "capture-data requires --access-address 0xNNNNNNNN".to_owned(),
+                )
+            })?;
+            let crc_init = crc_init.ok_or_else(|| {
+                Error::InvalidConfiguration("capture-data requires --crc-init 0xNNNNNN".to_owned())
+            })?;
+            LeFrameConfig::data(access_address, crc_init)?;
+            LeUncodedDemodConfig {
+                phy,
+                sample_rate_hz,
+                max_access_address_errors,
+            }
+            .validate()?;
+            CaptureFrame::Data {
+                access_address,
+                crc_init,
+                phy,
+            }
+        }
+    };
     Ok(CaptureArgs {
         device: device.ok_or_else(|| {
-            Error::InvalidConfiguration("capture requires --device bladerf|limesdr|xtrx".to_owned())
+            Error::InvalidConfiguration(format!(
+                "{command_name} requires --device bladerf|limesdr|xtrx"
+            ))
         })?,
         identifier,
-        channel: channel.ok_or_else(|| {
-            Error::InvalidConfiguration("capture requires --channel 37|38|39".to_owned())
-        })?,
+        channel,
         sample_rate_hz,
         bandwidth_hz,
         gain_db,
@@ -1071,6 +1175,7 @@ fn parse_capture_args(args: &[String]) -> Result<CaptureArgs> {
         max_access_address_errors,
         output_pcap,
         capture_start_ns,
+        frame,
     })
 }
 
@@ -2506,21 +2611,11 @@ fn capture(args: CaptureArgs) -> Result<()> {
     let device = args.device.to_ascii_lowercase();
     if !matches!(device.as_str(), "bladerf" | "limesdr" | "lime" | "xtrx") {
         return Err(Error::InvalidConfiguration(format!(
-            "capture device {:?} is not implemented; currently available: bladerf, limesdr, xtrx",
+            "{} device {:?} is not implemented; currently available: bladerf, limesdr, xtrx",
+            args.frame.command_name(),
             args.device
         )));
     }
-    if !args.channel.is_primary_advertising() {
-        return Err(Error::InvalidConfiguration(format!(
-            "capture currently requires BLE advertising channel 37, 38, or 39; got {}",
-            args.channel.index()
-        )));
-    }
-    let demod_config = Le1mDemodConfig {
-        sample_rate_hz: args.sample_rate_hz,
-        max_access_address_errors: args.max_access_address_errors,
-    };
-    demod_config.validate()?;
     let radio_config = SdrConfig {
         center_frequency_hz: args.channel.center_frequency_hz(),
         sample_rate_hz: args.sample_rate_hz,
@@ -2533,7 +2628,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         "bladerf" => {
             let mut source =
                 BladeRfSource::open(args.identifier.as_deref(), BladeRfOptions::default())?;
-            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            let stats = capture_from_source(&mut source, &args, &radio_config)?;
             if let Some(applied) = source.applied_config() {
                 eprintln!(
                     "bladeRF applied sample_rate={} bandwidth={}",
@@ -2545,7 +2640,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         "limesdr" | "lime" => {
             let mut source =
                 LimeSdrSource::open(args.identifier.as_deref(), LimeSdrOptions::default())?;
-            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            let stats = capture_from_source(&mut source, &args, &radio_config)?;
             if let Some(applied) = source.applied_config() {
                 eprintln!(
                     "LimeSDR applied sample_rate={} bandwidth={}",
@@ -2556,7 +2651,7 @@ fn capture(args: CaptureArgs) -> Result<()> {
         }
         "xtrx" => {
             let mut source = XtrxSource::open(args.identifier.as_deref(), XtrxOptions::default())?;
-            let stats = capture_from_source(&mut source, &args, &radio_config, demod_config)?;
+            let stats = capture_from_source(&mut source, &args, &radio_config)?;
             if let Some(applied) = source.applied_config() {
                 eprintln!(
                     "XTRX applied sample_rate={} bandwidth={}",
@@ -2582,7 +2677,6 @@ fn capture_from_source<S: IqSource>(
     source: &mut S,
     args: &CaptureArgs,
     radio_config: &SdrConfig,
-    demod_config: Le1mDemodConfig,
 ) -> Result<CaptureStats> {
     let capture_start_ns = args
         .capture_start_ns
@@ -2593,30 +2687,71 @@ fn capture_from_source<S: IqSource>(
         None => None,
     };
 
-    let stats = capture_primary_advertising(
-        source,
-        radio_config,
-        args.channel,
-        demod_config,
-        CaptureLimits {
-            maximum_samples: None,
-            maximum_duration: Some(args.duration),
-            read_timeout: Duration::from_millis(args.read_timeout_ms),
-            block_samples: args.block_samples,
-        },
-        |captured: &CapturedAdvertisingPdu| {
-            print_packet(&captured.observation);
-            if let Some(writer) = &mut pcap {
-                let timestamp = sample_timestamp_ns(
-                    capture_start_ns,
-                    captured.relative_sample_index,
-                    args.sample_rate_hz,
-                )?;
-                writer.write_advertising(&captured.observation, timestamp)?;
-            }
-            Ok(())
-        },
-    )?;
+    let limits = CaptureLimits {
+        maximum_samples: None,
+        maximum_duration: Some(args.duration),
+        read_timeout: Duration::from_millis(args.read_timeout_ms),
+        block_samples: args.block_samples,
+    };
+    let stats = match args.frame {
+        CaptureFrame::Advertising => capture_primary_advertising(
+            source,
+            radio_config,
+            args.channel,
+            Le1mDemodConfig {
+                sample_rate_hz: args.sample_rate_hz,
+                max_access_address_errors: args.max_access_address_errors,
+            },
+            limits,
+            |captured: &CapturedAdvertisingPdu| {
+                print_packet(&captured.observation);
+                if let Some(writer) = &mut pcap {
+                    let timestamp = sample_timestamp_ns(
+                        capture_start_ns,
+                        captured.relative_sample_index,
+                        args.sample_rate_hz,
+                    )?;
+                    writer.write_advertising(&captured.observation, timestamp)?;
+                }
+                Ok(())
+            },
+        )?,
+        CaptureFrame::Data {
+            access_address,
+            crc_init,
+            phy,
+        } => capture_data_channel(
+            source,
+            radio_config,
+            args.channel,
+            LeFrameConfig::data(access_address, crc_init)?,
+            LeUncodedDemodConfig {
+                phy,
+                sample_rate_hz: args.sample_rate_hz,
+                max_access_address_errors: args.max_access_address_errors,
+            },
+            limits,
+            |captured: &CapturedDataChannelPdu| {
+                let data = DataChannelPdu::from(captured.observation.pdu.clone());
+                if let Err(error) = print_data_packet(&captured.observation, &data, true) {
+                    eprintln!(
+                        "live data-channel plaintext-hint decode error: channel={} sample={} error={error}",
+                        data.channel.index(),
+                        captured.observation.access_address_sample
+                    );
+                }
+                if let Some(writer) = &mut pcap {
+                    let timestamp = sample_timestamp_ns(
+                        capture_start_ns,
+                        captured.relative_sample_index,
+                        args.sample_rate_hz,
+                    )?;
+                    writer.write_le(&captured.observation, timestamp)?;
+                }
+                Ok(())
+            },
+        )?,
+    };
     if let Some(writer) = pcap {
         writer.into_inner().flush()?;
     }
@@ -2837,7 +2972,8 @@ fn run() -> Result<()> {
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
         Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),
-        Some("capture") => capture(parse_capture_args(&args[1..])?),
+        Some("capture") => capture(parse_capture_args(&args[1..], CaptureCommand::Advertising)?),
+        Some("capture-data") => capture(parse_capture_args(&args[1..], CaptureCommand::Data)?),
         Some("backends") => {
             backends();
             Ok(())

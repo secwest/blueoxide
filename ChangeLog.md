@@ -146,8 +146,14 @@
 - A finite live-capture loop with sample and duration limits, cross-block
   decoding, capture-relative packet timestamps, and unconditional source stop
   after stream-time failures.
+- A shared live-capture engine for advertising and data decoders, preserving
+  applied-rate checks, exact hardware sample positions, discontinuity/drop
+  accounting, callback failure behavior, and unconditional source stop.
 - `blueoxide backends` and live capture through
   `--device bladerf|limesdr|xtrx`.
+- `blueoxide capture-data` for fixed-channel live LE 1M/2M connection traffic
+  with caller-supplied access address and CRC initializer, lossless data/CTE
+  output, and PHY-tagged BLE PCAPNG.
 - Live CLI validation for duration overflow, zero-sized reads, zero timeouts,
   unsupported devices, and missing native libraries.
 - Unit tests for channel mapping, whitening, CRC, PDU validation, GFSK
@@ -179,7 +185,8 @@
 - The uncoded demodulator requires 2 through 64 samples per symbol and an
   integer multiple of the selected 1 MHz or 2 MHz symbol rate.
 - Hardware-correlated wall-clock time, calibrated RSSI/SNR, live
-  capture-driven connection following and retuning, extended advertising,
+  multi-channel connection following and retuning, automatic routing of live
+  observations into connection state, extended advertising,
   automatic direction/counter inference, LTK selection from pairing state,
   LL encryption start/pause state, bidirectional encryption tracking, stateful
   L2CAP channels, GATT/EATT and pairing state, capture-driven PHY transition

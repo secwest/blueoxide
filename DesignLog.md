@@ -1123,5 +1123,38 @@ arbitrary anchor and schedule one `C2P:P2C:INSTANT` transition;
 CONNECT_IND.
 
 This is offline protocol scheduling, not automatic receive reconfiguration.
-`decode-data` still consumes one channel and one asserted uncoded PHY, and live
-capture still lacks observation delivery plus timed channel/PHY switching.
+At this increment, `decode-data` still consumed one channel and one asserted
+uncoded PHY, while live capture still lacked data observation delivery plus
+timed channel/PHY switching.
+
+## 2026-07-22: Reuse the live capture lifecycle for one data channel
+
+### Shared stream boundary
+
+Advertising and data capture now pass their existing stream decoders through
+one internal capture engine. The engine owns backend configuration, applied
+sample-rate verification, start/read/stop ordering, hardware-counter-relative
+packet positions, dropped-sample and overrun accounting, discontinuity counts,
+and unconditional stop after read or callback failure. Decoder adapters only
+normalize packet batches; they do not duplicate source lifecycle logic.
+
+The public `capture_data_channel` entry point validates channels 0 through 36,
+requires a typed data-channel `LeFrameConfig`, and accepts the same explicit
+LE 1M/2M demodulator configuration as `decode-data`. The CLI constructs that
+frame configuration from the caller's access address and CRC initializer.
+`CapturedDataChannelPdu` retains both the absolute hardware access-address
+sample and its capture-relative position for timestamp output.
+
+### Fixed-tuning policy
+
+`capture-data` deliberately configures one BLE data-channel center frequency
+for the whole finite capture. It does not claim connection following: packets
+on other hop channels are absent, direction is not inferred, and decoded
+control procedures do not retune the source or replace the asserted PHY.
+This provides real backend delivery into the generalized data decoder while
+keeping timed retuning or wideband channelization as an explicit later layer.
+
+Raw CRC-valid packets are printed and written to PCAPNG with their asserted
+PHY. As in undecrypted offline decoding, LL control and L2CAP interpretations
+are labeled plaintext hints; malformed semantic views are reported without
+stopping lossless capture.

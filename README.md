@@ -64,6 +64,9 @@ The repository now contains a dependency-free, buildable receive core with:
   overflow intervals, and exact timestamp-gap accounting.
 - A finite live-capture pipeline that always stops the source after decode,
   callback, or read failures.
+- Fixed-channel live LE 1M/2M data capture for a caller-supplied connection
+  access address and CRC initializer, with exact hardware sample positions and
+  BLE PCAPNG output.
 
 The older root-level SDR and channelizer files are historical prototypes. They
 are not part of the Cargo build because they depend on unverified crates, use
@@ -441,6 +444,34 @@ cargo run --release -- capture \
   --output-pcap capture.pcapng
 ```
 
+Capture one fixed connection data channel with any supported backend:
+
+```text
+cargo run --release -- capture-data \
+  --device bladerf \
+  --channel 12 \
+  --phy 2m \
+  --sample-rate 8000000 \
+  --bandwidth 4000000 \
+  --access-address 0x12345678 \
+  --crc-init 0xabcdef \
+  --seconds 30 \
+  --output-pcap connection-channel-12.pcapng
+```
+
+`capture-data` uses the same finite, timestamped SDR lifecycle as advertising
+capture, but instantiates the generalized data-channel decoder. It accepts LE
+1M or LE 2M, retains CP/CTEInfo at the correct frame boundary, prints the same
+lossless packet and plaintext-hint fields as offline `decode-data`, and records
+the asserted PHY in PCAPNG. Access address, CRC initialization, channel, and
+PHY are caller-supplied connection state.
+
+This command remains tuned to one channel for the full capture. It does not
+follow the connection hop sequence, infer packet direction, decrypt traffic,
+reassemble L2CAP, or apply tracked channel/PHY changes to the radio. Its output
+is authoritative for packets received on that tuned channel, not for the
+complete connection when transmissions occur elsewhere.
+
 The bladeRF backend loads the vendor library at runtime, so the project still
 builds and its DSP/protocol tests run without an installed SDR SDK. The default
 library names are `bladeRF.dll`/`libbladeRF.dll` on Windows,
@@ -503,10 +534,11 @@ supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
 synchronization, instant-based map/parameter updates, and direction-explicit
 ACL decryption, captured LL encryption-material derivation, and plaintext L2CAP
-PDU reassembly are now present; the next receive stages are wideband
-channelization or timed retuning, automatic capture-driven observation
-delivery, applying tracked PHY transitions to demodulator selection, and live
-BLE connection following. Full packet decode is a project requirement:
+PDU reassembly are now present. Fixed-channel live data observations are also
+available; the next receive stages are wideband channelization or timed
+retuning, routing those observations into connection-event state, applying
+tracked PHY transitions to demodulator selection, and full live BLE connection
+following. Full packet decode is a project requirement:
 extended advertising, complete LL procedure state, automatic pairing and LTK
 selection, bidirectional encryption-state tracking, L2CAP channel state,
 stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth Classic
