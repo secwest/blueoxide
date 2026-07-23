@@ -13,11 +13,12 @@ use blueoxide::demod::{
 };
 use blueoxide::iq::{IqFormat, open_iq_file};
 use blueoxide::link_layer::{
-    ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionTracker,
-    ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu,
+    ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionPhyState,
+    ConnectionTracker, ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu,
     DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
     L2capSignalingCommand, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryption, LeAclDecryptionStatus,
-    LeAclDecryptor, LinkDirection, LogicalLinkId, SampleTimingError, SleepClockAccuracy,
+    LeAclDecryptor, LePhy, LinkDirection, LogicalLinkId, PhyUpdateInd, SampleTimingError,
+    SleepClockAccuracy,
 };
 use blueoxide::ll_control::{
     ChannelClassification, CsConfigAction, DecodedControlPdu, LeEncryptionMaterialTracker,
@@ -110,6 +111,8 @@ struct ConnectionPlanArgs {
     window_size: u8,
     window_offset: u16,
     connect_ind_access_address_sample: Option<u64>,
+    initial_phy: ConnectionPhyState,
+    phy_update: Option<PhyUpdateInd>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +176,10 @@ CONNECTION-PLAN OPTIONS:
   --sample-rate HZ        Hardware sample rate
   --anchor-event N        Observed 16-bit event counter (default: 0)
   --anchor-sample N       Observed access-address sample index (default: 0)
+  --c2p-phy 1m|2m|coded  PHY at the anchor, central to peripheral (default: 1m)
+  --p2c-phy 1m|2m|coded  PHY at the anchor, peripheral to central (default: 1m)
+  --phy-update C2P:P2C:INSTANT
+                          Schedule directional PHYs; use unchanged for no change
   --events N              Number of events to print (default: 10)
   --peer-sca N            CONNECT_IND sleep-clock accuracy, 0..=7 (default: 0)
   --receiver-ppm N        Receiver sample-clock error bound (default: 20)
@@ -270,6 +277,50 @@ fn parse_uncoded_phy(value: &str, option: &str) -> Result<LeUncodedPhy> {
     }
 }
 
+fn parse_connection_phy(value: &str, option: &str) -> Result<LePhy> {
+    match value.to_ascii_lowercase().as_str() {
+        "1m" | "le-1m" => Ok(LePhy::Le1M),
+        "2m" | "le-2m" => Ok(LePhy::Le2M),
+        "coded" | "le-coded" => Ok(LePhy::LeCoded),
+        _ => Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for {option}; expected 1m, 2m, or coded"
+        ))),
+    }
+}
+
+fn parse_connection_phy_update(value: &str) -> Result<PhyUpdateInd> {
+    let mut fields = value.split(':');
+    let central_to_peripheral = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --phy-update; expected C2P:P2C:INSTANT".to_owned())
+    })?;
+    let peripheral_to_central = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --phy-update; expected C2P:P2C:INSTANT".to_owned())
+    })?;
+    let instant = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration("invalid --phy-update; expected C2P:P2C:INSTANT".to_owned())
+    })?;
+    if fields.next().is_some() {
+        return Err(Error::InvalidConfiguration(
+            "invalid --phy-update; expected C2P:P2C:INSTANT".to_owned(),
+        ));
+    }
+    let parse_field = |field: &str, option: &str| -> Result<u8> {
+        if matches!(
+            field.to_ascii_lowercase().as_str(),
+            "0" | "same" | "unchanged"
+        ) {
+            Ok(0)
+        } else {
+            Ok(parse_connection_phy(field, option)?.raw())
+        }
+    };
+    PhyUpdateInd::new(
+        parse_field(central_to_peripheral, "--phy-update C2P")?,
+        parse_field(peripheral_to_central, "--phy-update P2C")?,
+        parse_number(instant, "--phy-update instant")?,
+    )
+}
+
 fn parse_channel_map(value: &str) -> Result<DataChannelMap> {
     let hex = value
         .strip_prefix("0x")
@@ -328,6 +379,8 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
     let mut window_size = 1u8;
     let mut window_offset = 0u16;
     let mut connect_ind_access_address_sample = None;
+    let mut initial_phy = ConnectionPhyState::default();
+    let mut phy_update = None;
     let mut index = 0;
 
     while index < args.len() {
@@ -382,6 +435,23 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
             "--anchor-sample" => {
                 let value = value_after(args, &mut index, "--anchor-sample")?;
                 anchor_access_address_sample = parse_number(&value, "--anchor-sample")?;
+            }
+            "--c2p-phy" => {
+                let value = value_after(args, &mut index, "--c2p-phy")?;
+                initial_phy.central_to_peripheral = parse_connection_phy(&value, "--c2p-phy")?;
+            }
+            "--p2c-phy" => {
+                let value = value_after(args, &mut index, "--p2c-phy")?;
+                initial_phy.peripheral_to_central = parse_connection_phy(&value, "--p2c-phy")?;
+            }
+            "--phy-update" => {
+                let update =
+                    parse_connection_phy_update(&value_after(args, &mut index, "--phy-update")?)?;
+                if phy_update.replace(update).is_some() {
+                    return Err(Error::InvalidConfiguration(
+                        "--phy-update may only be supplied once".to_owned(),
+                    ));
+                }
             }
             "--events" => {
                 let value = value_after(args, &mut index, "--events")?;
@@ -476,6 +546,8 @@ fn parse_connection_plan_args(args: &[String]) -> Result<ConnectionPlanArgs> {
         window_size,
         window_offset,
         connect_ind_access_address_sample,
+        initial_phy,
+        phy_update,
     })
 }
 
@@ -1174,11 +1246,15 @@ fn describe_control_pdu(control: ControlPdu<'_>) -> Result<String> {
             value.receive_phys
         ),
         DecodedControlPdu::PhyUpdateInd(value) => format!(
-            "{} opcode=0x{:02x} central_to_peripheral_phy=0x{:02x} peripheral_to_central_phy=0x{:02x} instant={}",
+            "{} opcode=0x{:02x} central_to_peripheral_phy={} peripheral_to_central_phy={} instant={}",
             control.opcode_name(),
             control.opcode,
-            value.central_to_peripheral_phy,
-            value.peripheral_to_central_phy,
+            value
+                .central_to_peripheral_phy
+                .map_or_else(|| "unchanged".to_owned(), |phy| phy.to_string()),
+            value
+                .peripheral_to_central_phy
+                .map_or_else(|| "unchanged".to_owned(), |phy| phy.to_string()),
             value.instant
         ),
         DecodedControlPdu::MinimumUsedChannelsInd(value) => format!(
@@ -2563,7 +2639,7 @@ fn backends() {
 }
 
 fn connection_tracker(args: &ConnectionPlanArgs) -> Result<ConnectionTracker> {
-    ConnectionTracker::new(
+    let mut tracker = ConnectionTracker::new_with_phy(
         ConnectionTrackerConfig {
             access_address: args.access_address,
             channel_selection_algorithm: args.channel_selection_algorithm,
@@ -2574,7 +2650,12 @@ fn connection_tracker(args: &ConnectionPlanArgs) -> Result<ConnectionTracker> {
         },
         args.anchor_event_counter,
         args.anchor_access_address_sample,
-    )
+        args.initial_phy,
+    )?;
+    if let Some(update) = args.phy_update {
+        tracker.schedule_phy_update(update)?;
+    }
+    Ok(tracker)
 }
 
 fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
@@ -2607,10 +2688,12 @@ fn connection_plan(args: ConnectionPlanArgs) -> Result<()> {
                 )
             })?;
         println!(
-            "event={} channel={} frequency_hz={} expected_sample={} earliest_sample={} latest_sample={} widening_samples={}",
+            "event={} channel={} frequency_hz={} central_to_peripheral_phy={} peripheral_to_central_phy={} expected_sample={} earliest_sample={} latest_sample={} widening_samples={}",
             event.event_counter,
             event.channel.index(),
             event.channel.center_frequency_hz(),
+            event.phy.central_to_peripheral,
+            event.phy.peripheral_to_central,
             access_address_sample,
             timing_window.earliest_sample,
             timing_window.latest_sample,
@@ -2656,9 +2739,11 @@ fn print_synchronized_observation(
         SampleTimingError::Late(samples) => format!("late:{samples}"),
     };
     println!(
-        "event={} channel={} observed_sample={} advanced_events={} missed_events={} expected_sample={} timing={} earliest_sample={} latest_sample={} widening_samples={}",
+        "event={} channel={} central_to_peripheral_phy={} peripheral_to_central_phy={} observed_sample={} advanced_events={} missed_events={} expected_sample={} timing={} earliest_sample={} latest_sample={} widening_samples={}",
         observation.event.event_counter,
         observation.event.channel.index(),
+        observation.event.phy.central_to_peripheral,
+        observation.event.phy.peripheral_to_central,
         observed.access_address_sample,
         observation.advanced_events,
         missed_events,
@@ -2671,6 +2756,12 @@ fn print_synchronized_observation(
 }
 
 fn connection_acquire(args: ConnectionPlanArgs) -> Result<()> {
+    if args.initial_phy != ConnectionPhyState::default() {
+        return Err(Error::InvalidConfiguration(
+            "connection-acquire starts at event 0 on LE-1M in both directions; anchor PHY overrides are not accepted"
+                .to_owned(),
+        ));
+    }
     let connect_ind_access_address_sample =
         args.connect_ind_access_address_sample.ok_or_else(|| {
             Error::InvalidConfiguration("connection-acquire requires --connect-sample".to_owned())
@@ -2708,9 +2799,15 @@ fn connection_acquire(args: ConnectionPlanArgs) -> Result<()> {
         args.receiver_clock_accuracy_ppm,
         observed_central,
     )?;
+    if let Some(update) = args.phy_update {
+        tracker.schedule_phy_update(update)?;
+    }
+    let event = tracker.current_event()?;
     println!(
-        "event=0 channel={} central_sample={} connect_ind_sample={} nominal_start_sample={} nominal_end_sample={} earliest_sample={} latest_sample={} widening_samples={}",
+        "event=0 channel={} central_to_peripheral_phy={} peripheral_to_central_phy={} central_sample={} connect_ind_sample={} nominal_start_sample={} nominal_end_sample={} earliest_sample={} latest_sample={} widening_samples={}",
         first_window.channel.index(),
+        event.phy.central_to_peripheral,
+        event.phy.peripheral_to_central,
         first_central_transmission.access_address_sample,
         connect_ind_access_address_sample,
         first_window.nominal_start_sample,

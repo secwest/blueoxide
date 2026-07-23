@@ -204,7 +204,7 @@ Primary controller reference:
 - Project: Zephyr
 - Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
 - Files: `subsys/bluetooth/controller/ll_sw/pdu.h`,
-  `ull_llcp_pdu.c`, and `ull_llcp_internal.h`
+  `ull_llcp_pdu.c`, `ull_llcp_phy.c`, and `ull_llcp_internal.h`
 
 The fixed LL control layouts match Zephyr's packed structures and
 little-endian encode/decode paths:
@@ -213,6 +213,15 @@ little-endian encode/decode paths:
 | --- | ---: | ---: | --- |
 | LL_CONNECTION_UPDATE_IND | `00` | 11 | WinSize, WinOffset, Interval, Latency, Timeout, Instant |
 | LL_CHANNEL_MAP_IND | `01` | 7 | ChM[5], Instant |
+| LL_PHY_UPDATE_IND | `18` | 4 | C-to-P PHY, P-to-C PHY, Instant |
+
+Zephyr defines `PHY_1M`, `PHY_2M`, and `PHY_CODED` as one-hot values
+`0x01`, `0x02`, and `0x04`. Its update validation accepts zero for unchanged,
+accepts at most one of those bits per direction, treats an all-zero update as
+no change, and applies nonzero transmit/receive values according to role when
+the instant is reached. Blueoxide uses the same directional representation and
+keeps LE Coded as valid protocol state even though its demodulator is not yet
+implemented.
 
 Instant ordering follows the Core-derived modulo tests in Zephyr:
 
@@ -231,12 +240,15 @@ Tracker tests additionally verify:
 
 - Channel-map installation before channel selection at the instant.
 - Connection-parameter activation with mandatory anchor reacquisition.
+- Directional PHY installation before returning the instant event.
+- LE 1M/2M/Coded and unchanged field decoding, including invalid `0x03`.
+- No-change PHY updates leaving the pending-instant slot available.
 - Refusal to advance while the new anchor is unknown.
 - Rejection of reached, passed, ambiguous, malformed, and overlapping updates.
 - 16-bit event-counter wrap with a monotonic internal event index.
 - Anchor-relative nearest-sample calculation without cumulative rounding drift.
 - Offline CLI output for Core CSA#2 channels, BLE frequencies, sample timing,
-  malformed maps, and counter wrap.
+  directional PHY state, malformed maps, and counter wrap.
 
 ## Anchor acquisition and clock-window verification
 
@@ -1115,6 +1127,38 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Directional connection PHY verification
+
+The typed control and tracker tests cover exact four-octet
+`LL_PHY_UPDATE_IND` decoding, one-hot LE 1M/2M/Coded values, zero as unchanged,
+invalid multiple-bit values, and the reserved all-unchanged/nonzero-Instant
+combination. Tracker cases apply independent directional values before
+returning the instant event across event-counter wrap, preserve unchanged
+directions, reject overlapping instant procedures, and confirm that a valid
+no-change update does not consume pending state.
+
+The connection CLI tests start at event 65534 and schedule
+`--phy-update 2m:coded:1`, verify LE 1M through event zero and the new
+directional state at event one, assert already-active PHYs at an arbitrary
+planning anchor, reject an invalid all-unchanged update, and reject non-LE-1M
+anchor overrides for CONNECT_IND event-zero acquisition.
+
+Final local gate for this increment:
+
+```text
+161 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+1 advertising decode/PCAPNG integration test
+7 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1128,5 +1172,5 @@ git diff --check
 - Differential tests for extended advertising, data-channel following,
   stateful GATT, EATT, pairing and automatic LTK selection, full LL encryption
   activation/pause state, automatic bidirectional encryption state, automatic
-  PHY-update application, LE Coded PHY, and Bluetooth Classic as those layers
-  are added.
+  capture-driven PHY transition delivery and demodulator switching, LE Coded
+  PHY demodulation, and Bluetooth Classic as those layers are added.

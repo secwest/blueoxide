@@ -42,8 +42,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Validated data-channel maps plus Channel Selection Algorithms #1 and #2,
   including CONNECT_IND ChSel selection and event-counter channel calculation.
 - Anchored connection-event tracking with wrap-safe instant handling, strict
-  LL_CHANNEL_MAP_IND/LL_CONNECTION_UPDATE_IND parsing, and explicit anchor
-  reacquisition after connection-parameter changes.
+  LL_CHANNEL_MAP_IND/LL_CONNECTION_UPDATE_IND/LL_PHY_UPDATE_IND parsing,
+  directional PHY state, and explicit anchor reacquisition after
+  connection-parameter changes.
 - CONNECT_IND event-0 acquisition windows, Core sleep-clock-accuracy mapping,
   receiver-clock widening, missed-event matching, and observation-driven
   re-anchoring.
@@ -135,8 +136,10 @@ to LE 1M. LE 2M uses a 2 Msymbol/s rate, 500 kHz nominal deviation, and a
 two-octet alternating preamble; for example, an 8 Msps recording uses
 `--phy 2m --sample-rate 8000000`. Both uncoded PHYs require an integer
 oversampling ratio from 2 through 64 samples per symbol. The selected PHY is an
-explicit caller assertion: Blueoxide does not infer it from samples or apply an
-observed `LL_PHY_UPDATE_IND` at its instant.
+explicit caller assertion: `decode-data` does not infer it from samples or
+switch demodulators within one recording. The separate connection tracker can
+apply a typed `LL_PHY_UPDATE_IND` to offline directional state at its instant,
+but capture-driven decoder switching is not yet connected.
 
 The connection access address and 24-bit CRC initializer normally come from a
 decoded CONNECT_IND. Data PDUs are emitted only after CRC validation. When the
@@ -336,6 +339,7 @@ cargo run --release -- connection-plan \
   --sample-rate 4000000 \
   --anchor-event 0 \
   --anchor-sample 1000 \
+  --phy-update 2m:unchanged:6 \
   --events 10
 ```
 
@@ -346,7 +350,11 @@ sample without accumulating per-event rounding error. `--hop` selects the
 5-through-16 hop increment for CSA#1. `--peer-sca` accepts the CONNECT_IND SCA
 field from 0 through 7, while `--receiver-ppm` supplies the receiver sample
 clock's worst-case error. Plans include the resulting earliest/latest sample
-bounds.
+bounds and the active central-to-peripheral and peripheral-to-central PHYs.
+`--c2p-phy` and `--p2c-phy` assert the directional state at an arbitrary
+anchor. `--phy-update C2P:P2C:INSTANT` schedules a single update using
+`1m`, `2m`, `coded`, or `unchanged` for each direction. A CONNECT_IND
+acquisition always begins with LE 1M in both directions.
 
 Acquire event 0 from a decoded CONNECT_IND and continue with later CRC-valid
 observations:
@@ -384,11 +392,14 @@ For a connection with an existing anchor, use `connection-sync` with repeated
 state searched for each observation.
 
 The library tracker can schedule decoded `LL_CHANNEL_MAP_IND` and
-`LL_CONNECTION_UPDATE_IND` control PDUs. A channel-map update is applied before
-choosing the channel at its instant. A connection-parameter update deliberately
-returns an anchor-observation-required state at its instant; ordinary
-missed-event searches stop there, and scheduling resumes only after the caller
-supplies the access-address sample actually observed in that event.
+`LL_CONNECTION_UPDATE_IND` control PDUs, plus directional
+`LL_PHY_UPDATE_IND`. A channel-map update is applied before choosing the
+channel at its instant. A PHY update is applied before returning that event and
+preserves any direction encoded as unchanged. A connection-parameter update
+deliberately returns an anchor-observation-required state at its instant;
+ordinary missed-event searches stop there, and scheduling resumes only after
+the caller supplies the access-address sample actually observed in that event.
+The conservative tracker permits only one pending instant-based update.
 
 Capture live BLE advertising traffic from bladeRF RX0:
 
@@ -494,12 +505,13 @@ synchronization, instant-based map/parameter updates, and direction-explicit
 ACL decryption, captured LL encryption-material derivation, and plaintext L2CAP
 PDU reassembly are now present; the next receive stages are wideband
 channelization or timed retuning, automatic capture-driven observation
-delivery, automatic PHY-update application, and live BLE connection following.
-Full packet decode is a project requirement: extended advertising, complete LL
-procedure state, automatic pairing and LTK selection, bidirectional
-encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
-LE Coded PHY, and Bluetooth Classic BR/EDR layers will be added incrementally
-while retaining undecoded packet bytes losslessly.
+delivery, applying tracked PHY transitions to demodulator selection, and live
+BLE connection following. Full packet decode is a project requirement:
+extended advertising, complete LL procedure state, automatic pairing and LTK
+selection, bidirectional encryption-state tracking, L2CAP channel state,
+stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth Classic
+BR/EDR layers will be added incrementally while retaining undecoded packet
+bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

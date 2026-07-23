@@ -5,6 +5,7 @@ use crate::link_layer::{
 use crate::{Error, Result};
 
 mod cs;
+pub use crate::link_layer::{LePhy, PhyUpdateInd};
 pub use cs::*;
 
 pub const LE_FEATURE_PAGE_OCTETS: usize = 24;
@@ -342,13 +343,6 @@ pub struct DataLengthPdu {
 pub struct PhyPreferences {
     pub transmit_phys: u8,
     pub receive_phys: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhyUpdateInd {
-    pub central_to_peripheral_phy: u8,
-    pub peripheral_to_central_phy: u8,
-    pub instant: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -915,33 +909,9 @@ fn parse_phy_preferences(control: ControlPdu<'_>) -> Result<PhyPreferences> {
 }
 
 fn parse_phy_update(control: ControlPdu<'_>) -> Result<PhyUpdateInd> {
-    require_length(control, 4)?;
-    let value = PhyUpdateInd {
-        central_to_peripheral_phy: control.parameters[0],
-        peripheral_to_central_phy: control.parameters[1],
-        instant: le_u16(control.parameters, 2),
-    };
-    validate_phy_mask(
-        value.central_to_peripheral_phy,
-        true,
-        false,
-        "LL_PHY_UPDATE_IND central-to-peripheral",
-    )?;
-    validate_phy_mask(
-        value.peripheral_to_central_phy,
-        true,
-        false,
-        "LL_PHY_UPDATE_IND peripheral-to-central",
-    )?;
-    if value.central_to_peripheral_phy == 0
-        && value.peripheral_to_central_phy == 0
-        && value.instant != 0
-    {
-        return Err(Error::InvalidInput(
-            "LL_PHY_UPDATE_IND reserves Instant when neither PHY changes".to_owned(),
-        ));
-    }
-    Ok(value)
+    control
+        .phy_update_ind()?
+        .ok_or_else(|| Error::InvalidInput("control PDU is not LL_PHY_UPDATE_IND".to_owned()))
 }
 
 fn parse_minimum_used_channels(control: ControlPdu<'_>) -> Result<MinimumUsedChannelsInd> {
@@ -1656,6 +1626,14 @@ mod tests {
         assert!(control(0x16, &[0x00, 0x04]).decode().is_err());
         assert!(control(0x18, &[0, 0, 0, 0]).decode().is_ok());
         assert!(control(0x18, &[0, 0, 1, 0]).decode().is_err());
+        let DecodedControlPdu::PhyUpdateInd(update) =
+            control(0x18, &[0x02, 0x04, 6, 0]).decode().unwrap()
+        else {
+            panic!("unexpected decoded command");
+        };
+        assert_eq!(update.central_to_peripheral_phy, Some(LePhy::Le2M));
+        assert_eq!(update.peripheral_to_central_phy, Some(LePhy::LeCoded));
+        assert!(control(0x18, &[0x03, 0, 6, 0]).decode().is_err());
         assert!(control(0x19, &[0x07, 37]).decode().is_ok());
         assert!(control(0x1a, &[0x8a]).decode().is_ok());
         assert!(control(0x1a, &[0xaa]).decode().is_err());

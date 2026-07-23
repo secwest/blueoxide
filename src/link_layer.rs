@@ -218,6 +218,41 @@ impl Display for LinkDirection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LePhy {
+    Le1M = 0x01,
+    Le2M = 0x02,
+    LeCoded = 0x04,
+}
+
+impl LePhy {
+    pub fn from_raw(raw: u8) -> Result<Self> {
+        match raw {
+            0x01 => Ok(Self::Le1M),
+            0x02 => Ok(Self::Le2M),
+            0x04 => Ok(Self::LeCoded),
+            _ => Err(Error::InvalidInput(format!(
+                "LE PHY value 0x{raw:02x} is not one of 0x01, 0x02, or 0x04"
+            ))),
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Display for LePhy {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Le1M => formatter.write_str("LE-1M"),
+            Self::Le2M => formatter.write_str("LE-2M"),
+            Self::LeCoded => formatter.write_str("LE-Coded"),
+        }
+    }
+}
+
 /// Number of MIC octets appended to an encrypted LE ACL payload.
 pub const LE_ACL_MIC_OCTETS: usize = 4;
 /// Exclusive upper bound for the 39-bit LE ACL packet counter.
@@ -1329,6 +1364,23 @@ impl ControlPdu<'_> {
             instant: u16::from_le_bytes([self.parameters[5], self.parameters[6]]),
         }))
     }
+
+    pub fn phy_update_ind(self) -> Result<Option<PhyUpdateInd>> {
+        if self.opcode != 0x18 {
+            return Ok(None);
+        }
+        if self.parameters.len() != 4 {
+            return Err(Error::InvalidInput(format!(
+                "LL_PHY_UPDATE_IND requires 4 parameter octets, received {}",
+                self.parameters.len()
+            )));
+        }
+        Ok(Some(PhyUpdateInd::new(
+            self.parameters[0],
+            self.parameters[1],
+            u16::from_le_bytes([self.parameters[2], self.parameters[3]]),
+        )?))
+    }
 }
 
 pub fn decode_data_channel(
@@ -1531,6 +1583,62 @@ pub struct ChannelMapInd {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhyUpdateInd {
+    pub central_to_peripheral_phy: Option<LePhy>,
+    pub peripheral_to_central_phy: Option<LePhy>,
+    pub instant: u16,
+}
+
+impl PhyUpdateInd {
+    pub fn new(
+        central_to_peripheral_phy: u8,
+        peripheral_to_central_phy: u8,
+        instant: u16,
+    ) -> Result<Self> {
+        let update = Self {
+            central_to_peripheral_phy: optional_update_phy(
+                central_to_peripheral_phy,
+                "central-to-peripheral",
+            )?,
+            peripheral_to_central_phy: optional_update_phy(
+                peripheral_to_central_phy,
+                "peripheral-to-central",
+            )?,
+            instant,
+        };
+        update.validate()?;
+        Ok(update)
+    }
+
+    pub fn validate(self) -> Result<()> {
+        if self.central_to_peripheral_phy.is_none()
+            && self.peripheral_to_central_phy.is_none()
+            && self.instant != 0
+        {
+            return Err(Error::InvalidInput(
+                "LL_PHY_UPDATE_IND reserves Instant when neither PHY changes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn changes_phy(self) -> bool {
+        self.central_to_peripheral_phy.is_some() || self.peripheral_to_central_phy.is_some()
+    }
+}
+
+fn optional_update_phy(raw: u8, direction: &str) -> Result<Option<LePhy>> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    LePhy::from_raw(raw).map(Some).map_err(|_| {
+        Error::InvalidInput(format!(
+            "LL_PHY_UPDATE_IND {direction} PHY 0x{raw:02x} is not unchanged, LE 1M, LE 2M, or LE Coded"
+        ))
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InstantRelation {
     Future(u16),
     Reached,
@@ -1623,7 +1731,36 @@ pub enum ConnectionEventTiming {
 pub struct ConnectionEvent {
     pub event_counter: u16,
     pub channel: BleChannel,
+    pub phy: ConnectionPhyState,
     pub timing: ConnectionEventTiming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionPhyState {
+    pub central_to_peripheral: LePhy,
+    pub peripheral_to_central: LePhy,
+}
+
+impl ConnectionPhyState {
+    pub const fn new(central_to_peripheral: LePhy, peripheral_to_central: LePhy) -> Self {
+        Self {
+            central_to_peripheral,
+            peripheral_to_central,
+        }
+    }
+
+    pub const fn phy(self, direction: LinkDirection) -> LePhy {
+        match direction {
+            LinkDirection::CentralToPeripheral => self.central_to_peripheral,
+            LinkDirection::PeripheralToCentral => self.peripheral_to_central,
+        }
+    }
+}
+
+impl Default for ConnectionPhyState {
+    fn default() -> Self {
+        Self::new(LePhy::Le1M, LePhy::Le1M)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1668,6 +1805,10 @@ enum PendingConnectionUpdate {
         target_event: u64,
         update: ConnectionUpdateInd,
     },
+    Phy {
+        target_event: u64,
+        update: PhyUpdateInd,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1687,6 +1828,7 @@ pub struct ConnectionTracker {
     selector: ConnectionChannelSelector,
     event_counter: u16,
     event_index: u64,
+    phy: ConnectionPhyState,
     timing: TrackerTiming,
     pending: Option<PendingConnectionUpdate>,
 }
@@ -1696,6 +1838,20 @@ impl ConnectionTracker {
         config: ConnectionTrackerConfig,
         observed_event_counter: u16,
         observed_access_address_sample: u64,
+    ) -> Result<Self> {
+        Self::new_with_phy(
+            config,
+            observed_event_counter,
+            observed_access_address_sample,
+            ConnectionPhyState::default(),
+        )
+    }
+
+    pub fn new_with_phy(
+        config: ConnectionTrackerConfig,
+        observed_event_counter: u16,
+        observed_access_address_sample: u64,
+        phy: ConnectionPhyState,
     ) -> Result<Self> {
         config.validate()?;
         let selector = ConnectionChannelSelector::new(
@@ -1709,6 +1865,7 @@ impl ConnectionTracker {
             selector,
             event_counter: observed_event_counter,
             event_index: 0,
+            phy,
             timing: TrackerTiming::Anchored {
                 event_index: 0,
                 access_address_sample: observed_access_address_sample,
@@ -1729,10 +1886,15 @@ impl ConnectionTracker {
         &self.config.channel_map
     }
 
+    pub const fn phy(&self) -> ConnectionPhyState {
+        self.phy
+    }
+
     pub fn current_event(&self) -> Result<ConnectionEvent> {
         Ok(ConnectionEvent {
             event_counter: self.event_counter,
             channel: self.selector.channel_for_event(self.event_counter),
+            phy: self.phy,
             timing: self.current_timing()?,
         })
     }
@@ -1825,6 +1987,14 @@ impl ConnectionTracker {
                 PendingConnectionUpdate::Parameters { update, .. } => {
                     self.config.parameters = update.parameters;
                     self.timing = TrackerTiming::AwaitingAnchor { update };
+                }
+                PendingConnectionUpdate::Phy { update, .. } => {
+                    if let Some(phy) = update.central_to_peripheral_phy {
+                        self.phy.central_to_peripheral = phy;
+                    }
+                    if let Some(phy) = update.peripheral_to_central_phy {
+                        self.phy.peripheral_to_central = phy;
+                    }
                 }
             }
         }
@@ -1945,6 +2115,19 @@ impl ConnectionTracker {
         Ok(())
     }
 
+    pub fn schedule_phy_update(&mut self, update: PhyUpdateInd) -> Result<()> {
+        update.validate()?;
+        if !update.changes_phy() {
+            return Ok(());
+        }
+        let target_event = self.validate_new_instant(update.instant)?;
+        self.pending = Some(PendingConnectionUpdate::Phy {
+            target_event,
+            update,
+        });
+        Ok(())
+    }
+
     pub fn schedule_control(&mut self, control: ControlPdu<'_>) -> Result<bool> {
         if let Some(update) = control.connection_update_ind()? {
             self.schedule_connection_update(update)?;
@@ -1952,6 +2135,10 @@ impl ConnectionTracker {
         }
         if let Some(update) = control.channel_map_ind()? {
             self.schedule_channel_map(update)?;
+            return Ok(true);
+        }
+        if let Some(update) = control.phy_update_ind()? {
+            self.schedule_phy_update(update)?;
             return Ok(true);
         }
         Ok(false)
@@ -1983,7 +2170,8 @@ impl ConnectionTracker {
     fn pending_target_event(&self) -> Option<u64> {
         match &self.pending {
             Some(PendingConnectionUpdate::ChannelMap { target_event, .. })
-            | Some(PendingConnectionUpdate::Parameters { target_event, .. }) => Some(*target_event),
+            | Some(PendingConnectionUpdate::Parameters { target_event, .. })
+            | Some(PendingConnectionUpdate::Phy { target_event, .. }) => Some(*target_event),
             None => None,
         }
     }
@@ -3080,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_connection_update_and_channel_map_control_pdus() {
+    fn parses_instant_based_control_pdus() {
         let connection_update = ControlPdu {
             opcode: 0x00,
             parameters: &[2, 3, 0, 24, 0, 4, 0, 100, 0, 0x34, 0x12],
@@ -3106,6 +3294,17 @@ mod tests {
         .unwrap();
         assert_eq!(channel_map.channel_map.used_channels(), [1, 2]);
         assert_eq!(channel_map.instant, 2);
+
+        let phy_update = ControlPdu {
+            opcode: 0x18,
+            parameters: &[0x02, 0x04, 2, 0],
+        }
+        .phy_update_ind()
+        .unwrap()
+        .unwrap();
+        assert_eq!(phy_update.central_to_peripheral_phy, Some(LePhy::Le2M));
+        assert_eq!(phy_update.peripheral_to_central_phy, Some(LePhy::LeCoded));
+        assert_eq!(phy_update.instant, 2);
 
         assert!(
             ControlPdu {
@@ -3143,6 +3342,22 @@ mod tests {
             parameters: &[0x03, 0, 0, 0, 0, 6],
         };
         assert!(short_map.channel_map_ind().is_err());
+
+        let short_phy = ControlPdu {
+            opcode: 0x18,
+            parameters: &[2, 0, 6],
+        };
+        assert!(short_phy.phy_update_ind().is_err());
+        let multiple_phy = ControlPdu {
+            opcode: 0x18,
+            parameters: &[3, 0, 6, 0],
+        };
+        assert!(multiple_phy.phy_update_ind().is_err());
+        let unchanged_with_instant = ControlPdu {
+            opcode: 0x18,
+            parameters: &[0, 0, 6, 0],
+        };
+        assert!(unchanged_with_instant.phy_update_ind().is_err());
     }
 
     #[test]
@@ -3184,6 +3399,72 @@ mod tests {
                 access_address_sample: 721_000
             }
         );
+    }
+
+    #[test]
+    fn tracker_applies_directional_phy_update_at_wrapped_instant() {
+        let mut tracker = ConnectionTracker::new(
+            tracker_config(ChannelSelectionAlgorithm::Csa2),
+            65_534,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(tracker.phy(), ConnectionPhyState::default());
+        assert!(
+            tracker
+                .schedule_control(ControlPdu {
+                    opcode: 0x18,
+                    parameters: &[0x02, 0x04, 1, 0],
+                })
+                .unwrap()
+        );
+
+        assert_eq!(
+            tracker.advance().unwrap().phy,
+            ConnectionPhyState::default()
+        );
+        assert_eq!(
+            tracker.advance().unwrap().phy,
+            ConnectionPhyState::default()
+        );
+        let event = tracker.advance().unwrap();
+        assert_eq!(event.event_counter, 1);
+        assert_eq!(
+            event.phy,
+            ConnectionPhyState::new(LePhy::Le2M, LePhy::LeCoded)
+        );
+        assert_eq!(
+            event.phy.phy(LinkDirection::CentralToPeripheral),
+            LePhy::Le2M
+        );
+        assert_eq!(
+            event.phy.phy(LinkDirection::PeripheralToCentral),
+            LePhy::LeCoded
+        );
+    }
+
+    #[test]
+    fn no_change_phy_update_does_not_consume_pending_instant_state() {
+        let mut tracker =
+            ConnectionTracker::new(tracker_config(ChannelSelectionAlgorithm::Csa2), 0, 0).unwrap();
+        assert!(
+            tracker
+                .schedule_control(ControlPdu {
+                    opcode: 0x18,
+                    parameters: &[0, 0, 0, 0],
+                })
+                .unwrap()
+        );
+        tracker
+            .schedule_channel_map(ChannelMapInd {
+                channel_map: DataChannelMap::new([0x06, 0, 0, 0, 0]).unwrap(),
+                instant: 1,
+            })
+            .unwrap();
+        let event = tracker.advance().unwrap();
+        assert_eq!(event.event_counter, 1);
+        assert_eq!(tracker.channel_map().used_channels(), [1, 2]);
+        assert_eq!(event.phy, ConnectionPhyState::default());
     }
 
     #[test]
@@ -3282,6 +3563,11 @@ mod tests {
                 .schedule_connection_update(
                     ConnectionUpdateInd::new(1, 0, 24, 0, 100, 102).unwrap()
                 )
+                .is_err()
+        );
+        assert!(
+            tracker
+                .schedule_phy_update(PhyUpdateInd::new(2, 0, 102).unwrap())
                 .is_err()
         );
     }

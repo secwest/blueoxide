@@ -73,6 +73,9 @@
 - Anchored connection-event tracking with 16-bit counter wrapping, Core instant
   ordering, map application before instant-event channel selection, checked
   sample arithmetic, and explicit anchor reacquisition after timing changes.
+- Typed LE 1M, LE 2M, and LE Coded directional connection PHY state with
+  strict `LL_PHY_UPDATE_IND` one-hot/no-change decoding and application before
+  returning the instant event, including event-counter wrap.
 - CONNECT_IND construction of connection trackers and direct scheduling of
   supported decoded LL control PDUs.
 - Core sleep-clock-accuracy ranges, combined peer/receiver clock-widened sample
@@ -104,6 +107,9 @@
 - `blueoxide channels`, `blueoxide decode`, configurable
   `blueoxide decode-data`, and offline `blueoxide connection-plan`,
   `blueoxide connection-acquire`, and `blueoxide connection-sync` commands.
+- Offline connection planning options for asserted directional anchor PHYs and
+  one scheduled `--phy-update C2P:P2C:INSTANT`, with active PHY state included
+  in planned and synchronized event output.
 - Explicit `decode-data --phy 1m|2m` selection with LE 1M as the default,
   selected-PHY sample-rate validation, PHY-tagged packet output, and LE 2M
   PCAPNG pseudo-header metadata.
@@ -176,7 +182,8 @@
   capture-driven connection following and retuning, extended advertising,
   automatic direction/counter inference, LTK selection from pairing state,
   LL encryption start/pause state, bidirectional encryption tracking, stateful
-  L2CAP channels, GATT/EATT and pairing state, automatic PHY-update
-  application, Bluetooth Classic, and LE Coded PHY remain to be implemented.
+  L2CAP channels, GATT/EATT and pairing state, capture-driven PHY transition
+  delivery/demodulator switching, Bluetooth Classic, and LE Coded PHY
+  demodulation remain to be implemented.
 - Channel Sounding and Frame Space LL control syntax is typed, but its
   connection-scoped procedure state is not yet implemented.

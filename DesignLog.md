@@ -591,7 +591,8 @@ selecting that event's channel. At an LL_CONNECTION_UPDATE_IND instant, the new
 interval, latency, and timeout become active, but timing enters an explicit
 anchor-observation-required state carrying WinOffset and WinSize. The tracker
 cannot advance again until the caller supplies the access-address sample
-actually observed at that instant.
+actually observed at that instant. A later increment extends the same pending
+instant model to directional `LL_PHY_UPDATE_IND` state.
 
 ### Hardware boundary
 
@@ -1066,13 +1067,15 @@ Link Layer framing format.
 `decode-data --phy 1m|2m` is an explicit assertion about a recording already
 centered on one known data channel. The decoder validates an integer 2 through
 64 samples per selected-PHY symbol, but it does not classify PHY from I/Q,
-infer packet direction, or correlate a decoded `LL_PHY_UPDATE_IND` with a
-connection event and instant.
+infer packet direction, or switch PHY within one decoder instance. The
+connection tracker described in the next entry can correlate a decoded
+`LL_PHY_UPDATE_IND` with an event and instant, but it does not drive the
+demodulator.
 
-Applying PHY changes automatically belongs with bidirectional connection
-procedure state, event scheduling, and channel following. Live retuning and
-capture-driven observation delivery remain separate work; this increment
-decodes a fixed-PHY offline stream without claiming those capabilities.
+Applying tracked PHY changes to received I/Q belongs with capture-driven
+observation delivery and channel following. Live retuning and decoder switching
+remain separate work; this increment decodes a fixed-PHY offline stream without
+claiming those capabilities.
 
 ### Capture metadata
 
@@ -1081,3 +1084,44 @@ PHY configurations cannot deduplicate together. Text output includes
 `phy=LE-1M` or `phy=LE-2M`, and PCAPNG sets the two-bit PHY field in the
 standard Bluetooth LE Link Layer pseudo-header. Advertising capture continues
 to emit the LE 1M value.
+
+## 2026-07-22: Apply directional PHY state at the connection instant
+
+### Typed state
+
+`LePhy` represents the one-hot Link Layer values `0x01` for LE 1M, `0x02` for
+LE 2M, and `0x04` for LE Coded. `PhyUpdateInd` stores each direction as
+`Option<LePhy>` so zero means unchanged rather than an invented fourth PHY.
+The existing strict control decoder and `ConnectionTracker::schedule_control`
+share this parser, preventing syntax and state paths from disagreeing.
+
+`ConnectionPhyState` keeps central-to-peripheral and
+peripheral-to-central PHYs independently. A tracker created from CONNECT_IND
+starts with LE 1M in both directions. `new_with_phy` exists for a passive
+receiver that establishes an anchor after earlier procedures and therefore
+must assert the already-active directional state.
+
+### Instant policy
+
+A PHY update that changes either direction uses the same wrap-safe future
+instant validation and single-pending-update slot as channel-map and
+connection-parameter updates. The specified directions are installed before
+the instant event is returned; zero fields preserve their existing state. A
+valid no-change PDU has Instant zero, completes without reserving pending state,
+and does not block a later instant-based update.
+
+The tracker represents LE Coded state even though Blueoxide cannot yet
+demodulate LE Coded packets. Protocol state must remain lossless rather than
+silently coercing an unsupported PHY to LE 1M or LE 2M.
+
+### Offline and live boundary
+
+`connection-plan`, `connection-sync`, and `connection-acquire` now print both
+directional PHYs. Planning and synchronization can assert PHY state at an
+arbitrary anchor and schedule one `C2P:P2C:INSTANT` transition;
+`connection-acquire` rejects non-1M initial state because event 0 follows
+CONNECT_IND.
+
+This is offline protocol scheduling, not automatic receive reconfiguration.
+`decode-data` still consumes one channel and one asserted uncoded PHY, and live
+capture still lacks observation delivery plus timed channel/PHY switching.
