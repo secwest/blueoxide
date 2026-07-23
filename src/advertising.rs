@@ -716,7 +716,7 @@ fn decode_extended_advertising_header(pdu: &AdvertisingPdu) -> Result<ExtendedAd
             pdu.header[0] & 0x30
         )));
     }
-    if pdu.header[1] & 0xc0 != 0 {
+    if pdu.channel.is_primary_advertising() && pdu.header[1] & 0xc0 != 0 {
         return Err(Error::InvalidInput(format!(
             "ADV_EXT_IND sets reserved length-header bits 0x{:02x}",
             pdu.header[1] & 0xc0
@@ -886,6 +886,12 @@ fn decode_extended_advertising_header(pdu: &AdvertisingPdu) -> Result<ExtendedAd
 }
 
 pub fn decode_advertising_pdu(pdu: &AdvertisingPdu) -> Result<DecodedAdvertisingPdu> {
+    if !pdu.channel.is_primary_advertising() && pdu.pdu_type() != 7 {
+        return Ok(DecodedAdvertisingPdu::ExtendedOrReserved {
+            pdu_type: pdu.pdu_type(),
+            payload: pdu.payload.clone(),
+        });
+    }
     match pdu.pdu_type() {
         0 => {
             let (advertiser, advertiser_kind, data) = decode_advertiser_and_data(pdu)?;
@@ -1339,6 +1345,46 @@ mod tests {
         assert_eq!(header.flags, 0);
         assert!(header.additional_controller_advertising_data.is_empty());
         assert_eq!(header.advertising_data, [2, 1, 6]);
+    }
+
+    #[test]
+    fn secondary_extended_advertising_accepts_full_length_octet() {
+        let payload = [vec![0, 2, 1, 6], vec![0x55; 66]].concat();
+        let packet = AdvertisingPdu {
+            channel: BleChannel::new(20).unwrap(),
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [7, payload.len() as u8],
+            payload,
+            crc: [0; 3],
+        };
+        let decoded = decode_advertising_pdu(&packet).unwrap();
+        let DecodedAdvertisingPdu::AdvExtInd { header } = decoded else {
+            panic!("expected extended advertising PDU");
+        };
+        assert_eq!(packet.header[1], 70);
+        assert_eq!(header.advertising_data.len(), 69);
+    }
+
+    #[test]
+    fn secondary_legacy_type_is_preserved_without_primary_semantics() {
+        let packet = AdvertisingPdu {
+            channel: BleChannel::new(20).unwrap(),
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [0, 6],
+            payload: vec![1, 2, 3, 4, 5, 6],
+            crc: [0; 3],
+        };
+        assert_eq!(
+            decode_advertising_pdu(&packet).unwrap(),
+            DecodedAdvertisingPdu::ExtendedOrReserved {
+                pdu_type: 0,
+                payload: vec![1, 2, 3, 4, 5, 6],
+            }
+        );
     }
 
     #[test]

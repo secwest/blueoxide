@@ -3,6 +3,7 @@ use crate::{Error, Result};
 pub const LE_ADV_ACCESS_ADDRESS: u32 = 0x8e89_bed6;
 pub const LE_ADV_CRC_INIT: u32 = 0x55_55_55;
 pub const LE_PRIMARY_ADV_MAX_PAYLOAD: usize = 37;
+pub const LE_SECONDARY_ADV_MAX_PAYLOAD: usize = 255;
 pub const LE_DATA_MAX_PAYLOAD: usize = 255;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +53,7 @@ pub struct AdvertisingPdu {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LePduLayout {
     Advertising,
+    SecondaryAdvertising,
     Data,
 }
 
@@ -59,13 +61,14 @@ impl LePduLayout {
     const fn maximum_payload_length(self) -> usize {
         match self {
             Self::Advertising => LE_PRIMARY_ADV_MAX_PAYLOAD,
+            Self::SecondaryAdvertising => LE_SECONDARY_ADV_MAX_PAYLOAD,
             Self::Data => LE_DATA_MAX_PAYLOAD,
         }
     }
 
     const fn additional_header_length(self, header: [u8; 2]) -> usize {
         match self {
-            Self::Advertising => 0,
+            Self::Advertising | Self::SecondaryAdvertising => 0,
             Self::Data => {
                 if header[0] & 0x20 != 0 {
                     1
@@ -78,7 +81,7 @@ impl LePduLayout {
 
     const fn maximum_additional_header_length(self) -> usize {
         match self {
-            Self::Advertising => 0,
+            Self::Advertising | Self::SecondaryAdvertising => 0,
             Self::Data => 1,
         }
     }
@@ -86,7 +89,7 @@ impl LePduLayout {
     const fn payload_length(self, header: [u8; 2]) -> usize {
         match self {
             Self::Advertising => (header[1] & 0x3f) as usize,
-            Self::Data => header[1] as usize,
+            Self::SecondaryAdvertising | Self::Data => header[1] as usize,
         }
     }
 }
@@ -104,6 +107,14 @@ impl LeFrameConfig {
             access_address: LE_ADV_ACCESS_ADDRESS,
             crc_init: LE_ADV_CRC_INIT,
             layout: LePduLayout::Advertising,
+        }
+    }
+
+    pub const fn secondary_advertising() -> Self {
+        Self {
+            access_address: LE_ADV_ACCESS_ADDRESS,
+            crc_init: LE_ADV_CRC_INIT,
+            layout: LePduLayout::SecondaryAdvertising,
         }
     }
 
@@ -192,6 +203,33 @@ impl AdvertisingPdu {
         bytes.extend_from_slice(&self.payload);
         bytes.extend_from_slice(&self.crc);
         bytes
+    }
+}
+
+impl TryFrom<LePdu> for AdvertisingPdu {
+    type Error = Error;
+
+    fn try_from(packet: LePdu) -> Result<Self> {
+        if packet.access_address != LE_ADV_ACCESS_ADDRESS {
+            return Err(Error::InvalidInput(format!(
+                "advertising PDU requires access address 0x{LE_ADV_ACCESS_ADDRESS:08x}, received 0x{:08x}",
+                packet.access_address
+            )));
+        }
+        if packet.cte_info.is_some() {
+            return Err(Error::InvalidInput(
+                "advertising PDU cannot contain a data-channel CTEInfo header".to_owned(),
+            ));
+        }
+        Ok(Self {
+            channel: packet.channel,
+            bit_offset: packet.bit_offset,
+            inverted: packet.inverted,
+            access_address_errors: packet.access_address_errors,
+            header: packet.header,
+            payload: packet.payload,
+            crc: packet.crc,
+        })
     }
 }
 
@@ -572,6 +610,53 @@ mod tests {
         assert_eq!(packets[0].header, [0x1d, 200]);
         assert_eq!(packets[0].payload, payload);
         assert_eq!(packets[0].bit_offset, 4);
+    }
+
+    #[test]
+    fn secondary_advertising_decoder_uses_full_length_octet() {
+        let channel = BleChannel::new(20).unwrap();
+        let config = LeFrameConfig::secondary_advertising();
+        let payload: Vec<u8> = (0..200).map(|value| value as u8).collect();
+        let mut pdu = vec![0x07, payload.len() as u8];
+        pdu.extend_from_slice(&payload);
+        pdu.extend_from_slice(&crc24_bytes(&pdu, config.crc_init));
+        let mut body = bytes_to_bits_lsb(&pdu);
+        whiten_bits(&mut body, channel);
+
+        let mut bits = bytes_to_bits_lsb(&config.access_address.to_le_bytes());
+        bits.extend(body);
+
+        let packets = decode_le_frames(&bits, channel, config, 0).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].header, [0x07, 200]);
+        assert_eq!(packets[0].payload, payload);
+        assert_eq!(
+            AdvertisingPdu::try_from(packets[0].clone())
+                .unwrap()
+                .payload,
+            payload
+        );
+        assert!(
+            decode_le_frames(&bits, channel, LeFrameConfig::advertising(), 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn advertising_conversion_rejects_data_framing() {
+        let packet = LePdu {
+            channel: BleChannel::new(0).unwrap(),
+            access_address: 0x1234_5678,
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [0x02, 0],
+            cte_info: None,
+            payload: Vec::new(),
+            crc: [0; 3],
+        };
+        assert!(AdvertisingPdu::try_from(packet).is_err());
     }
 
     #[test]

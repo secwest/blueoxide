@@ -1235,3 +1235,45 @@ The wire layouts were checked independently against Zephyr controller commit
 `de3399269bad8c9a6bfb1dc181c3876340c198b8`; the CLI fixture's channel-37
 whitening comes from Jiao Xianjun's BTLE implementation rather than
 Blueoxide's own helper.
+
+## 2026-07-23: Decode fixed-channel secondary advertising before following
+
+### Framing distinction
+
+Primary and secondary advertising share access address `0x8e89bed6`, CRC
+initializer `0x555555`, whitening, and the advertising PDU header shape. They
+do not share Length semantics: primary advertising uses the lower six bits and
+is bounded to 37 payload octets, while secondary advertising uses the complete
+Length octet and may carry 255 payload octets. `LePduLayout` therefore keeps
+separate primary and secondary advertising variants rather than weakening the
+primary bound or treating auxiliary traffic as connection data.
+
+The generic uncoded demodulator and stream buffer now feed either advertising
+layout into a checked `AdvertisingPdu` conversion. Advertising observations
+retain the asserted uncoded PHY so LE 2M auxiliary packets set the correct
+PCAPNG pseudo-header metadata. Existing primary wrappers remain LE 1M.
+
+### Offline receive boundary
+
+`decode-secondary` accepts a recording already centered on one channel from 0
+through 36 and requires an asserted LE 1M or LE 2M PHY. It performs bounded
+streaming demodulation, advertising CRC validation, exact sample positioning,
+extended-header semantic decode for PDU type `0x07`, and optional PCAPNG
+serialization. Configuration errors are rejected before the input file is
+opened.
+
+PDU type `0x07` is shared by ADV_EXT_IND, AUX_ADV_IND, AUX_SCAN_RSP,
+AUX_SYNC_IND, and AUX_CHAIN_IND. A fixed isolated packet does not carry enough
+context to select one of those names reliably, so Blueoxide reports the wire
+type and preserves all bytes without inventing an AUX subtype. Legacy primary
+PDU meanings are not applied to non-`0x07` packets received on channels 0
+through 36.
+
+### Deliberate limits
+
+This increment does not consume an AuxPtr as a receive schedule, retune a
+radio, combine multiple channels, classify contextual AUX subtypes, reassemble
+advertising chains, establish periodic synchronization state, or demodulate LE
+Coded. Those capabilities require timing provenance and cross-packet state;
+fixed-channel secondary decode establishes the framing and packet-delivery
+layer they can build on.

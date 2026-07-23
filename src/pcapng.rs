@@ -50,12 +50,16 @@ impl<W: Write> PcapNgWriter<W> {
         packet: &ReceivedAdvertisingPdu,
         timestamp_ns: u64,
     ) -> Result<()> {
+        let phy_flags = match packet.phy {
+            LeUncodedPhy::Le1M => 0,
+            LeUncodedPhy::Le2M => BLE_PHY_LE_2M,
+        };
         self.write_packet(
             packet.pdu.channel.index(),
             packet.pdu.access_address_errors,
             LE_ADV_ACCESS_ADDRESS,
             &packet.pdu.link_layer_bytes(),
-            0,
+            phy_flags,
             timestamp_ns,
         )
     }
@@ -178,6 +182,7 @@ mod tests {
                 payload: vec![0xaa, 0xbb],
                 crc: [1, 2, 3],
             },
+            phy: LeUncodedPhy::Le1M,
             access_address_sample: 400,
             symbol_phase: 0,
             estimated_carrier_offset_hz: 0.0,

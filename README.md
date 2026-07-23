@@ -12,6 +12,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Bluetooth LE channel-to-frequency mapping.
 - LE whitening and 24-bit CRC implementations.
 - CRC-gated decoding of primary advertising PDUs on channels 37, 38, and 39.
+- Fixed-channel secondary advertising decode on channels 0 through 36 with
+  asserted LE 1M/2M PHY, full eight-bit Length framing, semantic extended
+  headers, and PHY-correct PCAPNG output.
 - Configurable CRC-gated LE 1M and LE 2M data-channel decoding for a known
   connection access address, CRC initializer, logical channel, and asserted
   PHY.
@@ -130,6 +133,32 @@ The decoder processes the file in bounded blocks and retains enough overlap to
 recover maximum-length primary advertisements split between reads. Repeated
 identical advertisements are preserved when they occur at different sample
 positions.
+
+Decode a recording already centered on one secondary advertising channel:
+
+```text
+cargo run --release -- decode-secondary \
+  --input auxiliary.cf32 \
+  --format f32le \
+  --channel 20 \
+  --phy 2m \
+  --sample-rate 8000000 \
+  --block-samples 262144 \
+  --output-pcap auxiliary.pcapng
+```
+
+`decode-secondary` accepts channels 0 through 36 and an asserted
+`--phy 1m|2m`. It uses the advertising access address and CRC initializer but
+the full eight-bit secondary advertising Length field, allowing payloads up to
+255 octets. PDU type `0x07` receives the same bounded extended-header semantic
+decode as primary `ADV_EXT_IND`; other secondary advertising PDU types remain
+lossless raw payloads instead of being assigned legacy primary meanings.
+
+The command decodes one already selected channel and PHY. It does not infer
+whether a type-`0x07` packet is AUX_ADV_IND, AUX_CHAIN_IND, AUX_SYNC_IND, or
+AUX_SCAN_RSP because that name depends on scheduling context. It does not
+follow AuxPtr, retune, combine channels, reassemble chains, maintain periodic
+synchronization state, or demodulate LE Coded.
 
 Decode a recording from a known LE connection data channel:
 
@@ -581,12 +610,13 @@ PDU reassembly are now present. Fixed-channel live data observations are also
 available; the next receive stages are wideband channelization or timed
 retuning, routing those observations into connection-event state, applying
 tracked PHY transitions to demodulator selection, and full live BLE connection
-following. Full packet decode is a project requirement: secondary and chained
-extended advertising, periodic advertising synchronization, complete LL
-procedure state, automatic pairing and LTK selection, bidirectional
-encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
-LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers will be added
-incrementally while retaining undecoded packet bytes losslessly.
+following. Full packet decode is a project requirement: AuxPtr-driven
+secondary-channel following, extended-advertising chain reassembly, periodic
+advertising synchronization, complete LL procedure state, automatic pairing
+and LTK selection, bidirectional encryption-state tracking, L2CAP channel
+state, stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth
+Classic BR/EDR layers will be added incrementally while retaining undecoded
+packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

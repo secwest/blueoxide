@@ -1334,6 +1334,66 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Fixed-channel secondary advertising verification
+
+The framing boundary was checked against Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4`. Its `pdu_adv` structure stores
+Length as one octet, aliases AUX_ADV_IND/AUX_SCAN_RSP/AUX_SYNC_IND/
+AUX_CHAIN_IND to advertising PDU type `0x07`, and bounds extended advertising
+payload independently from the 37-octet legacy primary limit. Wireshark commit
+`403c9a36ea7fa8f2d69a449be1f4fa97c52817c0` likewise reads the complete Length
+octet and interprets the AUX subtype only when external context supplies it.
+
+The fixed channel-20 vector deliberately uses Length `0x46`, which cannot pass
+a decoder that masks Length to the primary lower six bits:
+
+```text
+Header:          4746
+Payload octets:  70
+CRC:             d63ff5
+Whitened body:   b31362c6a81b6f5949022e3f84feb953f92eb1e1d304bf24
+                 2d0ec4fc016fcd3a6e01cf657d1e420d089d7967981f4fb6
+                 9d2ec81f12ab84a1a26c9f92ec2f06786cb1c3aaadf9efff
+                 921fac
+```
+
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+independently generated CRC `d63ff5`. Jiao Xianjun BTLE commit
+`85401861e8f4b04b90cbaa0394c0f9d45ed02f18` independently generated the
+channel-20 whitening bytes with `scramble_core`. Neither the library stream
+test nor CLI test calls Blueoxide CRC or whitening helpers to construct this
+packet.
+
+The vector contains ExtHdrLen 10, AdvA, ADI, one ACAD octet, and 59 advertising
+data octets. It is modulated as LE 2M at 8 Msps, split across 137/139-sample
+blocks, and must recover header `4746`, random advertiser
+`06:05:04:03:02:01`, SID 13, DID 2748, CRC `d63ff5`, one ACAD octet, and all 59
+advertising-data octets. The CLI PCAPNG assertion locates the exact dewhitened
+packet and verifies the LE 2M pseudo-header flag.
+
+Focused tests also prove that secondary framing accepts 200-octet payloads,
+the primary framing configuration cannot decode that packet, advertising
+conversion rejects a connection access address, primary channels are rejected
+by the secondary stream API and CLI, invalid LE 2M sample rates fail before
+input-file access, and non-`0x07` secondary packets remain raw rather than
+receiving legacy primary semantics.
+
+Final local gate for this increment:
+
+```text
+179 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+8 data-channel CLI integration tests
+4 advertising decode/PCAPNG integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1344,7 +1404,7 @@ git diff --check
 - Native backend error injection and device-removal tests.
 - Wireshark/tshark regression checks in CI.
 - Long-duration stream tests with sample overruns and retunes.
-- Differential tests for secondary/chained extended advertising, periodic
+- Differential tests for AuxPtr-driven/chained extended advertising, periodic
   advertising synchronization, data-channel following, stateful GATT, EATT,
   pairing and automatic LTK selection, full LL encryption activation/pause
   state, automatic bidirectional encryption state, automatic capture-driven

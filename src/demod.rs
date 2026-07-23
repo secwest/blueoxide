@@ -58,6 +58,7 @@ pub struct Le1mDemodConfig {
 #[derive(Clone, Debug)]
 pub struct ReceivedAdvertisingPdu {
     pub pdu: AdvertisingPdu,
+    pub phy: LeUncodedPhy,
     /// Sample index at the beginning of the detected access address.
     pub access_address_sample: u64,
     pub symbol_phase: usize,
@@ -327,30 +328,45 @@ pub fn decode_le_1m_advertising_detailed(
             channel.index()
         )));
     }
-    Ok(
-        decode_le_1m_detailed(samples, channel, LeFrameConfig::advertising(), config)?
-            .into_iter()
-            .map(|packet| ReceivedAdvertisingPdu {
-                pdu: AdvertisingPdu {
-                    channel: packet.pdu.channel,
-                    bit_offset: packet.pdu.bit_offset,
-                    inverted: packet.pdu.inverted,
-                    access_address_errors: packet.pdu.access_address_errors,
-                    header: packet.pdu.header,
-                    payload: {
-                        debug_assert!(packet.pdu.cte_info.is_none());
-                        packet.pdu.payload
-                    },
-                    crc: packet.pdu.crc,
-                },
-                access_address_sample: packet.access_address_sample,
-                symbol_phase: packet.symbol_phase,
-                estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
-                estimated_deviation_hz: packet.estimated_deviation_hz,
-                discriminator_separation: packet.discriminator_separation,
-            })
-            .collect(),
-    )
+    decode_le_1m_detailed(samples, channel, LeFrameConfig::advertising(), config)?
+        .into_iter()
+        .map(received_advertising_pdu)
+        .collect()
+}
+
+/// Demodulates detailed CRC-valid uncoded secondary advertising observations.
+pub fn decode_secondary_advertising_detailed(
+    samples: &[Complex32],
+    channel: BleChannel,
+    config: LeUncodedDemodConfig,
+) -> Result<Vec<ReceivedAdvertisingPdu>> {
+    if channel.is_primary_advertising() {
+        return Err(Error::InvalidConfiguration(format!(
+            "secondary advertising decoder requires channel 0 through 36; got {}",
+            channel.index()
+        )));
+    }
+    decode_le_uncoded_detailed(
+        samples,
+        channel,
+        LeFrameConfig::secondary_advertising(),
+        config,
+    )?
+    .into_iter()
+    .map(received_advertising_pdu)
+    .collect()
+}
+
+fn received_advertising_pdu(packet: ReceivedLePdu) -> Result<ReceivedAdvertisingPdu> {
+    Ok(ReceivedAdvertisingPdu {
+        phy: packet.phy,
+        pdu: AdvertisingPdu::try_from(packet.pdu)?,
+        access_address_sample: packet.access_address_sample,
+        symbol_phase: packet.symbol_phase,
+        estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
+        estimated_deviation_hz: packet.estimated_deviation_hz,
+        discriminator_separation: packet.discriminator_separation,
+    })
 }
 
 pub fn decode_le_1m_advertising(
@@ -556,26 +572,54 @@ impl Le1mStreamDecoder {
             packets: batch
                 .packets
                 .into_iter()
-                .map(|packet| ReceivedAdvertisingPdu {
-                    pdu: AdvertisingPdu {
-                        channel: packet.pdu.channel,
-                        bit_offset: packet.pdu.bit_offset,
-                        inverted: packet.pdu.inverted,
-                        access_address_errors: packet.pdu.access_address_errors,
-                        header: packet.pdu.header,
-                        payload: {
-                            debug_assert!(packet.pdu.cte_info.is_none());
-                            packet.pdu.payload
-                        },
-                        crc: packet.pdu.crc,
-                    },
-                    access_address_sample: packet.access_address_sample,
-                    symbol_phase: packet.symbol_phase,
-                    estimated_carrier_offset_hz: packet.estimated_carrier_offset_hz,
-                    estimated_deviation_hz: packet.estimated_deviation_hz,
-                    discriminator_separation: packet.discriminator_separation,
-                })
-                .collect(),
+                .map(received_advertising_pdu)
+                .collect::<Result<Vec<_>>>()?,
+            discontinuity: batch.discontinuity,
+        })
+    }
+}
+
+/// Bounded stream decoder for fixed-channel uncoded secondary advertising.
+pub struct LeSecondaryAdvertisingStreamDecoder {
+    inner: LeUncodedPacketStreamDecoder,
+}
+
+impl LeSecondaryAdvertisingStreamDecoder {
+    pub fn new(
+        channel: BleChannel,
+        config: LeUncodedDemodConfig,
+    ) -> Result<LeSecondaryAdvertisingStreamDecoder> {
+        if channel.is_primary_advertising() {
+            return Err(Error::InvalidConfiguration(format!(
+                "secondary advertising stream decoder requires channel 0 through 36; got {}",
+                channel.index()
+            )));
+        }
+        Ok(Self {
+            inner: LeUncodedPacketStreamDecoder::new(
+                channel,
+                LeFrameConfig::secondary_advertising(),
+                config,
+            )?,
+        })
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    pub fn push(
+        &mut self,
+        first_sample_index: u64,
+        input: &[Complex32],
+    ) -> Result<StreamDecodeBatch> {
+        let batch = self.inner.push(first_sample_index, input)?;
+        Ok(StreamDecodeBatch {
+            packets: batch
+                .packets
+                .into_iter()
+                .map(received_advertising_pdu)
+                .collect::<Result<Vec<_>>>()?,
             discontinuity: batch.discontinuity,
         })
     }
@@ -847,6 +891,63 @@ mod tests {
         assert_eq!(packets.len(), 1);
         assert_eq!(packets[0].pdu.cte_info, Some(0x85));
         assert_eq!(packets[0].pdu.payload, payload);
+    }
+
+    #[test]
+    fn secondary_advertising_stream_recovers_full_length_octet_on_le_2m() {
+        let phy = LeUncodedPhy::Le2M;
+        let channel = BleChannel::new(20).unwrap();
+        // Scapy produced CRC d63ff5. Jiao Xianjun's BTLE scramble_core
+        // produced the channel-20 body from a 70-octet advertising payload.
+        let bits = bytes_to_bits_lsb(&[
+            0xaa, 0xaa, 0xd6, 0xbe, 0x89, 0x8e, 0xb3, 0x13, 0x62, 0xc6, 0xa8, 0x1b, 0x6f, 0x59,
+            0x49, 0x02, 0x2e, 0x3f, 0x84, 0xfe, 0xb9, 0x53, 0xf9, 0x2e, 0xb1, 0xe1, 0xd3, 0x04,
+            0xbf, 0x24, 0x2d, 0x0e, 0xc4, 0xfc, 0x01, 0x6f, 0xcd, 0x3a, 0x6e, 0x01, 0xcf, 0x65,
+            0x7d, 0x1e, 0x42, 0x0d, 0x08, 0x9d, 0x79, 0x67, 0x98, 0x1f, 0x4f, 0xb6, 0x9d, 0x2e,
+            0xc8, 0x1f, 0x12, 0xab, 0x84, 0xa1, 0xa2, 0x6c, 0x9f, 0x92, 0xec, 0x2f, 0x06, 0x78,
+            0x6c, 0xb1, 0xc3, 0xaa, 0xad, 0xf9, 0xef, 0xff, 0x92, 0x1f, 0xac,
+        ]);
+        let samples = modulate_uncoded(&bits, 4, -60_000.0, phy);
+        let mut decoder = LeSecondaryAdvertisingStreamDecoder::new(
+            channel,
+            LeUncodedDemodConfig {
+                phy,
+                sample_rate_hz: 8_000_000,
+                max_access_address_errors: 0,
+            },
+        )
+        .unwrap();
+        let mut packets = Vec::new();
+        for (index, chunk) in samples.chunks(139).enumerate() {
+            let batch = decoder.push((index * 139) as u64, chunk).unwrap();
+            assert!(batch.discontinuity.is_none());
+            packets.extend(batch.packets);
+        }
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].phy, phy);
+        assert_eq!(packets[0].pdu.header, [0x47, 0x46]);
+        assert_eq!(packets[0].pdu.payload.len(), 70);
+        assert_eq!(
+            &packets[0].pdu.payload[..11],
+            &[0x0a, 0x09, 1, 2, 3, 4, 5, 6, 0xbc, 0xda, 0x99]
+        );
+        assert_eq!(packets[0].pdu.crc, [0xd6, 0x3f, 0xf5]);
+    }
+
+    #[test]
+    fn secondary_advertising_decoder_rejects_primary_channels() {
+        let config = LeUncodedDemodConfig {
+            phy: LeUncodedPhy::Le1M,
+            sample_rate_hz: 4_000_000,
+            max_access_address_errors: 0,
+        };
+        assert!(
+            LeSecondaryAdvertisingStreamDecoder::new(BleChannel::new(37).unwrap(), config).is_err()
+        );
+        assert!(
+            decode_secondary_advertising_detailed(&[], BleChannel::new(39).unwrap(), config)
+                .is_err()
+        );
     }
 
     #[test]
