@@ -1423,3 +1423,90 @@ SyncOffset zero cannot be represented and that AUX_SYNC_IND is contextual.
 Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8` generated the fixed
 periodic CRC, and Jiao Xianjun BTLE commit
 `85401861e8f4b04b90cbaa0394c0f9d45ed02f18` generated its whitening bytes.
+
+## 2026-07-23: Drive LE encryption state from directed capture records
+
+### Capture contract and state ownership
+
+`LeEncryptionSessionTracker` accepts one caller-selected LTK, a bounded
+counter-skip limit, and complete `DataChannelPdu` observations tagged with the
+actual transmitter direction. It deliberately does not infer direction from
+LLID, SN/NESN, packet timing, or control opcode. Those fields are not a
+direction oracle, and fixed-channel captures can omit arbitrary connection
+events.
+
+The tracker owns the material exchange plus independent
+central-to-peripheral and peripheral-to-central `LeAclDecryptor` instances.
+Its public state names the next capture-visible procedure packet rather than a
+local controller role. The initial states cover `LL_ENC_REQ`, `LL_ENC_RSP`,
+`LL_START_ENC_REQ`, the central encrypted `LL_START_ENC_RSP`, and the
+peripheral encrypted `LL_START_ENC_RSP`; the encrypted state then admits an
+optional pause/refresh cycle.
+
+### Directional activation and pause boundaries
+
+The Core's three-way start handshake is asymmetric. The peripheral
+`LL_START_ENC_REQ` is plaintext. Observing it installs both decryptors at
+counter zero but enables only central-to-peripheral authentication. The
+central `LL_START_ENC_RSP` must authenticate at central counter zero before
+peripheral-to-central authentication is enabled. The final peripheral
+`LL_START_ENC_RSP` must authenticate at peripheral counter zero before the
+session enters the fully encrypted state.
+
+Pause is asymmetric in the other direction. The central
+`LL_PAUSE_ENC_REQ` and peripheral `LL_PAUSE_ENC_RSP` remain encrypted. After
+the first response authenticates, future central-to-peripheral packets are
+plaintext while the old peripheral decryptor is retained only long enough to
+recognize an encrypted retransmission. The central's second
+`LL_PAUSE_ENC_RSP` is plaintext; accepting it discards both old decryptors and
+starts a fresh material exchange. The next `LL_START_ENC_REQ` installs two new
+counter-zero decryptors from the refreshed SKD and IV.
+
+An encrypted extended rejection of `LL_PAUSE_ENC_REQ` returns to the encrypted
+state and preserves the active material and decryptors. A rejected initial
+material exchange returns to the initial request state. A rejection after
+encryption has already been paused returns to the refresh-request state rather
+than claiming that the old encryption can resume.
+
+### Transactional observations and retransmissions
+
+Encrypted observations run against a cloned candidate decryptor. The candidate
+counter and procedure transition are committed only after MIC verification,
+strict control decoding, direction validation, and state validation all
+succeed. A malformed packet, failed MIC, wrong direction, or out-of-order PDU
+therefore changes neither procedure state nor packet counters. The caller
+retains the borrowed raw packet on every error.
+
+Encrypted retransmissions use `LeAclDecryptor`'s authenticated SN/counter
+reuse. Plaintext procedure retransmissions are idempotent only when direction,
+the stable LLID/CP/RFU header bits, SN, and complete control payload match the
+immediately accepted plaintext control PDU; changing SN on the same repeated
+payload is rejected. NESN and MD may change without hiding an LLID change as a
+retransmission. Empty PDUs and a valid `LL_TERMINATE_IND` remain admissible
+during the restricted handshake. `reset` drops procedure, material, and
+counter state after a capture discontinuity while preserving the configured
+LTK and skip bound.
+
+### Offline integration boundary
+
+`encryption-trace` accepts repeated
+`DIRECTION:HEADERPAYLOADHEX` records. It prints the raw record before invoking
+the tracker, reports plaintext/authenticated output and state transitions, and
+continues after per-record errors. This is an offline protocol integration
+surface, not a direction classifier or channel follower. It does not consume
+I/Q, select an LTK from pairing state, merge captures, or route live hopping
+observations. `decode-data` remains the explicit single-direction path for a
+fixed-channel waveform with caller-supplied initial state.
+
+### Independent behavior boundary
+
+Bluetooth Core 6.1 Vol 6, Part B, Sections 5.1.3.1 and 5.1.3.2 define which
+start and pause PDUs are plaintext or encrypted. Zephyr controller commit
+`7d46db352251f85a6bc7b5961fb8a86e2f3125e4` independently implements separate
+`enc_rx`/`enc_tx` transitions and resets both CCM counters in
+`ull_llcp_enc.c`; its `ctrl_encrypt` tests exercise the same directional
+sequence. Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+independently serializes the six encryption control opcodes. Pause and refresh
+ciphertexts were generated outside Blueoxide with `cryptography 46.0.7`
+backed by OpenSSL 3.5.6 after reproducing both published Core counter-zero
+start-response vectors.

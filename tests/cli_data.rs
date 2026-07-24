@@ -806,6 +806,161 @@ fn cli_authenticates_decrypts_and_reassembles_encrypted_waveforms() {
 }
 
 #[test]
+fn cli_validates_direction_tagged_encryption_trace_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args(["encryption-trace", "--packet", "c2p:030105"])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("encryption-trace requires --ltk"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "encryption-trace",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("encryption-trace requires at least one --packet")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "encryption-trace",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--packet",
+            "c2p:030203",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("data Length declares 2 payload octets but 1 were supplied")
+    );
+}
+
+#[test]
+fn cli_tracks_initial_pause_refresh_and_bidirectional_encrypted_data() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "encryption-trace",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--packet",
+            "c2p:0317039078563412efcdab74241302f1e0dfcebdac24abdcba",
+            "--packet",
+            "p2c:070d047968574635241302bebaafde",
+            "--packet",
+            "p2c:030105",
+            "--packet",
+            "c2p:13059fcda7f448",
+            "--packet",
+            "p2c:0705a34c13a415",
+            "--packet",
+            "c2p:0f056705b5b139",
+            "--packet",
+            "p2c:0b05ef83ed096c",
+            "--packet",
+            "c2p:07010b",
+            "--packet",
+            "c2p:0317039078563412efcdab74241202f1e0dfcebdac24abdcba",
+            "--packet",
+            "p2c:070d047868574635241302bebaafdf",
+            "--packet",
+            "p2c:030105",
+            "--packet",
+            "c2p:1305b2dd7a7e9a",
+            "--packet",
+            "p2c:07050ce74620c8",
+            "--packet",
+            "c2p:020d265ced8b95e2f33651732dace1",
+            "--packet",
+            "p2c:060b0d567b5b51aa49678426f8",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "raw_encryption_packet index=3 direction=central-to-peripheral header=1305 payload=9fcda7f448"
+    ));
+    assert!(stdout.contains(
+        "protection=encrypted-new packet_counter=0 skipped_counters=0 state_before=awaiting-central-start-encryption-response state_after=awaiting-peripheral-start-encryption-response header=1301 payload=06 control=LL_START_ENC_RSP"
+    ));
+    assert!(stdout.contains(
+        "state_before=awaiting-peripheral-pause-encryption-response state_after=awaiting-central-pause-encryption-response"
+    ));
+    assert!(stdout.contains(
+        "state_before=awaiting-central-pause-encryption-response state_after=awaiting-refresh-encryption-request header=0701 payload=0b control=LL_PAUSE_ENC_RSP"
+    ));
+    assert!(stdout.contains(
+        "encryption_observation index=13 direction=central-to-peripheral protection=encrypted-new packet_counter=1 skipped_counters=0 state_before=encrypted state_after=encrypted header=0209 payload=050004000a01000200 control=none"
+    ));
+    assert!(stdout.contains(
+        "encryption_observation index=14 direction=peripheral-to-central protection=encrypted-new packet_counter=1 skipped_counters=0 state_before=encrypted state_after=encrypted header=0607 payload=030004000a0100 control=none"
+    ));
+    assert!(stderr.contains(
+        "processed 15 directed encryption packet(s); accepted=15 errors=0 final_state=encrypted"
+    ));
+}
+
+#[test]
+fn cli_keeps_raw_packets_visible_and_continues_after_mic_failure() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "encryption-trace",
+            "--ltk",
+            "bf01fb9d4ef3bc36d874f5394138684c",
+            "--packet",
+            "c2p:0317039078563412efcdab74241302f1e0dfcebdac24abdcba",
+            "--packet",
+            "p2c:070d047968574635241302bebaafde",
+            "--packet",
+            "p2c:030105",
+            "--packet",
+            "c2p:13059fcda7f448",
+            "--packet",
+            "p2c:0705a34c13a415",
+            "--packet",
+            "c2p:0f056605b5b139",
+            "--packet",
+            "c2p:0f056705b5b139",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "raw_encryption_packet index=5 direction=central-to-peripheral header=0f05 payload=6605b5b139"
+    ));
+    assert!(stdout.contains(
+        "encryption_observation index=6 direction=central-to-peripheral protection=encrypted-new packet_counter=1"
+    ));
+    assert!(stderr.contains(
+        "encryption observation error: index=5 direction=central-to-peripheral state=encrypted"
+    ));
+    assert!(stderr.contains(
+        "processed 7 directed encryption packet(s); accepted=6 errors=1 final_state=awaiting-peripheral-pause-encryption-response"
+    ));
+}
+
+#[test]
 fn cli_decodes_plaintext_le_l2cap_signaling_without_hiding_raw_pdus() {
     let channel = BleChannel::new(12).expect("valid channel");
     let access_address = 0x1234_5678u32;

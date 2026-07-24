@@ -26,6 +26,7 @@ pub(crate) fn aes_128_encrypt_block(key: [u8; AES_BLOCK_OCTETS], block: [u8; 16]
     Aes128::new(key).encrypt(block)
 }
 
+#[derive(Clone)]
 pub(crate) struct Aes128Ccm {
     aes: Aes128,
 }
@@ -113,6 +114,7 @@ impl Aes128Ccm {
     }
 }
 
+#[derive(Clone)]
 struct Aes128 {
     round_keys: [u8; AES_128_ROUND_KEY_OCTETS],
 }

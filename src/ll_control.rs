@@ -1,5 +1,6 @@
 use crate::link_layer::{
     ChannelMapInd, ConnectionParameters, ConnectionUpdateInd, ControlPdu, DataChannelMap,
+    DataChannelPdu, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryptionStatus, LeAclDecryptor,
     LinkDirection, SleepClockAccuracy,
 };
 use crate::{Error, Result};
@@ -295,6 +296,530 @@ impl LeEncryptionMaterialTracker {
             _ => Ok(None),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeEncryptionSessionState {
+    AwaitingInitialEncryptionRequest,
+    AwaitingEncryptionResponse,
+    AwaitingStartEncryptionRequest,
+    AwaitingCentralStartEncryptionResponse,
+    AwaitingPeripheralStartEncryptionResponse,
+    Encrypted,
+    AwaitingPeripheralPauseEncryptionResponse,
+    AwaitingCentralPauseEncryptionResponse,
+    AwaitingRefreshEncryptionRequest,
+}
+
+impl std::fmt::Display for LeEncryptionSessionState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::AwaitingInitialEncryptionRequest => "awaiting-initial-encryption-request",
+            Self::AwaitingEncryptionResponse => "awaiting-encryption-response",
+            Self::AwaitingStartEncryptionRequest => "awaiting-start-encryption-request",
+            Self::AwaitingCentralStartEncryptionResponse => {
+                "awaiting-central-start-encryption-response"
+            }
+            Self::AwaitingPeripheralStartEncryptionResponse => {
+                "awaiting-peripheral-start-encryption-response"
+            }
+            Self::Encrypted => "encrypted",
+            Self::AwaitingPeripheralPauseEncryptionResponse => {
+                "awaiting-peripheral-pause-encryption-response"
+            }
+            Self::AwaitingCentralPauseEncryptionResponse => {
+                "awaiting-central-pause-encryption-response"
+            }
+            Self::AwaitingRefreshEncryptionRequest => "awaiting-refresh-encryption-request",
+        };
+        formatter.write_str(name)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeEncryptionObservation {
+    pub packet: DataChannelPdu,
+    pub decryption: Option<LeAclDecryptionStatus>,
+    pub state_before: LeEncryptionSessionState,
+    pub state_after: LeEncryptionSessionState,
+}
+
+/// Reconstructs a bidirectional LE encryption session from directed packets.
+///
+/// Every packet direction must come from capture context supplied by the
+/// caller. The tracker never infers direction from an isolated data PDU. It
+/// observes plaintext material exchange, enables each decryptor at the
+/// Core-defined `LL_START_ENC_*` boundary, handles the asymmetric pause
+/// transition, and resets both direction-specific counters when refreshed
+/// material enters the start handshake.
+///
+/// The input packet is borrowed and remains available to the caller when
+/// authentication or procedure validation fails. State, including packet
+/// counters, is committed only after the complete observation is accepted.
+pub struct LeEncryptionSessionTracker {
+    long_term_key: [u8; 16],
+    maximum_counter_skip: u64,
+    material_tracker: LeEncryptionMaterialTracker,
+    pending_material: Option<LeEncryptionMaterial>,
+    active_material: Option<LeEncryptionMaterial>,
+    central_to_peripheral: Option<LeAclDecryptor>,
+    peripheral_to_central: Option<LeAclDecryptor>,
+    last_plaintext_control: Option<PlaintextControlFingerprint>,
+    state: LeEncryptionSessionState,
+    refreshing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlaintextControlFingerprint {
+    direction: LinkDirection,
+    authenticated_header: u8,
+    sequence_number: bool,
+    payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for LeEncryptionSessionTracker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeEncryptionSessionTracker")
+            .field("state", &self.state)
+            .field("refreshing", &self.refreshing)
+            .field(
+                "central_to_peripheral_counter",
+                &self.next_packet_counter(LinkDirection::CentralToPeripheral),
+            )
+            .field(
+                "peripheral_to_central_counter",
+                &self.next_packet_counter(LinkDirection::PeripheralToCentral),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl LeEncryptionSessionTracker {
+    pub fn new(long_term_key: [u8; 16], maximum_counter_skip: u64) -> Result<Self> {
+        if maximum_counter_skip > LE_ACL_MAXIMUM_COUNTER_SKIP {
+            return Err(Error::InvalidConfiguration(format!(
+                "LE ACL maximum counter skip must be in 0..={LE_ACL_MAXIMUM_COUNTER_SKIP}"
+            )));
+        }
+        Ok(Self {
+            long_term_key,
+            maximum_counter_skip,
+            material_tracker: LeEncryptionMaterialTracker::new(long_term_key),
+            pending_material: None,
+            active_material: None,
+            central_to_peripheral: None,
+            peripheral_to_central: None,
+            last_plaintext_control: None,
+            state: LeEncryptionSessionState::AwaitingInitialEncryptionRequest,
+            refreshing: false,
+        })
+    }
+
+    pub const fn state(&self) -> LeEncryptionSessionState {
+        self.state
+    }
+
+    pub const fn active_material(&self) -> Option<LeEncryptionMaterial> {
+        self.active_material
+    }
+
+    pub fn direction_encrypted(&self, direction: LinkDirection) -> bool {
+        use LeEncryptionSessionState as State;
+        match self.state {
+            State::AwaitingCentralStartEncryptionResponse => {
+                direction == LinkDirection::CentralToPeripheral
+            }
+            State::AwaitingPeripheralStartEncryptionResponse
+            | State::Encrypted
+            | State::AwaitingPeripheralPauseEncryptionResponse => true,
+            State::AwaitingCentralPauseEncryptionResponse => {
+                direction == LinkDirection::PeripheralToCentral
+            }
+            State::AwaitingInitialEncryptionRequest
+            | State::AwaitingEncryptionResponse
+            | State::AwaitingStartEncryptionRequest
+            | State::AwaitingRefreshEncryptionRequest => false,
+        }
+    }
+
+    pub fn next_packet_counter(&self, direction: LinkDirection) -> Option<u64> {
+        self.decryptor(direction)
+            .map(LeAclDecryptor::next_packet_counter)
+    }
+
+    /// Drops all procedure, material, and packet-counter state after a capture
+    /// discontinuity while retaining the configured LTK and skip bound.
+    pub fn reset(&mut self) {
+        self.material_tracker = LeEncryptionMaterialTracker::new(self.long_term_key);
+        self.pending_material = None;
+        self.active_material = None;
+        self.central_to_peripheral = None;
+        self.peripheral_to_central = None;
+        self.last_plaintext_control = None;
+        self.state = LeEncryptionSessionState::AwaitingInitialEncryptionRequest;
+        self.refreshing = false;
+    }
+
+    pub fn observe(
+        &mut self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> Result<LeEncryptionObservation> {
+        if usize::from(packet.declared_payload_length()) != packet.payload.len() {
+            return Err(Error::InvalidInput(format!(
+                "data-channel Length declares {} octets but the packet retains {}",
+                packet.declared_payload_length(),
+                packet.payload.len()
+            )));
+        }
+
+        let state_before = self.state;
+        let (observed, decryption, candidate_decryptor) = if self.direction_encrypted(direction) {
+            let mut candidate = self
+                .decryptor(direction)
+                .ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "{} decryptor is missing in {:?}",
+                        direction, self.state
+                    ))
+                })?
+                .duplicate_state();
+            let decryption = candidate.decrypt(packet)?;
+            (decryption.packet, Some(decryption.status), Some(candidate))
+        } else {
+            (packet.clone(), None, None)
+        };
+
+        if decryption.is_none()
+            && !matches!(
+                self.state,
+                LeEncryptionSessionState::AwaitingInitialEncryptionRequest
+                    | LeEncryptionSessionState::Encrypted
+            )
+            && self.is_plaintext_sequence_conflict(direction, &observed)
+        {
+            return Err(Error::InvalidState(
+                "repeated plaintext control payload changed its SN bit".to_owned(),
+            ));
+        }
+        let plaintext_retransmission =
+            decryption.is_none() && self.is_plaintext_retransmission(direction, &observed);
+        if !plaintext_retransmission
+            && !matches!(
+                decryption,
+                Some(LeAclDecryptionStatus::Retransmission { .. })
+            )
+        {
+            self.process_observed(direction, &observed)?;
+        }
+
+        if let Some(candidate) = candidate_decryptor {
+            *self.decryptor_mut(direction) = Some(candidate);
+        }
+        if decryption.is_none() && !plaintext_retransmission && observed.control()?.is_some() {
+            self.last_plaintext_control = Some(PlaintextControlFingerprint {
+                direction,
+                authenticated_header: observed.header[0] & 0xe3,
+                sequence_number: observed.sequence_number(),
+                payload: observed.payload.clone(),
+            });
+        }
+
+        Ok(LeEncryptionObservation {
+            packet: observed,
+            decryption,
+            state_before,
+            state_after: self.state,
+        })
+    }
+
+    fn process_observed(
+        &mut self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> Result<()> {
+        use DecodedControlPdu as Control;
+        use LeEncryptionSessionState as State;
+
+        if packet.payload.is_empty() {
+            return Ok(());
+        }
+        let control = packet.control()?;
+        let Some(control) = control else {
+            return match self.state {
+                State::AwaitingInitialEncryptionRequest | State::Encrypted => Ok(()),
+                state => Err(Error::InvalidState(format!(
+                    "unexpected non-control data PDU in {state:?}"
+                ))),
+            };
+        };
+        if control.opcode == 0x02 {
+            control.decode()?;
+            return Ok(());
+        }
+
+        let encryption_opcode = matches!(
+            control.opcode,
+            0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x0a | 0x0b | 0x0d | 0x11
+        );
+        if !encryption_opcode {
+            return match self.state {
+                State::AwaitingInitialEncryptionRequest | State::Encrypted => Ok(()),
+                state => Err(Error::InvalidState(format!(
+                    "unexpected {} in {state:?}",
+                    control.opcode_name()
+                ))),
+            };
+        }
+        let decoded = control.decode()?;
+
+        match self.state {
+            State::AwaitingInitialEncryptionRequest => match decoded {
+                Control::EncryptionRequest(_) => {
+                    self.observe_material(direction, control)?;
+                    self.state = State::AwaitingEncryptionResponse;
+                    Ok(())
+                }
+                Control::StartEncryptionRequest
+                | Control::StartEncryptionResponse
+                | Control::PauseEncryptionRequest
+                | Control::PauseEncryptionResponse
+                | Control::EncryptionResponse(_) => Err(unexpected_control(control, self.state)),
+                _ => Ok(()),
+            },
+            State::AwaitingEncryptionResponse => match decoded {
+                Control::EncryptionRequest(_) => self.observe_material(direction, control),
+                Control::EncryptionResponse(_) => {
+                    if let Some(material) = self.observe_material_value(direction, control)? {
+                        self.pending_material = Some(material);
+                        self.state = State::AwaitingStartEncryptionRequest;
+                    }
+                    Ok(())
+                }
+                Control::RejectInd(_) if direction == LinkDirection::PeripheralToCentral => {
+                    self.reject_material_exchange();
+                    Ok(())
+                }
+                Control::RejectExtendedInd(reject)
+                    if direction == LinkDirection::PeripheralToCentral
+                        && reject.rejected_opcode == 0x03 =>
+                {
+                    self.reject_material_exchange();
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::AwaitingStartEncryptionRequest => match decoded {
+                Control::EncryptionResponse(_) => self.observe_material(direction, control),
+                Control::UnknownResponse(_) if direction == LinkDirection::CentralToPeripheral => {
+                    Ok(())
+                }
+                Control::StartEncryptionRequest
+                    if direction == LinkDirection::PeripheralToCentral =>
+                {
+                    self.install_pending_decryptors()?;
+                    self.state = State::AwaitingCentralStartEncryptionResponse;
+                    Ok(())
+                }
+                Control::RejectInd(_) if direction == LinkDirection::PeripheralToCentral => {
+                    self.reject_material_exchange();
+                    Ok(())
+                }
+                Control::RejectExtendedInd(reject)
+                    if direction == LinkDirection::PeripheralToCentral
+                        && reject.rejected_opcode == 0x03 =>
+                {
+                    self.reject_material_exchange();
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::AwaitingCentralStartEncryptionResponse => match decoded {
+                Control::StartEncryptionRequest
+                    if direction == LinkDirection::PeripheralToCentral =>
+                {
+                    Ok(())
+                }
+                Control::StartEncryptionResponse
+                    if direction == LinkDirection::CentralToPeripheral =>
+                {
+                    self.state = State::AwaitingPeripheralStartEncryptionResponse;
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::AwaitingPeripheralStartEncryptionResponse => match decoded {
+                Control::StartEncryptionResponse
+                    if direction == LinkDirection::PeripheralToCentral =>
+                {
+                    self.active_material = self.pending_material.take();
+                    self.state = State::Encrypted;
+                    self.refreshing = false;
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::Encrypted => match decoded {
+                Control::PauseEncryptionRequest
+                    if direction == LinkDirection::CentralToPeripheral =>
+                {
+                    self.state = State::AwaitingPeripheralPauseEncryptionResponse;
+                    Ok(())
+                }
+                Control::EncryptionRequest(_)
+                | Control::EncryptionResponse(_)
+                | Control::StartEncryptionRequest
+                | Control::StartEncryptionResponse
+                | Control::PauseEncryptionRequest
+                | Control::PauseEncryptionResponse => Err(unexpected_control(control, self.state)),
+                _ => Ok(()),
+            },
+            State::AwaitingPeripheralPauseEncryptionResponse => match decoded {
+                Control::PauseEncryptionResponse
+                    if direction == LinkDirection::PeripheralToCentral =>
+                {
+                    self.state = State::AwaitingCentralPauseEncryptionResponse;
+                    Ok(())
+                }
+                Control::RejectInd(_) if direction == LinkDirection::PeripheralToCentral => {
+                    self.state = State::Encrypted;
+                    Ok(())
+                }
+                Control::RejectExtendedInd(reject)
+                    if direction == LinkDirection::PeripheralToCentral
+                        && reject.rejected_opcode == 0x0a =>
+                {
+                    self.state = State::Encrypted;
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::AwaitingCentralPauseEncryptionResponse => match decoded {
+                Control::PauseEncryptionResponse
+                    if direction == LinkDirection::CentralToPeripheral =>
+                {
+                    self.central_to_peripheral = None;
+                    self.peripheral_to_central = None;
+                    self.material_tracker = LeEncryptionMaterialTracker::new(self.long_term_key);
+                    self.pending_material = None;
+                    self.active_material = None;
+                    self.state = State::AwaitingRefreshEncryptionRequest;
+                    self.refreshing = true;
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+            State::AwaitingRefreshEncryptionRequest => match decoded {
+                Control::PauseEncryptionResponse
+                    if direction == LinkDirection::CentralToPeripheral =>
+                {
+                    Ok(())
+                }
+                Control::EncryptionRequest(_) => {
+                    self.observe_material(direction, control)?;
+                    self.state = State::AwaitingEncryptionResponse;
+                    Ok(())
+                }
+                _ => Err(unexpected_control(control, self.state)),
+            },
+        }
+    }
+
+    fn observe_material(
+        &mut self,
+        direction: LinkDirection,
+        control: ControlPdu<'_>,
+    ) -> Result<()> {
+        self.observe_material_value(direction, control).map(|_| ())
+    }
+
+    fn observe_material_value(
+        &mut self,
+        direction: LinkDirection,
+        control: ControlPdu<'_>,
+    ) -> Result<Option<LeEncryptionMaterial>> {
+        self.material_tracker.observe(direction, control)
+    }
+
+    fn install_pending_decryptors(&mut self) -> Result<()> {
+        let material = self.pending_material.ok_or_else(|| {
+            Error::InvalidState(
+                "LL_START_ENC_REQ was observed without complete session material".to_owned(),
+            )
+        })?;
+        self.central_to_peripheral = Some(LeAclDecryptor::new(
+            material.session_key(),
+            material.initialization_vector(),
+            LinkDirection::CentralToPeripheral,
+            0,
+            self.maximum_counter_skip,
+        )?);
+        self.peripheral_to_central = Some(LeAclDecryptor::new(
+            material.session_key(),
+            material.initialization_vector(),
+            LinkDirection::PeripheralToCentral,
+            0,
+            self.maximum_counter_skip,
+        )?);
+        Ok(())
+    }
+
+    fn reject_material_exchange(&mut self) {
+        self.material_tracker = LeEncryptionMaterialTracker::new(self.long_term_key);
+        self.pending_material = None;
+        self.central_to_peripheral = None;
+        self.peripheral_to_central = None;
+        self.state = if self.refreshing {
+            LeEncryptionSessionState::AwaitingRefreshEncryptionRequest
+        } else {
+            LeEncryptionSessionState::AwaitingInitialEncryptionRequest
+        };
+    }
+
+    fn decryptor(&self, direction: LinkDirection) -> Option<&LeAclDecryptor> {
+        match direction {
+            LinkDirection::CentralToPeripheral => self.central_to_peripheral.as_ref(),
+            LinkDirection::PeripheralToCentral => self.peripheral_to_central.as_ref(),
+        }
+    }
+
+    fn decryptor_mut(&mut self, direction: LinkDirection) -> &mut Option<LeAclDecryptor> {
+        match direction {
+            LinkDirection::CentralToPeripheral => &mut self.central_to_peripheral,
+            LinkDirection::PeripheralToCentral => &mut self.peripheral_to_central,
+        }
+    }
+
+    fn is_plaintext_retransmission(
+        &self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> bool {
+        self.last_plaintext_control.as_ref().is_some_and(|last| {
+            last.direction == direction
+                && last.authenticated_header == packet.header[0] & 0xe3
+                && last.sequence_number == packet.sequence_number()
+                && last.payload == packet.payload
+        })
+    }
+
+    fn is_plaintext_sequence_conflict(
+        &self,
+        direction: LinkDirection,
+        packet: &DataChannelPdu,
+    ) -> bool {
+        self.last_plaintext_control.as_ref().is_some_and(|last| {
+            last.direction == direction
+                && last.authenticated_header == packet.header[0] & 0xe3
+                && last.sequence_number != packet.sequence_number()
+                && last.payload == packet.payload
+        })
+    }
+}
+
+fn unexpected_control(control: ControlPdu<'_>, state: LeEncryptionSessionState) -> Error {
+    Error::InvalidState(format!("unexpected {} in {state:?}", control.opcode_name()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1427,9 +1952,87 @@ fn parse_feature_page(control: ControlPdu<'_>) -> Result<FeaturePagePdu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ble::BleChannel;
 
     fn control(opcode: u8, parameters: &[u8]) -> ControlPdu<'_> {
         ControlPdu { opcode, parameters }
+    }
+
+    fn data_packet(header: u8, payload: &[u8]) -> DataChannelPdu {
+        DataChannelPdu {
+            channel: BleChannel::new(0).unwrap(),
+            access_address: 0x1234_5678,
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [header, payload.len() as u8],
+            cte_info: None,
+            payload: payload.to_vec(),
+            crc: [0; 3],
+        }
+    }
+
+    fn control_packet(header: u8, opcode: u8, parameters: &[u8]) -> DataChannelPdu {
+        let mut payload = Vec::with_capacity(parameters.len() + 1);
+        payload.push(opcode);
+        payload.extend_from_slice(parameters);
+        data_packet(header, &payload)
+    }
+
+    fn core_ltk() -> [u8; 16] {
+        [
+            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
+            0x68, 0x4c,
+        ]
+    }
+
+    fn core_request_parameters() -> [u8; 22] {
+        [
+            0x90, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x74, 0x24, 0x13, 0x02, 0xf1, 0xe0,
+            0xdf, 0xce, 0xbd, 0xac, 0x24, 0xab, 0xdc, 0xba,
+        ]
+    }
+
+    fn core_response_parameters() -> [u8; 12] {
+        [
+            0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xbe, 0xba, 0xaf, 0xde,
+        ]
+    }
+
+    fn start_core_session(maximum_counter_skip: u64) -> LeEncryptionSessionTracker {
+        let mut tracker =
+            LeEncryptionSessionTracker::new(core_ltk(), maximum_counter_skip).unwrap();
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x07, 0x04, &core_response_parameters()),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x03, 0x05, &[]),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x13, &[0x9f, 0xcd, 0xa7, 0xf4, 0x48]),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x07, &[0xa3, 0x4c, 0x13, 0xa4, 0x15]),
+            )
+            .unwrap();
+        tracker
     }
 
     #[test]
@@ -1460,17 +2063,9 @@ mod tests {
 
     #[test]
     fn reconstructs_core_encryption_material_from_directional_control_exchange() {
-        let long_term_key = [
-            0xbf, 0x01, 0xfb, 0x9d, 0x4e, 0xf3, 0xbc, 0x36, 0xd8, 0x74, 0xf5, 0x39, 0x41, 0x38,
-            0x68, 0x4c,
-        ];
-        let request_parameters = [
-            0x90, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x74, 0x24, 0x13, 0x02, 0xf1, 0xe0,
-            0xdf, 0xce, 0xbd, 0xac, 0x24, 0xab, 0xdc, 0xba,
-        ];
-        let response_parameters = [
-            0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xbe, 0xba, 0xaf, 0xde,
-        ];
+        let long_term_key = core_ltk();
+        let request_parameters = core_request_parameters();
+        let response_parameters = core_response_parameters();
         let mut tracker = LeEncryptionMaterialTracker::new(long_term_key);
 
         assert_eq!(
@@ -1584,6 +2179,493 @@ mod tests {
             LeEncryptionMaterialTrackerState::AwaitingResponse
         );
         assert_eq!(tracker.material(), None);
+    }
+
+    #[test]
+    fn tracks_initial_encryption_activation_and_counter_zero_in_both_directions() {
+        let mut tracker = LeEncryptionSessionTracker::new(core_ltk(), 0).unwrap();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingInitialEncryptionRequest
+        );
+
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x07, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .observe(
+                    LinkDirection::CentralToPeripheral,
+                    &control_packet(0x02, 0x03, &core_request_parameters()),
+                )
+                .is_err()
+        );
+        assert!(
+            tracker
+                .observe(
+                    LinkDirection::CentralToPeripheral,
+                    &control_packet(0x0b, 0x03, &core_request_parameters()),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingEncryptionResponse
+        );
+
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x07, 0x04, &core_response_parameters()),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingStartEncryptionRequest
+        );
+
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x03, 0x05, &[]),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingCentralStartEncryptionResponse
+        );
+        assert!(tracker.direction_encrypted(LinkDirection::CentralToPeripheral));
+        assert!(!tracker.direction_encrypted(LinkDirection::PeripheralToCentral));
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            Some(0)
+        );
+
+        let central = tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x13, &[0x9f, 0xcd, 0xa7, 0xf4, 0x48]),
+            )
+            .unwrap();
+        assert_eq!(central.packet.payload, [0x06]);
+        assert_eq!(
+            central.decryption,
+            Some(LeAclDecryptionStatus::New {
+                packet_counter: 0,
+                skipped_counters: 0,
+            })
+        );
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingPeripheralStartEncryptionResponse
+        );
+        assert!(tracker.direction_encrypted(LinkDirection::CentralToPeripheral));
+        assert!(tracker.direction_encrypted(LinkDirection::PeripheralToCentral));
+
+        let duplicate = tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x17, &[0x9f, 0xcd, 0xa7, 0xf4, 0x48]),
+            )
+            .unwrap();
+        assert_eq!(
+            duplicate.decryption,
+            Some(LeAclDecryptionStatus::Retransmission { packet_counter: 0 })
+        );
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingPeripheralStartEncryptionResponse
+        );
+
+        let peripheral = tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x07, &[0xa3, 0x4c, 0x13, 0xa4, 0x15]),
+            )
+            .unwrap();
+        assert_eq!(peripheral.packet.payload, [0x06]);
+        assert_eq!(
+            peripheral.decryption,
+            Some(LeAclDecryptionStatus::New {
+                packet_counter: 0,
+                skipped_counters: 0,
+            })
+        );
+        assert_eq!(tracker.state(), LeEncryptionSessionState::Encrypted);
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            Some(1)
+        );
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn pauses_refreshes_and_resets_independent_directional_counters() {
+        let mut tracker = start_core_session(0);
+        let old_material = tracker.active_material().unwrap();
+
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x0f, &[0x67, 0x05, 0xb5, 0xb1, 0x39]),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingPeripheralPauseEncryptionResponse
+        );
+
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x0b, &[0xef, 0x83, 0xed, 0x09, 0x6c]),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingCentralPauseEncryptionResponse
+        );
+        assert!(!tracker.direction_encrypted(LinkDirection::CentralToPeripheral));
+        assert!(tracker.direction_encrypted(LinkDirection::PeripheralToCentral));
+
+        let duplicate = tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x1b, &[0xef, 0x83, 0xed, 0x09, 0x6c]),
+            )
+            .unwrap();
+        assert!(matches!(
+            duplicate.decryption,
+            Some(LeAclDecryptionStatus::Retransmission { packet_counter: 1 })
+        ));
+
+        let plaintext_pause = tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x07, 0x0b, &[]),
+            )
+            .unwrap();
+        assert_eq!(plaintext_pause.decryption, None);
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingRefreshEncryptionRequest
+        );
+        assert_eq!(tracker.active_material(), None);
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            None
+        );
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            None
+        );
+
+        let refreshed_request = [
+            0x90, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab, 0x74, 0x24, 0x12, 0x02, 0xf1, 0xe0,
+            0xdf, 0xce, 0xbd, 0xac, 0x24, 0xab, 0xdc, 0xba,
+        ];
+        let refreshed_response = [
+            0x78, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xbe, 0xba, 0xaf, 0xdf,
+        ];
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &refreshed_request),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x07, 0x04, &refreshed_response),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x03, 0x05, &[]),
+            )
+            .unwrap();
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            Some(0)
+        );
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            Some(0)
+        );
+
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x13, &[0xb2, 0xdd, 0x7a, 0x7e, 0x9a]),
+            )
+            .unwrap();
+        tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x07, &[0x0c, 0xe7, 0x46, 0x20, 0xc8]),
+            )
+            .unwrap();
+        assert_eq!(tracker.state(), LeEncryptionSessionState::Encrypted);
+        let refreshed_material = tracker.active_material().unwrap();
+        assert_ne!(refreshed_material, old_material);
+        assert_eq!(
+            refreshed_material.session_key(),
+            [
+                0xad, 0xbc, 0x86, 0x74, 0xff, 0x0b, 0x6b, 0x60, 0xec, 0x79, 0x5e, 0x09, 0xbc, 0x39,
+                0x75, 0x4c,
+            ]
+        );
+        assert_eq!(
+            refreshed_material.initialization_vector(),
+            [0x24, 0xab, 0xdc, 0xba, 0xbe, 0xba, 0xaf, 0xdf]
+        );
+
+        let central_data = tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(
+                    0x02,
+                    &[
+                        0x26, 0x5c, 0xed, 0x8b, 0x95, 0xe2, 0xf3, 0x36, 0x51, 0x73, 0x2d, 0xac,
+                        0xe1,
+                    ],
+                ),
+            )
+            .unwrap();
+        assert_eq!(central_data.packet.payload, [5, 0, 4, 0, 0x0a, 1, 0, 2, 0]);
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            Some(2)
+        );
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            Some(1)
+        );
+
+        let peripheral_data = tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(
+                    0x06,
+                    &[
+                        0x0d, 0x56, 0x7b, 0x5b, 0x51, 0xaa, 0x49, 0x67, 0x84, 0x26, 0xf8,
+                    ],
+                ),
+            )
+            .unwrap();
+        assert_eq!(peripheral_data.packet.payload, [3, 0, 4, 0, 0x0a, 1, 0]);
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::PeripheralToCentral),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_order_and_rolls_back_mic_and_procedure_errors() {
+        let mut terminating = LeEncryptionSessionTracker::new(core_ltk(), 0).unwrap();
+        terminating
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        terminating
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x03, 0x02, &[0x13]),
+            )
+            .unwrap();
+        assert_eq!(
+            terminating.state(),
+            LeEncryptionSessionState::AwaitingEncryptionResponse
+        );
+
+        let mut unknown = LeEncryptionSessionTracker::new(core_ltk(), 0).unwrap();
+        unknown
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        unknown
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &control_packet(0x07, 0x04, &core_response_parameters()),
+            )
+            .unwrap();
+        unknown
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x07, &[0x12]),
+            )
+            .unwrap();
+        assert_eq!(
+            unknown.state(),
+            LeEncryptionSessionState::AwaitingStartEncryptionRequest
+        );
+
+        let mut tracker = LeEncryptionSessionTracker::new(core_ltk(), 0).unwrap();
+        assert!(
+            tracker
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    &control_packet(0x03, 0x03, &core_request_parameters()),
+                )
+                .is_err()
+        );
+        assert!(
+            tracker
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    &control_packet(0x03, 0x04, &core_response_parameters()),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingInitialEncryptionRequest
+        );
+
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &control_packet(0x03, 0x03, &core_request_parameters()),
+            )
+            .unwrap();
+        assert!(
+            tracker
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    &control_packet(0x03, 0x05, &[]),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingEncryptionResponse
+        );
+
+        let mut encrypted = start_core_session(0);
+        let mut damaged = data_packet(0x0f, &[0x67, 0x05, 0xb5, 0xb1, 0x39]);
+        damaged.payload[0] ^= 1;
+        assert!(
+            encrypted
+                .observe(LinkDirection::CentralToPeripheral, &damaged)
+                .is_err()
+        );
+        assert_eq!(encrypted.state(), LeEncryptionSessionState::Encrypted);
+        assert_eq!(
+            encrypted.next_packet_counter(LinkDirection::CentralToPeripheral),
+            Some(1)
+        );
+
+        encrypted
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x0f, &[0x67, 0x05, 0xb5, 0xb1, 0x39]),
+            )
+            .unwrap();
+        let counter_before = encrypted.next_packet_counter(LinkDirection::PeripheralToCentral);
+        assert!(
+            encrypted
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    &data_packet(
+                        0x06,
+                        &[
+                            0xf3, 0x88, 0x81, 0xe7, 0xbd, 0x94, 0xc9, 0xc3, 0x69, 0xb9, 0xa6, 0x68,
+                            0x46, 0xdd, 0x47, 0x86, 0xaa, 0x8c, 0x39, 0xce, 0x54, 0x0d, 0x0d, 0xae,
+                            0x3a, 0xdc, 0xdf, 0x89, 0xb9, 0x60, 0x88,
+                        ],
+                    ),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            encrypted.next_packet_counter(LinkDirection::PeripheralToCentral),
+            counter_before
+        );
+        assert!(
+            encrypted
+                .observe(
+                    LinkDirection::PeripheralToCentral,
+                    &data_packet(0x0b, &[0xef, 0x83, 0xed, 0x09, 0x6d]),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            encrypted.state(),
+            LeEncryptionSessionState::AwaitingPeripheralPauseEncryptionResponse
+        );
+        assert_eq!(
+            encrypted.next_packet_counter(LinkDirection::PeripheralToCentral),
+            counter_before
+        );
+    }
+
+    #[test]
+    fn rejected_pause_preserves_the_encrypted_session_and_reset_drops_it() {
+        let mut tracker = start_core_session(0);
+        let material = tracker.active_material();
+        tracker
+            .observe(
+                LinkDirection::CentralToPeripheral,
+                &data_packet(0x0f, &[0x67, 0x05, 0xb5, 0xb1, 0x39]),
+            )
+            .unwrap();
+        let rejection = tracker
+            .observe(
+                LinkDirection::PeripheralToCentral,
+                &data_packet(0x0b, &[0xf5, 0x82, 0xba, 0x36, 0x45, 0xa3, 0xa1]),
+            )
+            .unwrap();
+        assert_eq!(rejection.packet.payload, [0x11, 0x0a, 0x0c]);
+        assert_eq!(tracker.state(), LeEncryptionSessionState::Encrypted);
+        assert_eq!(tracker.active_material(), material);
+        assert!(tracker.direction_encrypted(LinkDirection::CentralToPeripheral));
+        assert!(tracker.direction_encrypted(LinkDirection::PeripheralToCentral));
+
+        tracker.reset();
+        assert_eq!(
+            tracker.state(),
+            LeEncryptionSessionState::AwaitingInitialEncryptionRequest
+        );
+        assert_eq!(tracker.active_material(), None);
+        assert_eq!(
+            tracker.next_packet_counter(LinkDirection::CentralToPeripheral),
+            None
+        );
+        assert!(!format!("{tracker:?}").contains("99ad"));
+    }
+
+    #[test]
+    fn session_tracker_handles_bounded_arbitrary_control_input_without_panicking() {
+        for opcode in 0u8..=u8::MAX {
+            for length in 0..=24usize {
+                let parameters = vec![opcode.wrapping_mul(17); length];
+                let packet = control_packet(0x03, opcode, &parameters);
+                let mut tracker = LeEncryptionSessionTracker::new(core_ltk(), 3).unwrap();
+                let _ = tracker.observe(LinkDirection::CentralToPeripheral, &packet);
+                let _ = tracker.observe(LinkDirection::PeripheralToCentral, &packet);
+            }
+        }
     }
 
     #[test]
@@ -1757,6 +2839,16 @@ mod tests {
                     0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
                 ],
             ),
+            (
+                0x04,
+                &[
+                    0x79, 0x68, 0x57, 0x46, 0x35, 0x24, 0x13, 0x02, 0xbe, 0xba, 0xaf, 0xde,
+                ],
+            ),
+            (0x05, &[]),
+            (0x06, &[]),
+            (0x0a, &[]),
+            (0x0b, &[]),
             (0x0c, &[0x0d, 0x34, 0x12, 0x78, 0x56]),
             (0x14, &[0xfb, 0x00, 0x48, 0x08, 0x1b, 0x00, 0x48, 0x08]),
             (0x1a, &[0x8a]),

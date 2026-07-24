@@ -1593,6 +1593,129 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Capture-driven LE encryption procedure verification
+
+Normative references:
+
+- Bluetooth Core Specification 6.1, Vol 6, Part B, Section 5.1.3.1 for the
+  Encryption Start procedure.
+- Bluetooth Core Specification 6.1, Vol 6, Part B, Section 5.1.3.2 for the
+  Encryption Pause procedure and encapsulated key refresh.
+- Bluetooth Core Specification, Vol 6, Part E, Sections 1 and 2 for packet
+  counters, direction, nonce construction, MIC, and empty-PDU behavior.
+
+The observed-wire start sequence is fixed as:
+
+| Direction | Control PDU | Protection | Counter effect |
+| --- | --- | --- | --- |
+| Central to peripheral | `LL_ENC_REQ` | Plaintext | None |
+| Peripheral to central | `LL_ENC_RSP` | Plaintext | None |
+| Peripheral to central | `LL_START_ENC_REQ` | Plaintext | Install both counters at zero |
+| Central to peripheral | `LL_START_ENC_RSP` | Encrypted | Consume central counter 0 |
+| Peripheral to central | `LL_START_ENC_RSP` | Encrypted | Consume peripheral counter 0 |
+
+The pause boundary is fixed as:
+
+| Direction | Control PDU | Protection | Following state |
+| --- | --- | --- | --- |
+| Central to peripheral | `LL_PAUSE_ENC_REQ` | Encrypted | Both directions still encrypted |
+| Peripheral to central | `LL_PAUSE_ENC_RSP` | Encrypted | Central direction becomes plaintext |
+| Central to peripheral | `LL_PAUSE_ENC_RSP` | Plaintext | Both old decryptors discarded |
+| Central to peripheral | New `LL_ENC_REQ` | Plaintext | Refreshed material exchange |
+
+Independent implementation reference:
+
+- Project: Zephyr Bluetooth Controller
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/controller/ll_sw/ull_llcp_enc.c`
+  - `subsys/bluetooth/controller/ll_sw/lll_conn.h`
+  - `tests/bluetooth/controller/ctrl_encrypt/src/main.c`
+
+Zephyr's `enc_setup_lll` independently resets `ccm_tx.counter` and
+`ccm_rx.counter` to zero. Its central FSM enables both encryption directions
+when queuing the central start response. Its peripheral FSM enables receive
+decryption before that response and transmit encryption for the final
+peripheral response. During pause, the peripheral disables receive decryption
+after its encrypted response; the central disables transmit and receive
+encryption before its plaintext response; the peripheral disables transmit
+encryption after receiving that response. Zephyr's controller tests assert
+these exact `enc_rx`/`enc_tx` states and the Core session key, IV, direction,
+and zero counters.
+
+Pinned Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8`
+was loaded directly through `PYTHONPATH`. It independently serialized:
+
+```text
+LL_ENC_REQ:       039078563412efcdab74241302f1e0dfcebdac24abdcba
+LL_ENC_RSP:       047968574635241302bebaafde
+LL_START_ENC_REQ: 05
+LL_START_ENC_RSP: 06
+LL_PAUSE_ENC_REQ: 0a
+LL_PAUSE_ENC_RSP: 0b
+```
+
+AES-CCM fixtures were generated outside Blueoxide with Python
+`cryptography 46.0.7` backed by OpenSSL 3.5.6. The generator first reproduced
+the two published Core counter-zero start responses:
+
+```text
+C->P counter 0, header 13, plaintext 06 -> 9fcda7f448
+P->C counter 0, header 07, plaintext 06 -> a34c13a415
+```
+
+It then generated the immediate pause vectors under the same material:
+
+```text
+C->P counter 1, header 0f, plaintext 0a     -> 6705b5b139
+P->C counter 1, header 0b, plaintext 0b     -> ef83ed096c
+P->C counter 1, header 0b, plaintext 110a0c -> f582ba3645a3a1
+```
+
+A different SKDm, SKDs, and IVs independently produce:
+
+```text
+LL_ENC_REQ parameters: 9078563412efcdab74241202f1e0dfcebdac24abdcba
+LL_ENC_RSP parameters: 7868574635241302bebaafdf
+AES session key:       adbc8674ff0b6b60ec795e09bc39754c
+LL IV octets:          24abdcbabebaafdf
+C->P start response:   b2dd7a7e9a
+P->C start response:   0ce74620c8
+C->P counter 1 data:   265ced8b95e2f33651732dace1
+P->C counter 1 data:   0d567b5b51aa49678426f8
+```
+
+Library tests cover the complete initial sequence, both counter-zero
+activation boundaries, independent counter progression, encrypted and
+plaintext retransmissions, asymmetric pause, refreshed material and counter
+reset, rejected pause, wrong direction, out-of-order controls, MIC rollback,
+explicit discontinuity reset, and arbitrary bounded control input without
+panics.
+
+The `encryption-trace` integration fixture feeds 15 direction-tagged records
+through initial start, pause, refresh, and one encrypted data packet in each
+direction. It requires final state `encrypted`, refreshed counters one and
+then two independently, and authenticated plaintext. A second fixture corrupts
+one pause ciphertext, requires the raw packet line to remain visible, checks
+that the state and counter do not advance, and then accepts the valid packet.
+Argument tests reject a missing LTK, an empty trace, and a Length mismatch.
+
+Final local gate for this increment:
+
+```text
+204 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+11 data-channel/encryption CLI integration tests
+9 advertising decode/planning/reassembly/periodic CLI integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1606,7 +1729,7 @@ git diff --check
 - Recorded multi-channel or timed-retune validation for live AuxPtr-driven
   extended advertising and periodic advertising following, plus differential
   tests for data-channel following, stateful GATT, EATT, pairing and automatic
-  LTK selection, full LL encryption activation/pause state, automatic
-  bidirectional encryption state, automatic capture-driven PHY transition
-  delivery and demodulator switching, LE Coded PHY demodulation, and Bluetooth
-  Classic as those layers are added.
+  LTK selection, live direction classification and routing into the encryption
+  tracker, automatic capture-driven PHY transition delivery and demodulator
+  switching, LE Coded PHY demodulation, and Bluetooth Classic as those layers
+  are added.

@@ -87,6 +87,17 @@
 - Direction-checked `LL_ENC_REQ`/`LL_ENC_RSP` material tracking with exact
   retransmission handling, refresh invalidation, Core byte-order conversion,
   and AES session-key plus combined-IV derivation from a caller-selected LTK.
+- `LeEncryptionSessionTracker` for capture-driven initial encryption, pause,
+  key refresh, exact plaintext/encrypted retransmissions, rejected-pause
+  recovery, and independent central/peripheral decryptors with counter-zero
+  activation at the Core-defined handshake boundaries.
+- Transactional session observation: MIC failures, wrong directions,
+  out-of-order control PDUs, and malformed packets preserve procedure and
+  counter state while the caller retains the original raw packet.
+- `encryption-trace` for ordered direction-tagged data-header/payload records,
+  with raw-first output, authenticated plaintext, transition and counter
+  reporting, bounded skip recovery, and continued processing after per-record
+  errors.
 - `decode-data` support for deriving decryption material directly from
   `--ltk`, complete captured `--enc-req`, and complete captured `--enc-rsp`
   payloads as an alternative to supplying `--session-key` and `--iv`.
@@ -230,8 +241,8 @@
   classification and unasserted routing of live observations, live or
   AuxPtr-driven secondary advertising reception, live multi-channel periodic
   advertising following, automatic direction/counter inference, LTK selection
-  from pairing state, LL encryption start/pause state, bidirectional encryption
-  tracking, stateful L2CAP channels, GATT/EATT and pairing state, capture-driven
+  from pairing state, live routing into the direction-explicit encryption
+  tracker, stateful L2CAP channels, GATT/EATT and pairing state, capture-driven
   PHY transition delivery/demodulator switching, Bluetooth Classic, and LE
   Coded PHY demodulation remain to be implemented. Contextual
   AUX_ADV_IND/AUX_CHAIN_IND classification and chain reassembly plus periodic

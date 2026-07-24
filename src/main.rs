@@ -29,6 +29,7 @@ use blueoxide::link_layer::{
 };
 use blueoxide::ll_control::{
     ChannelClassification, CsConfigAction, DecodedControlPdu, LeEncryptionMaterialTracker,
+    LeEncryptionSessionTracker,
 };
 use blueoxide::pcapng::{PcapNgWriter, sample_timestamp_ns};
 use blueoxide::periodic::{
@@ -113,6 +114,19 @@ struct DecodeDataDecryptionArgs {
     direction: LinkDirection,
     initial_packet_counter: u64,
     maximum_counter_skip: u64,
+}
+
+#[derive(Debug)]
+struct EncryptionTraceArgs {
+    long_term_key: [u8; 16],
+    maximum_counter_skip: u64,
+    packets: Vec<DirectionalDataPacketArg>,
+}
+
+#[derive(Clone, Debug)]
+struct DirectionalDataPacketArg {
+    direction: LinkDirection,
+    packet: DataChannelPdu,
 }
 
 #[derive(Debug)]
@@ -232,6 +246,8 @@ USAGE:
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide decode-data --input FILE --channel 0..36 --sample-rate HZ \
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
+  blueoxide encryption-trace --ltk HEX \
+    --packet DIRECTION:HEADERPAYLOADHEX [--packet ...] [OPTIONS]
   blueoxide connection-plan --access-address 0xNNNNNNNN \
     --channel-map HEX --csa 1|2 --interval N --sample-rate HZ [OPTIONS]
   blueoxide connection-sync --access-address 0xNNNNNNNN \
@@ -282,6 +298,12 @@ DECODE-DATA OPTIONS:
   --decrypt-direction central-to-peripheral|peripheral-to-central
                           Assert the transmitter direction for AES-CCM
   --packet-counter N      Initial 39-bit direction-specific packet counter
+  --max-counter-skip N    MIC-search skipped counters, 0..=65535 (default: 0)
+
+ENCRYPTION-TRACE OPTIONS:
+  --ltk HEX               16 LTK octets in HCI/SMP field order
+  --packet DIRECTION:HEX  Directed two-octet data header plus Length-counted
+                          payload/MIC; repeat in observed wire order
   --max-counter-skip N    MIC-search skipped counters, 0..=65535 (default: 0)
 
 CONNECTION-PLAN OPTIONS:
@@ -1622,6 +1644,98 @@ fn parse_decode_data_args(args: &[String]) -> Result<DecodeDataArgs> {
         plaintext_l2cap_direction,
         maximum_l2cap_payload_length,
         decryption,
+    })
+}
+
+fn parse_encryption_trace_packet(value: &str) -> Result<DirectionalDataPacketArg> {
+    let (direction, bytes) = value.split_once(':').ok_or_else(|| {
+        Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --packet; expected DIRECTION:HEADERPAYLOADHEX"
+        ))
+    })?;
+    let direction = parse_link_direction(direction, "--packet direction")?;
+    let bytes = parse_hex_bytes(bytes, "--packet")?;
+    if bytes.len() < 2 {
+        return Err(Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --packet; expected a two-octet data header"
+        )));
+    }
+    if bytes[0] & 0x20 != 0 {
+        return Err(Error::InvalidConfiguration(
+            "--packet does not accept a CTEInfo field; clear the data-header CP bit".to_owned(),
+        ));
+    }
+    let payload_length = usize::from(bytes[1]);
+    if bytes.len() != payload_length + 2 {
+        return Err(Error::InvalidConfiguration(format!(
+            "--packet data Length declares {payload_length} payload octets but {} were supplied",
+            bytes.len() - 2
+        )));
+    }
+    Ok(DirectionalDataPacketArg {
+        direction,
+        packet: DataChannelPdu {
+            channel: BleChannel::new(0).expect("data channel zero is valid"),
+            access_address: 0,
+            bit_offset: 0,
+            inverted: false,
+            access_address_errors: 0,
+            header: [bytes[0], bytes[1]],
+            cte_info: None,
+            payload: bytes[2..].to_vec(),
+            crc: [0; 3],
+        },
+    })
+}
+
+fn parse_encryption_trace_args(args: &[String]) -> Result<EncryptionTraceArgs> {
+    let mut long_term_key = None;
+    let mut maximum_counter_skip = 0;
+    let mut packets = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--ltk" => {
+                long_term_key = Some(parse_fixed_hex(
+                    &value_after(args, &mut index, "--ltk")?,
+                    "--ltk",
+                )?);
+            }
+            "--max-counter-skip" => {
+                maximum_counter_skip = parse_u64(
+                    &value_after(args, &mut index, "--max-counter-skip")?,
+                    "--max-counter-skip",
+                )?;
+            }
+            "--packet" => {
+                packets.push(parse_encryption_trace_packet(&value_after(
+                    args, &mut index, "--packet",
+                )?)?);
+            }
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown encryption-trace option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    let long_term_key = long_term_key
+        .ok_or_else(|| Error::InvalidConfiguration("encryption-trace requires --ltk".to_owned()))?;
+    if packets.is_empty() {
+        return Err(Error::InvalidConfiguration(
+            "encryption-trace requires at least one --packet".to_owned(),
+        ));
+    }
+    if maximum_counter_skip > LE_ACL_MAXIMUM_COUNTER_SKIP {
+        return Err(Error::InvalidConfiguration(format!(
+            "--max-counter-skip must be in 0..={LE_ACL_MAXIMUM_COUNTER_SKIP}"
+        )));
+    }
+    Ok(EncryptionTraceArgs {
+        long_term_key,
+        maximum_counter_skip,
+        packets,
     })
 }
 
@@ -3506,6 +3620,72 @@ fn decode_data(args: DecodeDataArgs) -> Result<()> {
     Ok(())
 }
 
+fn encryption_trace(args: EncryptionTraceArgs) -> Result<()> {
+    let mut tracker =
+        LeEncryptionSessionTracker::new(args.long_term_key, args.maximum_counter_skip)?;
+    let mut accepted = 0usize;
+    let mut errors = 0usize;
+    for (index, directed) in args.packets.iter().enumerate() {
+        println!(
+            "raw_encryption_packet index={index} direction={} header={} payload={}",
+            directed.direction,
+            print_hex(&directed.packet.header),
+            print_hex(&directed.packet.payload)
+        );
+        match tracker.observe(directed.direction, &directed.packet) {
+            Ok(observation) => {
+                accepted += 1;
+                let (protection, packet_counter, skipped_counters) = match observation.decryption {
+                    None => ("plaintext", "none".to_owned(), 0),
+                    Some(LeAclDecryptionStatus::New {
+                        packet_counter,
+                        skipped_counters,
+                    }) => (
+                        "encrypted-new",
+                        packet_counter.to_string(),
+                        skipped_counters,
+                    ),
+                    Some(LeAclDecryptionStatus::Retransmission { packet_counter }) => {
+                        ("encrypted-retransmission", packet_counter.to_string(), 0)
+                    }
+                    Some(LeAclDecryptionStatus::UnencryptedEmpty) => {
+                        ("unencrypted-empty", "none".to_owned(), 0)
+                    }
+                };
+                let control = observation
+                    .packet
+                    .control()
+                    .ok()
+                    .flatten()
+                    .map(ControlPdu::opcode_name)
+                    .unwrap_or("none");
+                println!(
+                    "encryption_observation index={index} direction={} protection={protection} packet_counter={packet_counter} skipped_counters={skipped_counters} state_before={} state_after={} header={} payload={} control={control}",
+                    directed.direction,
+                    observation.state_before,
+                    observation.state_after,
+                    print_hex(&observation.packet.header),
+                    print_hex(&observation.packet.payload),
+                );
+            }
+            Err(error) => {
+                errors += 1;
+                eprintln!(
+                    "encryption observation error: index={index} direction={} state={} error={error}",
+                    directed.direction,
+                    tracker.state()
+                );
+            }
+        }
+    }
+    eprintln!(
+        "processed {} directed encryption packet(s); accepted={accepted} errors={errors} final_state={}",
+        args.packets.len(),
+        tracker.state()
+    );
+    Ok(())
+}
+
 fn current_unix_time_ns() -> Result<u64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4132,6 +4312,7 @@ fn run() -> Result<()> {
         Some("decode-secondary") => decode_secondary(parse_decode_secondary_args(&args[1..])?),
         Some("decode-periodic") => decode_periodic(parse_decode_periodic_args(&args[1..])?),
         Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
+        Some("encryption-trace") => encryption_trace(parse_encryption_trace_args(&args[1..])?),
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
         Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),

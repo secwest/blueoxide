@@ -31,6 +31,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Dependency-free AES-128/CCM authentication and decryption for explicitly
   directed LE ACL streams with caller-supplied session state, MIC-gated counter
   advancement, retransmission handling, and bounded counter resynchronization.
+- Capture-driven LE encryption start, pause, key refresh, and independent
+  bidirectional decryptor state for ordered packets with caller-supplied
+  direction and LTK.
 - Uncoded LE 1M/2M quadrature demodulation with integer timing-phase search,
   robust slicing, spectrum-inversion handling, and configurable
   access-address tolerance.
@@ -317,12 +320,45 @@ A malformed known PDU remains visible in the complete packet line and
 increments `ll_control_errors`. Encryption and Channel Sounding security output
 can contain Rand, EDIV, session-key diversifiers, initialization vectors,
 nonces, and personalization vectors and must be handled as sensitive capture
-data. The parser does not enforce procedure order, role legality relative to
-connection history, capability negotiation, instant timing relative to an
-observed event, application of CS or Frame Space changes, or encryption state.
-The separate encryption-material tracker does enforce central
-`LL_ENC_REQ`/peripheral `LL_ENC_RSP` direction and order when a caller supplies
-the matching LTK.
+data. The isolated control parser does not enforce procedure order, role
+legality relative to connection history, capability negotiation, instant
+timing relative to an observed event, or application of CS or Frame Space
+changes. Separate encryption trackers enforce central
+`LL_ENC_REQ`/peripheral `LL_ENC_RSP` material exchange and, when given complete
+ordered data PDUs with explicit directions, the `LL_START_ENC_*` and
+`LL_PAUSE_ENC_*` wire transitions.
+
+For an ordered, direction-tagged data-PDU trace, reconstruct the initial
+encryption procedure and both packet-counter streams directly from the LTK:
+
+```text
+cargo run --release -- encryption-trace \
+  --ltk bf01fb9d4ef3bc36d874f5394138684c \
+  --packet c2p:0317039078563412efcdab74241302f1e0dfcebdac24abdcba \
+  --packet p2c:070d047968574635241302bebaafde \
+  --packet p2c:030105 \
+  --packet c2p:13059fcda7f448 \
+  --packet p2c:0705a34c13a415
+```
+
+Each `--packet` value is `DIRECTION:HEX`, where `HEX` contains the two-octet
+data-channel header followed by exactly the Length-counted payload and
+optional MIC. Directions accept `c2p`/`central-to-peripheral` and
+`p2c`/`peripheral-to-central`. The command prints every raw record before
+authentication, then prints plaintext or authenticated bytes, packet-counter
+status, and the state transition. It continues after per-record MIC or
+procedure errors without hiding the raw packet.
+
+The tracker treats the peripheral `LL_START_ENC_REQ` as plaintext, activates
+central-to-peripheral decryption for the central's encrypted
+`LL_START_ENC_RSP`, then activates peripheral-to-central decryption for the
+peripheral's encrypted response. Both first encrypted responses consume
+direction-specific counter zero. During pause, the request and peripheral
+response remain encrypted; the central response is plaintext. A subsequent
+material exchange installs two new decryptors at counter zero. Exact
+retransmissions are idempotent, a failed MIC or invalid transition commits no
+state, and `reset` discards procedure, key, and counter state after a capture
+discontinuity.
 
 For a recording with known link-encryption state, authenticate and decrypt one
 asserted transmitter direction:
@@ -389,11 +425,12 @@ plaintext trace. LTKs, session keys, and captured encryption material supplied
 on a command line may be visible in shell history and process inspection and
 must be handled as sensitive data.
 
-Material reconstruction does not select an LTK from Rand/EDIV or pairing
-history, infer packet direction or the initial counter, model
-`LL_START_ENC_*`/`LL_PAUSE_ENC_*` activation, or create independent
-bidirectional decryptors automatically. A complete capture-driven encryption
-procedure still requires those states.
+Neither encryption path selects an LTK from Rand/EDIV or pairing history or
+infers packet direction. `decode-data` remains a fixed-channel,
+single-direction path with a caller-supplied initial counter.
+`encryption-trace` owns bidirectional counters only when the caller supplies a
+complete ordered trace beginning with the material exchange; it does not read
+I/Q, follow hopping channels, or merge live observations automatically.
 
 For a recording that is already known to contain a complete, ordered plaintext
 stream from one link direction, opt into L2CAP PDU reassembly:
@@ -704,21 +741,23 @@ firmware compatibility, and hardware tests make that practical.
 The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
-synchronization, instant-based map/parameter updates, and direction-explicit
-ACL decryption, captured LL encryption-material derivation, and plaintext L2CAP
-PDU reassembly are now present. Fixed-channel live data observations are also
-available; the next receive stages are wideband channelization or timed
-retuning, routing those observations into connection-event state, applying
-tracked PHY transitions to demodulator selection, and full live BLE connection
-following. Offline AuxPtr scheduling and extended-advertising chain
+synchronization, instant-based map/parameter updates, direction-explicit ACL
+decryption, capture-driven encryption start/pause/refresh state, and plaintext
+L2CAP PDU reassembly are now present. Fixed-channel live data observations are
+also available; the next receive stages are wideband channelization or timed
+retuning, routing those observations and explicit directions into
+connection-event and encryption state, applying tracked PHY transitions to
+demodulator selection, and full live BLE connection following. Offline AuxPtr
+scheduling and extended-advertising chain
 reassembly plus periodic advertising planning, fixed-channel decode, and
 observation re-anchoring are present. Live AuxPtr-driven or periodic
 multi-channel capture still requires timestamp-preserving timed retuning or
 channelization. Full packet decode remains a project requirement: complete LL
-procedure state, automatic pairing and LTK selection, bidirectional
-encryption-state tracking, L2CAP channel state, stateful GATT reconstruction,
-LE Coded PHY demodulation, and Bluetooth Classic BR/EDR layers will be added
-incrementally while retaining undecoded packet bytes losslessly.
+procedure state beyond the modeled encryption flow, automatic pairing and LTK
+selection, live direction classification and encryption routing, L2CAP channel
+state, stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth
+Classic BR/EDR layers will be added incrementally while retaining undecoded
+packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

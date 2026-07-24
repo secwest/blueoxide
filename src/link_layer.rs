@@ -355,6 +355,17 @@ impl LeAclDecryptor {
         self.next_packet_counter
     }
 
+    pub(crate) fn duplicate_state(&self) -> Self {
+        Self {
+            ccm: self.ccm.clone(),
+            initialization_vector: self.initialization_vector,
+            direction: self.direction,
+            next_packet_counter: self.next_packet_counter,
+            maximum_counter_skip: self.maximum_counter_skip,
+            last_authenticated: self.last_authenticated,
+        }
+    }
+
     pub fn decrypt(&mut self, packet: &DataChannelPdu) -> Result<LeAclDecryption> {
         if usize::from(packet.declared_payload_length()) != packet.payload.len() {
             return Err(Error::InvalidInput(format!(
