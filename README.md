@@ -52,6 +52,9 @@ The repository now contains a dependency-free, buildable receive core with:
 - Bounded, direction-explicit plaintext L2CAP PDU reassembly with independent
   central/peripheral state, exact retransmission suppression, malformed-length
   rejection, and discontinuity reset.
+- Transactional LE and Enhanced Credit Based L2CAP channel tracking with
+  direction-specific dynamic CIDs, endpoint MTU/MPS/credits, segmented SDU
+  reassembly, reconfiguration/disconnection state, and EATT SPSM recognition.
 - Strict, lossless ATT PDU decoding on fixed CID `0x0004`, covering every
   assigned Core 6.1 opcode, fixed and variable record validation, raw unknown
   opcode preservation, and non-suppressing semantic error reporting.
@@ -466,6 +469,35 @@ output. Unknown command codes retain their raw parameters. A malformed known
 command reports a signaling error after the complete raw `l2cap_pdu` line, so
 semantic decoding never suppresses reconstructed bytes.
 
+For a complete ordered sequence of already-reassembled plaintext L2CAP PDUs,
+track dynamic channel establishment, credits, SDUs, reconfiguration, and
+disconnection:
+
+```text
+cargo run --release -- l2cap-trace \
+  --pdu c2p:0x0005:17010c00270040004000030040004100 \
+  --pdu p2c:0x0005:18010c00400040000200000042004300 \
+  --pdu c2p:0x0042:03000a0100
+```
+
+Each `--pdu` value is `DIRECTION:CID:PAYLOADHEX`; the basic L2CAP Length/CID
+header has already been consumed, so `PAYLOADHEX` is the complete reconstructed
+payload. The command correlates signaling identifiers in both directions,
+opens only validated dynamic CID pairs, counts every credit-based K-frame
+against the receiving endpoint's credits, and reassembles the two-octet
+length-prefixed SDU across MPS-bounded segments. It prints each raw PDU first
+and continues after state or framing errors without committing partial channel,
+credit, or SDU changes.
+
+SPSM `0x0027` identifies an Enhanced ATT bearer. A completed SDU on such a
+channel receives `eatt_pdu` output through the same strict ATT parser used for
+fixed CID `0x0004`; payload shape alone never classifies a dynamic CID as EATT.
+LE Credit Based channels allow zero initial credits, while Enhanced Credit
+Based endpoints require nonzero initial credits and MTU/MPS values of at least
+64. Dynamic CIDs are restricted to `0x0040..=0x007f`. A capture discontinuity
+must reset the tracker because missed signaling, K-frames, or credit indications
+make later state ambiguous.
+
 Completed plaintext PDUs on the fixed ATT channel CID `0x0004` receive a
 separate `att_pdu` description. The decoder covers requests, responses,
 commands, notifications, indications, and confirmations through the Core 6.1
@@ -477,11 +509,11 @@ final-value truncation in a Read Multiple Variable Length Response. Unknown
 opcodes retain all parameter bytes. A malformed known PDU increments
 `att_errors` only after the complete raw `l2cap_pdu` has been printed.
 
-This layer is stateless ATT syntax. It does not infer attribute types, rebuild a
-GATT database, track negotiated MTUs, verify signed-write authentication, or
-identify Enhanced ATT on dynamically allocated L2CAP channels. EATT decoding
-requires credit-based channel state and its assigned PSM, so dynamic CIDs are
-not guessed from payload bytes.
+ATT interpretation remains syntax-only. `decode-data` recognizes the fixed ATT
+CID, while `l2cap-trace` recognizes EATT only after the Enhanced Credit Based
+SPSM and both dynamic CIDs have been observed. Neither path infers attribute
+types, rebuilds a GATT database, tracks ATT request/response concurrency or
+negotiated bearer MTUs, or verifies signed-write authentication.
 
 Completed plaintext PDUs on the LE Security Manager fixed channel CID `0x0006`
 receive a separate `smp_pdu` description. The decoder covers Pairing Request
@@ -742,9 +774,10 @@ The next hardware work is recorded fixtures and live smoke tests from all three
 supported SDR families. Connection framing, channel selection, anchored event
 progression, clock-error windows, offline anchor acquisition, observation
 synchronization, instant-based map/parameter updates, direction-explicit ACL
-decryption, capture-driven encryption start/pause/refresh state, and plaintext
-L2CAP PDU reassembly are now present. Fixed-channel live data observations are
-also available; the next receive stages are wideband channelization or timed
+decryption, capture-driven encryption start/pause/refresh state, plaintext
+L2CAP PDU reassembly, and stateful LE credit-based/EATT bearer tracking are now
+present. Fixed-channel live data observations are also available; the next
+receive stages are wideband channelization or timed
 retuning, routing those observations and explicit directions into
 connection-event and encryption state, applying tracked PHY transitions to
 demodulator selection, and full live BLE connection following. Offline AuxPtr
@@ -754,10 +787,10 @@ observation re-anchoring are present. Live AuxPtr-driven or periodic
 multi-channel capture still requires timestamp-preserving timed retuning or
 channelization. Full packet decode remains a project requirement: complete LL
 procedure state beyond the modeled encryption flow, automatic pairing and LTK
-selection, live direction classification and encryption routing, L2CAP channel
-state, stateful GATT reconstruction, LE Coded PHY demodulation, and Bluetooth
-Classic BR/EDR layers will be added incrementally while retaining undecoded
-packet bytes losslessly.
+selection, live direction classification and encryption/L2CAP routing,
+stateful ATT transactions and GATT reconstruction, LE Coded PHY demodulation,
+and Bluetooth Classic BR/EDR layers will be added incrementally while
+retaining undecoded packet bytes losslessly.
 
 Active signal injection and transmit support are intentionally deferred until
 receive, timestamping, channelization, and packet validation are reliable;

@@ -19,13 +19,17 @@ use blueoxide::demod::{
     LeUncodedPhy, ReceivedAdvertisingPdu, ReceivedLePdu,
 };
 use blueoxide::iq::{IqFormat, open_iq_file};
+use blueoxide::l2cap::{
+    IncompleteL2capCreditBasedSdu, L2capCreditBasedChannel, L2capCreditBasedChannelTracker,
+    L2capCreditBasedEvent, L2capCreditBasedSdu,
+};
 use blueoxide::link_layer::{
     ChannelSelectionAlgorithm, ConnectionEventTiming, ConnectionParameters, ConnectionPhyState,
     ConnectionTracker, ConnectionTrackerConfig, ControlPdu, DataChannelMap, DataChannelPdu,
-    DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capReassembler, L2capReassemblyOutcome,
-    L2capSignalingCommand, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryption, LeAclDecryptionStatus,
-    LeAclDecryptor, LePhy, LinkDirection, LogicalLinkId, PhyUpdateInd, SampleTimingError,
-    SleepClockAccuracy,
+    DecodedL2capSignalingCommand, IncompleteL2capPdu, L2capPdu, L2capReassembler,
+    L2capReassemblyOutcome, L2capSignalingCommand, LE_ACL_MAXIMUM_COUNTER_SKIP, LeAclDecryption,
+    LeAclDecryptionStatus, LeAclDecryptor, LePhy, LinkDirection, LogicalLinkId, PhyUpdateInd,
+    SampleTimingError, SleepClockAccuracy,
 };
 use blueoxide::ll_control::{
     ChannelClassification, CsConfigAction, DecodedControlPdu, LeEncryptionMaterialTracker,
@@ -121,6 +125,11 @@ struct EncryptionTraceArgs {
     long_term_key: [u8; 16],
     maximum_counter_skip: u64,
     packets: Vec<DirectionalDataPacketArg>,
+}
+
+#[derive(Debug)]
+struct L2capTraceArgs {
+    pdus: Vec<L2capPdu>,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +257,7 @@ USAGE:
     --access-address 0xNNNNNNNN --crc-init 0xNNNNNN [OPTIONS]
   blueoxide encryption-trace --ltk HEX \
     --packet DIRECTION:HEADERPAYLOADHEX [--packet ...] [OPTIONS]
+  blueoxide l2cap-trace --pdu DIRECTION:CID:PAYLOADHEX [--pdu ...]
   blueoxide connection-plan --access-address 0xNNNNNNNN \
     --channel-map HEX --csa 1|2 --interval N --sample-rate HZ [OPTIONS]
   blueoxide connection-sync --access-address 0xNNNNNNNN \
@@ -305,6 +315,10 @@ ENCRYPTION-TRACE OPTIONS:
   --packet DIRECTION:HEX  Directed two-octet data header plus Length-counted
                           payload/MIC; repeat in observed wire order
   --max-counter-skip N    MIC-search skipped counters, 0..=65535 (default: 0)
+
+L2CAP-TRACE OPTIONS:
+  --pdu DIRECTION:CID:HEX Complete plaintext L2CAP PDU after the basic header;
+                          CID accepts decimal or 0x-prefixed hexadecimal
 
 CONNECTION-PLAN OPTIONS:
   --channel-map HEX       Five map octets in over-the-air order
@@ -1737,6 +1751,60 @@ fn parse_encryption_trace_args(args: &[String]) -> Result<EncryptionTraceArgs> {
         maximum_counter_skip,
         packets,
     })
+}
+
+fn parse_l2cap_trace_pdu(value: &str) -> Result<L2capPdu> {
+    let mut fields = value.splitn(3, ':');
+    let direction = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --pdu; expected DIRECTION:CID:PAYLOADHEX"
+        ))
+    })?;
+    let channel_id = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --pdu; expected DIRECTION:CID:PAYLOADHEX"
+        ))
+    })?;
+    let payload = fields.next().ok_or_else(|| {
+        Error::InvalidConfiguration(format!(
+            "invalid value {value:?} for --pdu; expected DIRECTION:CID:PAYLOADHEX"
+        ))
+    })?;
+    let direction = parse_link_direction(direction, "--pdu direction")?;
+    let channel_id = parse_u32(channel_id, "--pdu CID")?;
+    let channel_id = u16::try_from(channel_id).map_err(|_| {
+        Error::InvalidConfiguration(format!("--pdu CID 0x{channel_id:x} exceeds 16 bits"))
+    })?;
+    Ok(L2capPdu {
+        direction,
+        channel_id,
+        payload: parse_hex_bytes(payload, "--pdu payload")?,
+        fragment_count: 1,
+    })
+}
+
+fn parse_l2cap_trace_args(args: &[String]) -> Result<L2capTraceArgs> {
+    let mut pdus = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pdu" => pdus.push(parse_l2cap_trace_pdu(&value_after(
+                args, &mut index, "--pdu",
+            )?)?),
+            unknown => {
+                return Err(Error::InvalidConfiguration(format!(
+                    "unknown l2cap-trace option {unknown:?}"
+                )));
+            }
+        }
+        index += 1;
+    }
+    if pdus.is_empty() {
+        return Err(Error::InvalidConfiguration(
+            "l2cap-trace requires at least one --pdu".to_owned(),
+        ));
+    }
+    Ok(L2capTraceArgs { pdus })
 }
 
 fn parse_capture_args(args: &[String], command: CaptureCommand) -> Result<CaptureArgs> {
@@ -3686,6 +3754,199 @@ fn encryption_trace(args: EncryptionTraceArgs) -> Result<()> {
     Ok(())
 }
 
+fn describe_credit_channel(channel: &L2capCreditBasedChannel) -> String {
+    format!(
+        "mode={} spsm=0x{:04x} eatt={} status={} central_cid=0x{:04x} central_mtu={} central_mps={} central_credits={} peripheral_cid=0x{:04x} peripheral_mtu={} peripheral_mps={} peripheral_credits={}",
+        channel.mode,
+        channel.spsm,
+        channel.is_eatt(),
+        channel.status,
+        channel.central.channel_id,
+        channel.central.mtu,
+        channel.central.mps,
+        channel.central.credits,
+        channel.peripheral.channel_id,
+        channel.peripheral.mtu,
+        channel.peripheral.mps,
+        channel.peripheral.credits
+    )
+}
+
+fn print_credit_sdu(index: usize, sdu: &L2capCreditBasedSdu) -> Result<()> {
+    println!(
+        "l2cap_credit_sdu index={index} direction={} cid=0x{:04x} spsm=0x{:04x} eatt={} segments={} payload={}",
+        sdu.direction,
+        sdu.channel_id,
+        sdu.spsm,
+        sdu.is_eatt(),
+        sdu.segment_count,
+        print_hex(&sdu.payload)
+    );
+    if let Some(att) = sdu.att_pdu()? {
+        println!(
+            "eatt_pdu index={index} direction={} cid=0x{:04x} {}",
+            sdu.direction,
+            sdu.channel_id,
+            describe_att_pdu(att)?
+        );
+    }
+    Ok(())
+}
+
+fn print_l2cap_credit_event(index: usize, event: L2capCreditBasedEvent) -> Result<()> {
+    match event {
+        L2capCreditBasedEvent::Ignored => {
+            println!("l2cap_credit_event index={index} kind=ignored");
+        }
+        L2capCreditBasedEvent::ConnectionRequestPending {
+            mode,
+            identifier,
+            spsm,
+            channel_count,
+        } => println!(
+            "l2cap_credit_event index={index} kind=connection-request-pending mode={mode} identifier={identifier} spsm=0x{spsm:04x} channels={channel_count}"
+        ),
+        L2capCreditBasedEvent::ConnectionRejected {
+            mode,
+            identifier,
+            result,
+        } => println!(
+            "l2cap_credit_event index={index} kind=connection-rejected mode={mode} identifier={identifier} result=0x{result:04x}"
+        ),
+        L2capCreditBasedEvent::ChannelsOpened(channels) => {
+            for channel in channels {
+                println!(
+                    "l2cap_credit_event index={index} kind=channel-opened {}",
+                    describe_credit_channel(&channel)
+                );
+            }
+        }
+        L2capCreditBasedEvent::CreditsAdded {
+            owner,
+            channel_id,
+            added,
+            total,
+        } => println!(
+            "l2cap_credit_event index={index} kind=credits-added owner={} cid=0x{channel_id:04x} added={added} total={total}",
+            match owner {
+                LinkDirection::CentralToPeripheral => "central",
+                LinkDirection::PeripheralToCentral => "peripheral",
+            }
+        ),
+        L2capCreditBasedEvent::SduInProgress(IncompleteL2capCreditBasedSdu {
+            direction,
+            channel_id,
+            spsm,
+            expected_octets,
+            received_octets,
+            segment_count,
+        }) => println!(
+            "l2cap_credit_event index={index} kind=sdu-in-progress direction={direction} cid=0x{channel_id:04x} spsm=0x{spsm:04x} received={received_octets} expected={expected_octets} segments={segment_count}"
+        ),
+        L2capCreditBasedEvent::SduComplete(sdu) => print_credit_sdu(index, &sdu)?,
+        L2capCreditBasedEvent::ReconfigurePending {
+            identifier,
+            owner,
+            channel_ids,
+            mtu,
+            mps,
+        } => println!(
+            "l2cap_credit_event index={index} kind=reconfigure-pending identifier={identifier} owner={} cids={} mtu={mtu} mps={mps}",
+            match owner {
+                LinkDirection::CentralToPeripheral => "central",
+                LinkDirection::PeripheralToCentral => "peripheral",
+            },
+            print_l2cap_channel_ids(&channel_ids)
+        ),
+        L2capCreditBasedEvent::ReconfigureRejected { identifier, result } => println!(
+            "l2cap_credit_event index={index} kind=reconfigure-rejected identifier={identifier} result=0x{result:04x}"
+        ),
+        L2capCreditBasedEvent::Reconfigured {
+            owner,
+            channel_ids,
+            mtu,
+            mps,
+        } => println!(
+            "l2cap_credit_event index={index} kind=reconfigured owner={} cids={} mtu={mtu} mps={mps}",
+            match owner {
+                LinkDirection::CentralToPeripheral => "central",
+                LinkDirection::PeripheralToCentral => "peripheral",
+            },
+            print_l2cap_channel_ids(&channel_ids)
+        ),
+        L2capCreditBasedEvent::DisconnectPending {
+            identifier,
+            central_channel_id,
+            peripheral_channel_id,
+        } => println!(
+            "l2cap_credit_event index={index} kind=disconnect-pending identifier={identifier} central_cid=0x{central_channel_id:04x} peripheral_cid=0x{peripheral_channel_id:04x}"
+        ),
+        L2capCreditBasedEvent::Disconnected(channel) => println!(
+            "l2cap_credit_event index={index} kind=disconnected {}",
+            describe_credit_channel(&channel)
+        ),
+        L2capCreditBasedEvent::CommandRejected {
+            identifier,
+            removed_pending_procedure,
+        } => println!(
+            "l2cap_credit_event index={index} kind=command-rejected identifier={identifier} removed_pending={removed_pending_procedure}"
+        ),
+    }
+    Ok(())
+}
+
+fn l2cap_trace(args: L2capTraceArgs) -> Result<()> {
+    let mut tracker = L2capCreditBasedChannelTracker::default();
+    let mut accepted = 0usize;
+    let mut errors = 0usize;
+    for (index, pdu) in args.pdus.iter().enumerate() {
+        println!(
+            "raw_l2cap_pdu index={index} direction={} cid=0x{:04x} payload={}",
+            pdu.direction,
+            pdu.channel_id,
+            print_hex(&pdu.payload)
+        );
+        if pdu.channel_id == blueoxide::link_layer::LE_SIGNALING_CHANNEL_ID {
+            match pdu.le_signaling_command() {
+                Ok(Some(command)) => match describe_l2cap_signaling(command) {
+                    Ok(description) => println!(
+                        "l2cap_signal index={index} direction={} {description}",
+                        pdu.direction
+                    ),
+                    Err(error) => eprintln!(
+                        "l2cap signaling decode error: index={index} direction={} error={error}",
+                        pdu.direction
+                    ),
+                },
+                Ok(None) => {}
+                Err(error) => eprintln!(
+                    "l2cap signaling envelope error: index={index} direction={} error={error}",
+                    pdu.direction
+                ),
+            }
+        }
+        match tracker.observe(pdu) {
+            Ok(event) => {
+                accepted += 1;
+                print_l2cap_credit_event(index, event)?;
+            }
+            Err(error) => {
+                errors += 1;
+                eprintln!(
+                    "l2cap credit observation error: index={index} direction={} cid=0x{:04x} error={error}",
+                    pdu.direction, pdu.channel_id
+                );
+            }
+        }
+    }
+    eprintln!(
+        "processed {} directed L2CAP PDU(s); accepted={accepted} errors={errors} open_channels={}",
+        args.pdus.len(),
+        tracker.channels().count()
+    );
+    Ok(())
+}
+
 fn current_unix_time_ns() -> Result<u64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4313,6 +4574,7 @@ fn run() -> Result<()> {
         Some("decode-periodic") => decode_periodic(parse_decode_periodic_args(&args[1..])?),
         Some("decode-data") => decode_data(parse_decode_data_args(&args[1..])?),
         Some("encryption-trace") => encryption_trace(parse_encryption_trace_args(&args[1..])?),
+        Some("l2cap-trace") => l2cap_trace(parse_l2cap_trace_args(&args[1..])?),
         Some("connection-plan") => connection_plan(parse_connection_plan_args(&args[1..])?),
         Some("connection-sync") => connection_sync(parse_connection_plan_args(&args[1..])?),
         Some("connection-acquire") => connection_acquire(parse_connection_plan_args(&args[1..])?),

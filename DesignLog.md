@@ -1510,3 +1510,74 @@ independently serializes the six encryption control opcodes. Pause and refresh
 ciphertexts were generated outside Blueoxide with `cryptography 46.0.7`
 backed by OpenSSL 3.5.6 after reproducing both published Core counter-zero
 start-response vectors.
+
+## 2026-07-24: Track credit-based L2CAP channels before identifying EATT
+
+### Endpoint and CID model
+
+An LE dynamic CID identifies the receiving endpoint that allocated it. A
+central-to-peripheral K-frame therefore carries the peripheral's CID, while a
+peripheral-to-central K-frame carries the central's CID. The tracker stores
+both endpoints explicitly with their own MTU, MPS, and remaining credits rather
+than treating the two CIDs as interchangeable aliases.
+
+Connection requests carry the initiating endpoint's source CID and receive
+parameters. The response contributes the peer endpoint's destination CID and
+parameters. Requests and responses are correlated by signaling identifier and
+opposite direction. Enhanced requests can open up to five channels; partial
+results retain nonzero destination CIDs and reject zero entries without
+inventing channels. CID reuse, repeated CIDs, response-count mismatches, and
+responses without a matching request are errors.
+
+### Credits and SDU segmentation
+
+Initial credits belong to the endpoint advertised in the same request or
+response and permit the peer to send that many K-frames to it. A Flow Control
+Credit indication names the sender's receive CID and adds credits to that
+endpoint. Zero additions and 16-bit overflow are rejected. Every accepted
+dynamic-channel L2CAP PDU consumes one credit before entering SDU reassembly.
+
+The first K-frame of an SDU starts with a little-endian two-octet SDU Length.
+The remaining bytes and all following K-frames are accumulated until that
+length is reached. Each K-frame is bounded by the receiving endpoint's MPS and
+the complete SDU by its MTU. Overflow, missing first-frame length, exhausted
+credits, and out-of-order dynamic CIDs leave the tracker unchanged because
+each public observation runs against a cloned candidate state.
+
+### Reconfiguration, disconnection, and collisions
+
+Enhanced reconfiguration changes the request sender's receiving endpoints only
+after the opposite-direction success response. MTU cannot decrease. MPS may
+decrease for one channel but not when multiple channels are listed. A channel
+cannot begin reconfiguration and disconnection concurrently; this conservative
+collision rule keeps every pending response tied to live channel state.
+
+A disconnection request must name the exact destination/source CID pair for
+its direction. The channel enters a visible disconnecting state and is removed
+only after the matching response. A command rejection cancels the matching
+pending procedure and restores a disconnecting channel to open state.
+
+### EATT boundary and integration
+
+Dynamic payload bytes are never sufficient to identify ATT. Only an established
+Enhanced Credit Based channel with SPSM `0x0027` is an EATT bearer. Completed
+SDUs on that channel can enter the existing strict `AttPdu` parser. This adds
+bearer identification and segmentation, not ATT transaction scheduling, GATT
+database reconstruction, or live direction routing.
+
+`l2cap-trace` accepts complete direction-tagged L2CAP PDUs after basic-header
+reassembly, prints raw bytes before state processing, and reports channel,
+credit, SDU, reconfiguration, disconnection, and EATT/ATT output. A capture gap
+requires `reset`; preserving channel or credit state across missed signaling or
+K-frames would claim knowledge the capture no longer contains.
+
+### Independent behavior boundary
+
+Zephyr commit `7d46db352251f85a6bc7b5961fb8a86e2f3125e4` independently represents each
+credit-based channel as separate `rx` and `tx` endpoints. Its host L2CAP code
+uses local `rx.cid` as the request source CID, remote `tx.cid` as the
+destination CID, decrements one receive credit per K-frame, validates MPS before
+removing the first SDU Length field, and identifies EATT with PSM `0x0027`.
+Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8` independently serialized
+the request, response, credit, reconfiguration, and disconnection fixtures used
+by the integration tests.

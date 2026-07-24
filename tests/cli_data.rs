@@ -961,6 +961,122 @@ fn cli_keeps_raw_packets_visible_and_continues_after_mic_failure() {
 }
 
 #[test]
+fn cli_tracks_eatt_channels_credits_reconfiguration_and_disconnection() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "l2cap-trace",
+            "--pdu",
+            "c2p:0x0005:17010c00270040004000030040004100",
+            "--pdu",
+            "p2c:0x0005:18010c00400040000200000042004300",
+            "--pdu",
+            "c2p:0x0042:05001b01",
+            "--pdu",
+            "c2p:0x0042:00aabb",
+            "--pdu",
+            "p2c:0x0005:1602040042000400",
+            "--pdu",
+            "c2p:0x0005:190308008000500040004100",
+            "--pdu",
+            "p2c:0x0005:1a0302000000",
+            "--pdu",
+            "c2p:0x0005:0604040042004000",
+            "--pdu",
+            "p2c:0x0005:0704040042004000",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "raw_l2cap_pdu index=0 direction=central-to-peripheral cid=0x0005 payload=17010c00270040004000030040004100"
+    ));
+    assert!(stdout.contains(
+        "kind=channel-opened mode=enhanced-credit-based spsm=0x0027 eatt=true status=open central_cid=0x0040"
+    ));
+    assert!(stdout.contains(
+        "l2cap_credit_event index=2 kind=sdu-in-progress direction=central-to-peripheral cid=0x0042 spsm=0x0027 received=2 expected=5 segments=1"
+    ));
+    assert!(stdout.contains(
+        "l2cap_credit_sdu index=3 direction=central-to-peripheral cid=0x0042 spsm=0x0027 eatt=true segments=2 payload=1b0100aabb"
+    ));
+    assert!(stdout.contains(
+        "eatt_pdu index=3 direction=central-to-peripheral cid=0x0042 opcode=0x1b name=handle-value-notification type=notification handle=0x0001 value=aabb"
+    ));
+    assert!(stdout.contains("kind=credits-added owner=peripheral cid=0x0042 added=4 total=4"));
+    assert!(stdout.contains("kind=reconfigured owner=central cids=0x0040,0x0041 mtu=128 mps=80"));
+    assert!(
+        stdout.contains(
+            "kind=disconnect-pending identifier=4 central_cid=0x0040 peripheral_cid=0x0042"
+        )
+    );
+    assert!(stdout.contains("kind=disconnected mode=enhanced-credit-based spsm=0x0027"));
+    assert!(
+        stderr.contains("processed 9 directed L2CAP PDU(s); accepted=9 errors=0 open_channels=1")
+    );
+}
+
+#[test]
+fn cli_l2cap_trace_validates_arguments_and_continues_after_credit_error() {
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .arg("l2cap-trace")
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("l2cap-trace requires at least one --pdu")
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args(["l2cap-trace", "--pdu", "c2p:0x10000:00"])
+        .output()
+        .expect("run blueoxide");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CID 0x10000 exceeds 16 bits"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_blueoxide"))
+        .args([
+            "l2cap-trace",
+            "--pdu",
+            "c2p:5:17010a0027004000400001004000",
+            "--pdu",
+            "p2c:5:18010a0040004000010000004200",
+            "--pdu",
+            "c2p:0x42:010013",
+            "--pdu",
+            "c2p:0x42:010013",
+            "--pdu",
+            "p2c:5:1602040042000100",
+            "--pdu",
+            "c2p:0x42:010013",
+        ])
+        .output()
+        .expect("run blueoxide");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stdout.contains(
+        "raw_l2cap_pdu index=3 direction=central-to-peripheral cid=0x0042 payload=010013"
+    ));
+    assert!(stdout.contains("l2cap_credit_sdu index=5 direction=central-to-peripheral cid=0x0042"));
+    assert!(stderr.contains(
+        "l2cap credit observation error: index=3 direction=central-to-peripheral cid=0x0042"
+    ));
+    assert!(
+        stderr.contains("processed 6 directed L2CAP PDU(s); accepted=5 errors=1 open_channels=1")
+    );
+}
+
+#[test]
 fn cli_decodes_plaintext_le_l2cap_signaling_without_hiding_raw_pdus() {
     let channel = BleChannel::new(12).expect("valid channel");
     let access_address = 0x1234_5678u32;

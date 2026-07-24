@@ -142,6 +142,16 @@
   exact single-command envelopes, typed disconnection, connection-parameter,
   and credit-based command views, bounded Enhanced Credit Based channel lists,
   raw unknown-command preservation, and non-suppressing CLI error reporting.
+- `L2capCreditBasedChannelTracker` for direction-correlated LE and Enhanced
+  Credit Based requests/responses, central/peripheral dynamic CID maps,
+  endpoint MTU/MPS/credit accounting, partial Enhanced results, reconfiguration,
+  disconnection, command rejection, and capture-gap reset.
+- Credit-based SDU reassembly with per-K-frame credit consumption, first-frame
+  SDU Length validation, MPS/MTU enforcement, rollback on invalid observations,
+  and EATT recognition only from assigned SPSM `0x0027`.
+- `l2cap-trace` for raw-first direction-tagged complete L2CAP PDUs, channel and
+  credit transitions, completed SDUs, strict EATT/ATT output, and continued
+  processing after nonfatal per-PDU errors.
 - Strict lossless ATT decoding for fixed CID `0x0004`, including every Core 6.1
   opcode, typed request/response/command/notification/indication views, exact
   and variable-record validation, legal final-value truncation, raw unknown
@@ -242,9 +252,10 @@
   AuxPtr-driven secondary advertising reception, live multi-channel periodic
   advertising following, automatic direction/counter inference, LTK selection
   from pairing state, live routing into the direction-explicit encryption
-  tracker, stateful L2CAP channels, GATT/EATT and pairing state, capture-driven
-  PHY transition delivery/demodulator switching, Bluetooth Classic, and LE
-  Coded PHY demodulation remain to be implemented. Contextual
+  and credit-based L2CAP trackers, stateful ATT/GATT transactions and pairing
+  state, capture-driven PHY transition delivery/demodulator switching,
+  Bluetooth Classic, and LE Coded PHY demodulation remain to be implemented.
+  Contextual
   AUX_ADV_IND/AUX_CHAIN_IND classification and chain reassembly plus periodic
   CSA#2 planning and observation synchronization are available offline when
   packets share exact sample coordinates.

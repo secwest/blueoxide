@@ -14,6 +14,7 @@ mod crypto;
 pub mod demod;
 pub mod error;
 pub mod iq;
+pub mod l2cap;
 pub mod link_layer;
 pub mod ll_control;
 pub mod native;

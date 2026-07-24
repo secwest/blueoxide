@@ -1716,6 +1716,92 @@ cargo doc --no-deps
 git diff --check
 ```
 
+## Stateful credit-based L2CAP and EATT verification
+
+Normative behavior is taken from Bluetooth Core 6.1, Vol 3, Part A:
+
+- Sections 4.22 and 4.23 for LE Credit Based connection request/response.
+- Section 4.24 for Flow Control Credit and Sections 4.25 and 4.26 for Enhanced
+  Credit Based connection request/response.
+- Sections 4.27 and 4.28 plus Section 7.11 for Enhanced Credit Based
+  reconfiguration.
+- The Credit Based Flow Control mode segmentation rules for per-K-frame
+  credits, MPS, MTU, and the first-frame SDU Length field.
+
+Independent implementation reference:
+
+- Project: Zephyr Bluetooth Host
+- Commit: `7d46db352251f85a6bc7b5961fb8a86e2f3125e4`
+- Files:
+  - `subsys/bluetooth/host/l2cap.c`
+  - `subsys/bluetooth/host/l2cap_internal.h`
+  - `include/zephyr/bluetooth/l2cap.h`
+  - `subsys/bluetooth/host/att_internal.h`
+
+Zephyr independently defines LE dynamic CIDs as `0x0040..=0x007f`, legacy
+minimum MTU/MPS as 23, Enhanced minimum MTU/MPS as 64, maximum MPS as 65533,
+and EATT PSM as `0x0027`. Its `bt_l2cap_le_chan` stores a local receiving
+endpoint and an image of the remote receiving endpoint. Outgoing connection
+requests serialize local `rx.cid`; successful responses populate remote
+`tx.cid`. Flow Control Credit indications serialize the sender's `rx.cid` and
+increase the receiver's matching `tx.credits`.
+
+Zephyr's receive path decrements one endpoint credit for each dynamic-channel
+K-frame, rejects payloads beyond MPS, removes the little-endian SDU Length from
+the first K-frame, bounds the SDU by MTU, and appends later K-frames until the
+declared length is complete. Its Enhanced reconfiguration path rejects MTU
+decrease and rejects MPS decrease when more than one channel is listed.
+
+Pinned Scapy commit `de3399269bad8c9a6bfb1dc181c3876340c198b8` generated the
+complete basic-header plus signaling fixtures:
+
+```text
+Enhanced request:    1000050017010c00270040004000030040004100
+Enhanced response:   1000050018010c00400040000200000042004300
+Credit indication:   080005001602040042000400
+Reconfigure request: 0c000500190308008000500040004100
+Reconfigure response:060005001a0302000000
+Disconnect request:  080005000604040042004000
+Disconnect response: 080005000704040042004000
+Legacy request:      0e00050014090a0080004400170017000000
+Legacy response:     0e00050015090a0045004000200001000000
+```
+
+The first four octets of each fixture are the little-endian basic L2CAP Length
+and CID; the `l2cap-trace` fixtures feed the remaining signaling payload after
+independently checking those headers.
+
+Library tests cover exact request retransmission, legacy and Enhanced channel
+establishment, partial Enhanced acceptance, all-refused responses, central and
+peripheral CID mapping, bidirectional credits, segmented EATT SDUs, ATT
+handoff, credit exhaustion and replenishment, reconfiguration, collision
+rejection, disconnection, transactional rollback, and bounded arbitrary L2CAP
+input without panics.
+
+The CLI integration trace opens two EATT bearers, reassembles a two-K-frame ATT
+Handle Value Notification, adds flow-control credits, reconfigures both central
+endpoints, disconnects one exact CID pair, and ends with one open channel. A
+second trace exhausts the only credit, requires the raw rejected K-frame to
+remain visible, accepts a later credit indication, and then processes the same
+SDU successfully. Argument tests reject an empty trace and a CID wider than 16
+bits.
+
+Final local gate for this increment:
+
+```text
+210 library tests
+5 connection planning/acquisition/synchronization CLI integration tests
+13 data/encryption/L2CAP CLI integration tests
+9 advertising decode/planning/reassembly/periodic CLI integration tests
+9 live/backend CLI integration tests
+cargo fmt -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+cargo doc --no-deps
+git diff --check
+```
+
 ## Remaining verification requirements
 
 - Recorded over-the-air fixtures from LimeSDR, bladeRF, and XTRX.
@@ -1728,8 +1814,8 @@ git diff --check
 - Long-duration stream tests with sample overruns and retunes.
 - Recorded multi-channel or timed-retune validation for live AuxPtr-driven
   extended advertising and periodic advertising following, plus differential
-  tests for data-channel following, stateful GATT, EATT, pairing and automatic
-  LTK selection, live direction classification and routing into the encryption
-  tracker, automatic capture-driven PHY transition delivery and demodulator
-  switching, LE Coded PHY demodulation, and Bluetooth Classic as those layers
-  are added.
+  tests for data-channel following, stateful ATT/GATT transactions, pairing and
+  automatic LTK selection, live direction classification and routing into the
+  encryption and credit-based L2CAP trackers, automatic capture-driven PHY
+  transition delivery and demodulator switching, LE Coded PHY demodulation,
+  and Bluetooth Classic as those layers are added.
